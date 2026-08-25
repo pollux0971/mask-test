@@ -13,3 +13,8 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# venv（各 agent 自建的測試環境，不進版控）
+.venv/
+venv/
+*.egg-info/

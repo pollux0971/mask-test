@@ -18,6 +18,8 @@
 
 | 日期 | 章節 | 變更 | 影響的 story | 已通知 |
 |---|---|---|---|---|
+| 2026-08-26 | 1. 序列埠協定 v2 | T04：新增 `ssi-backlog/tools/mock_device.py`（pty 假裝置，產生 `$T`/`$M`/`$H`/`$STATUS`）。預設 `--proto v2` 照本章格式；`--proto v1` 保留凍結前舊格式，讓 mock 現在就能對接 unmodified `bridge_server.py`，也作為 `B02` 雙協定相容測試的夾具 | `B01`, `B02`, `C01`, `C05` | 是 |
+| 2026-08-26 | 1. 序列埠協定 v2 | 調度決議：`A01`、`A02` 合併為一個實作單元。原因：§1 凍結後 `$T` 行的 `d0..dN,s0..sN` 是同一組欄位契約，且「無效值語意」要求距離與 signal 在無效 zone 必須同時回 `-1`（不能只有其中一個），中間切開會產生違反此規則、也沒有消費者能正確解析的過渡格式。實作已在 A01 完成，A02 內容併入 | `A01`, `A02`, `B01` | 是 |
 | 2026-08-26 | 1. 序列埠協定 v2 | 凍結協定 v2：補齊每種 `$` 行的欄位型別/單位/範圍表、7 行真實範例（含極端值）、`$STATUS` 版本協商流程、`-1` 無效值的適用情境。**破壞性變更**：`$M` 的 `rms` 從草案佔位 `f1`（浮點文字）改為 `i16` 定點整數（16-bit PCM 原始振幅），以符合「浮點格式一律定點整數」的既有決定 | `A01`, `A03`, `B01`, `T04` | ⬜ 待通知（見完成回報） |
 | 2026-08-26 | 5. 檔案所有權 | 建立目錄骨架並凍結；依 T03 決議新增 `ssi-backlog/tools/reference_mel.py`（T 軌獨佔，A/B/D 唯讀引用） | A, B, D, T03 | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | 凍結 schema；新增 `ssi-backlog/tools/schema_example.py` 產生結構正確的空 HDF5 檔供 D 軌開發 | B, D, B07, B17, D01, D10 | 是 |
@@ -31,6 +33,10 @@
 
 > **FROZEN 2026-08-26**：本章節（1.1–1.4）已凍結。後續修改需在文件頂端
 > 「變更紀錄」加一行並通知 A/B/C/D 全體軌道，不可直接改字。
+>
+> `ssi-backlog/tools/mock_device.py --proto v1` 保留本章凍結前的舊格式
+> （`$TOF`/`$MIC`/`$STATUS,res=`），供 `B02` 雙協定相容測試使用；預設
+> `--proto v2` 才是本章的協定。
 
 ### 1.1 裝置 → 主機
 
@@ -255,6 +261,7 @@ manifest 是**衍生資料**，永遠可從 HDF5 重建（`rebuild_manifest.py`�
 窗長        512 samples (32 ms) @ 16 kHz
 hop         256 samples (16 ms) → 62.5 Hz     [A14 之前為 512]
 窗函數      Hann，週期性（periodic），非對稱
+STFT        center=False（裝置端無前後 padding，逐幀比對用）
 n_mels      40
 fmin/fmax   80 Hz / 8000 Hz
 mel 尺度    Slaney            ⚠ 不是 HTK
@@ -267,6 +274,11 @@ log         log10(max(power, 1e-10))
 > librosa 預設 Slaney、多數 C 實作預設 HTK，兩者在 1 kHz 以上有可見差距。
 > `A12` 的驗收條件是「裝置端與 librosa 相關係數 > 0.95」——公式不一致就永遠達不到。
 > 對應參數：`librosa.filters.mel(..., htk=False, norm='slaney')`
+
+> **⚠ `center=False`，不是 librosa 預設的 `center=True`。**
+> 裝置端即時分幀沒有前後 padding 可用，`center=True` 會讓幀邊界對不上，
+> 逐幀比對（`A12`、`tools/compare_mel.py`）就沒有意義。
+> 對應參數：`librosa.stft(..., center=False)`。
 
 ### 3.2 ToF 特徵
 

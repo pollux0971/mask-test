@@ -1,10 +1,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "vl53l7cx_api.h"
 #include "bone_mic.h"
@@ -55,6 +57,10 @@ static const sensor_pins_t pins[] = {
 
 static VL53L7CX_Configuration s_dev[NUM_SENSORS];
 static VL53L7CX_ResultsData s_results[NUM_SENSORS];
+/* Per-sensor frame counter for the $T line (CONTRACTS.md #1.1/#1.3). Only
+ * incremented once a frame is actually sent, so a stall or read failure
+ * shows up as a gap in seq rather than a repeated or skipped-silently value. */
+static uint32_t s_seq[NUM_SENSORS];
 
 static bool init_bus_and_sensor(size_t idx)
 {
@@ -123,23 +129,29 @@ static bool init_bus_and_sensor(size_t idx)
     return true;
 }
 
-/* Compact machine-readable line for the live monitor panel (monitor/):
- *   $TOF,<sensor_letter>,<grid_dim>,<v0>,<v1>,...,<vN-1>
- * where vi is the distance in mm, or -1 if that zone's reading isn't valid
- * (target_status other than 5/9). Printed with plain printf (no ESP_LOG
- * prefix) so the host bridge can pick out lines by their '$' sentinel
- * without fighting log formatting. */
-static void print_tof_line(char sensor_letter, const VL53L7CX_ResultsData *res)
+/* Wire format frozen in CONTRACTS.md #1.1:
+ *   $T,<A|B>,<seq:u32>,<t_us:i64>,<dim>,<d0>..<dN>,<s0>..<sN>
+ * dim is the zone COUNT (16 or 64), not the grid edge length. d is distance
+ * in mm, s is signal_per_spad/100 (rounded, not truncated -- CONTRACTS.md
+ * #1.3 "signal rate 縮放"). Per #1.1 "無效值語意", a zone with
+ * target_status outside {5, 9} reports -1 for BOTH d and s together, never
+ * one without the other. Printed with plain printf (no ESP_LOG prefix) so
+ * the host bridge can pick out lines by their '$' sentinel without fighting
+ * log formatting. */
+static void print_tof_line(char sensor_letter, uint32_t seq, int64_t t_us,
+                            const VL53L7CX_ResultsData *res)
 {
+    const int dim = TOF_GRID_DIM * TOF_GRID_DIM;
+
     uart_out_lock();
-    printf("$TOF,%c,%d", sensor_letter, TOF_GRID_DIM);
-    for (int i = 0; i < TOF_GRID_DIM * TOF_GRID_DIM; i++) {
-        uint8_t status_code = res->target_status[i];
-        if (status_code == 5 || status_code == 9) {
-            printf(",%d", res->distance_mm[i]);
-        } else {
-            printf(",-1");
-        }
+    printf("$T,%c,%" PRIu32 ",%" PRId64 ",%d", sensor_letter, seq, t_us, dim);
+    for (int i = 0; i < dim; i++) {
+        bool valid = (res->target_status[i] == 5 || res->target_status[i] == 9);
+        printf(",%d", valid ? res->distance_mm[i] : -1);
+    }
+    for (int i = 0; i < dim; i++) {
+        bool valid = (res->target_status[i] == 5 || res->target_status[i] == 9);
+        printf(",%d", valid ? (int)((res->signal_per_spad[i] + 50) / 100) : -1);
     }
     printf("\n");
     uart_out_unlock();
@@ -177,9 +189,14 @@ void app_main(void)
             uint8_t ready = 0;
             uint8_t status = vl53l7cx_check_data_ready(&s_dev[i], &ready);
             if (status == 0 && ready) {
+                /* Sampled here, not after get_ranging_data(): the I2C
+                 * transfer is ~2-4 ms and taking t_us after it would bake
+                 * that in as a systematic bias (CONTRACTS.md #1.3). */
+                int64_t t_us = esp_timer_get_time();
                 status = vl53l7cx_get_ranging_data(&s_dev[i], &s_results[i]);
                 if (status == 0) {
-                    print_tof_line(pins[i].letter, &s_results[i]);
+                    print_tof_line(pins[i].letter, s_seq[i], t_us, &s_results[i]);
+                    s_seq[i]++;
                 }
             }
         }

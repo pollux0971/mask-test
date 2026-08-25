@@ -33,12 +33,15 @@ import queue
 import re
 import struct
 import subprocess
+import sys
 import threading
 import time
 import socketserver
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote
+
+import numpy as np
 
 MONITOR_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = MONITOR_DIR.parent
@@ -48,6 +51,18 @@ IDF_EXPORT = Path.home() / "esp" / "esp-idf" / "export.sh"
 PANEL_HTML = MONITOR_DIR / "panel.html"
 VOICE_DIR = ROOT_DIR / "voice"
 VOICE_DIR.mkdir(parents=True, exist_ok=True)
+
+# B14：WAV -> log-Mel 備援路線。`host/` 跟這支腳本不在同一個套件樹下，
+# 用之前得先把 repo 根目錄塞進 sys.path。
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+from host.features.mel_pipeline import wav_to_log_mel_timed  # noqa: E402
+from host.storage.mel_writer import write_mel_to_trial  # noqa: E402
+
+# B09（session/trial 狀態機）還沒做，這裡先用「每次錄音自動 +1」模擬 trial_idx，
+# 讓 B07/B09 落地前就能對著一個真實 h5 檔驗證「特徵寫回 HDF5」這條路徑通不通。
+# --h5-session 沒給的話就只算 mel、存 .npy，不寫 HDF5。
+mfcc_target = {"h5_path": None, "next_trial_idx": 0}
 
 RESOLUTION_RE = re.compile(r"#define\s+TOF_RESOLUTION_MODE\s+\d+")
 WAV_HEADER_RE = re.compile(r"rate=(\d+) bits=(\d+) channels=(\d+) bytes=(\d+)")
@@ -139,6 +154,47 @@ def save_wav(rate, bits, channels, pcm_bytes):
     return filename, len(header) + len(pcm_bytes)
 
 
+def _process_mfcc(filename):
+    """B14 備援路線：WAV 存好之後算 log-Mel，永遠存一份 `.npy`，
+    有指定 `--h5-session` 的話再多寫一份進該 session 的下一個 trial。
+
+    在自己的執行緒跑，不擋 serial_reader 讀下一行（延遲拆解裡 MFCC 只要
+    ~0.1s，但 h5py I/O 加上 GIL 底下沒必要冒風險卡到即時的 $TOF 解析）。
+    """
+    wav_path = VOICE_DIR / filename
+    broadcaster.publish({"type": "mfcc", "state": "computing", "file": filename})
+    try:
+        log_mel, elapsed = wav_to_log_mel_timed(wav_path)
+    except Exception as exc:
+        broadcaster.publish({"type": "mfcc", "state": "error", "file": filename, "message": str(exc)})
+        return
+
+    npy_path = wav_path.with_suffix(".mel.npy")
+    np.save(npy_path, log_mel)
+
+    event = {
+        "type": "mfcc", "state": "done", "file": filename,
+        "npy_file": npy_path.name, "n_frames": int(log_mel.shape[0]),
+        "elapsed_ms": round(elapsed * 1000, 1),
+    }
+
+    h5_path = mfcc_target["h5_path"]
+    if h5_path is not None:
+        trial_idx = mfcc_target["next_trial_idx"]
+        mfcc_target["next_trial_idx"] += 1
+        try:
+            write_mel_to_trial(h5_path, trial_idx, log_mel)
+            event["h5_trial_idx"] = trial_idx
+        except Exception as exc:
+            broadcaster.publish({
+                "type": "mfcc", "state": "error", "file": filename,
+                "message": f"HDF5 寫入失敗 (trial_idx={trial_idx}): {exc}",
+            })
+            return
+
+    broadcaster.publish(event)
+
+
 def serial_reader(port, baud):
     """Runs for the lifetime of the process; pauses itself while `flashing`
     is set so the flash subprocess can have the port exclusively."""
@@ -193,6 +249,7 @@ def serial_reader(port, baud):
                                 "bytes": size, "duration_sec": round(len(pcm) / (wav_meta["rate"] * 2), 2),
                             })
                             print(f"[bridge] saved recording: voice/{filename} ({size} bytes)")
+                            threading.Thread(target=_process_mfcc, args=(filename,), daemon=True).start()
                         except Exception as exc:
                             broadcaster.publish({"type": "record", "state": "error", "message": str(exc)})
                         wav_meta = None
@@ -410,7 +467,15 @@ def main():
     parser.add_argument("--port", default="/dev/ttyUSB0", help="ESP32 serial port")
     parser.add_argument("--baud", type=int, default=460800, help="must match CONFIG_ESP_CONSOLE_UART_BAUDRATE")
     parser.add_argument("--http-port", type=int, default=8765)
+    parser.add_argument(
+        "--h5-session", default=None,
+        help="B14 備援路線：每次錄音完成後，除了存 .npy，也把 log-mel 寫進這個 "
+             "session HDF5 檔（trial group 要已經存在，例如用 "
+             "ssi-backlog/tools/schema_example.py 產生）。不給就只存 .npy。")
     args = parser.parse_args()
+
+    if args.h5_session:
+        mfcc_target["h5_path"] = Path(args.h5_session)
 
     reader = threading.Thread(target=serial_reader, args=(args.port, args.baud), daemon=True)
     reader.start()
