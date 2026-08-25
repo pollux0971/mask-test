@@ -1,10 +1,12 @@
-// App entry point (C01): loads the shell/bus module stubs so the ES module
-// graph is exercised end to end, and opens the SSE connection to the
-// bridge. Parsing/dispatching those events into the bus (C03) and rendering
-// per-mode content (C05+) are out of scope here — this only proves the
-// connection itself works with no build step.
+// App entry point. Loads shell.js (mode switching, hash routing) and
+// bus.js (dataStore + per-mode fan-out), opens the one SSE connection for
+// the app's lifetime, and hands every message to the bus (C03). Mode
+// switching never tears this connection down or rebuilds it -- see
+// ssi-backlog/README.md, "架構關鍵：資料層與模式層分離" -- and
+// EventSource auto-reconnects on its own after a drop, so a bridge
+// restart just resumes the same pipeline without any code here noticing.
 import "./shell.js";
-import "./bus.js";
+import { handleEvent } from "./bus.js";
 
 const es = new EventSource("/events");
 
@@ -14,4 +16,14 @@ es.onopen = () => {
 
 es.onerror = () => {
   console.log("[panel] SSE connection error (bridge down or restarting)");
+};
+
+es.onmessage = (e) => {
+  let evt;
+  try {
+    evt = JSON.parse(e.data);
+  } catch {
+    return;
+  }
+  handleEvent(evt);
 };

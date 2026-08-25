@@ -261,9 +261,16 @@ class DropTracker:
         ``device_drops`` maps stream name to the cumulative counter from the
         most recent ``$H`` -- e.g. ``{"tof_A": drop_A, "tof_B": drop_B,
         "mic": drop_M}``. Both sides count since boot and neither is reset
-        by ``$STATUS``, so on a healthy link they should agree exactly; the
-        only expected difference is frames still in flight when ``$H`` was
-        stamped.
+        by ``$STATUS``, so on a healthy link they track each other closely.
+
+        They do not match exactly, and the mismatch has a fixed sign. The
+        host infers a drop from the gap between two *received* frames, so a
+        drop with nothing received after it yet cannot be seen: ``host``
+        trails ``device`` by the run of drops immediately before that ``$H``,
+        plus whatever was still in flight when it was stamped. A positive
+        ``delta`` is therefore the interesting one -- it means the host
+        counted a loss the device does not believe it caused, which points
+        at the transport rather than at either counter.
 
         Returns, per stream: ``host``, ``device``, ``delta``
         (host - device), and ``rate_delta`` -- the difference expressed in

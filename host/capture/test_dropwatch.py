@@ -331,13 +331,26 @@ def _run_mock(args, seconds):
     return lines, proc.stderr.read()
 
 
-def _feed(tracker, lines):
+def _feed(tracker, lines, stop_at_last_h=False):
     """Minimal $T/$M/$H/$STATUS field-splitter.
 
     Deliberately not B01's parser: B03 only needs (stream, seq), and
     depending on protocol.py while its interface is still moving would
     couple two stories that do not otherwise need each other.
+
+    ``stop_at_last_h`` truncates the feed after the final ``$H``. Comparing
+    two cumulative counters only means something if both were sampled at
+    the same instant, and the device's ``$H`` is a sample taken mid-stream:
+    every frame that arrives after it is a drop the host can see and that
+    ``$H`` could not have counted yet.
     """
+    if stop_at_last_h:
+        last_h = max(
+            (i for i, L in enumerate(lines) if L.startswith("$H,")), default=None
+        )
+        assert last_h is not None, "no $H line seen"
+        lines = lines[: last_h + 1]
+
     device_drops = None
     for line in lines:
         parts = line.split(",")
@@ -362,53 +375,82 @@ def _feed(tracker, lines):
     return device_drops
 
 
+# The mock drops each scheduled frame on an independent coin flip, so the
+# measured rate is binomial around 0.05 and the "4-6%" acceptance band is
+# only a real test of the estimator if the band is several sigma wide. At
+# 800 fps for 10 s that is ~8000 scheduled frames per stream:
+#     sigma = sqrt(0.05 * 0.95 / 8000) = 0.24 pp  ->  the 1 pp band is ~4.1 sigma
+# The obvious 60 fps / 12 s (720 frames) gives sigma = 0.81 pp, i.e. a 1.2
+# sigma band -- that version failed here on its first run at 6.39%, which
+# was correct behaviour from the tracker and a badly sized test.
+_E2E_FPS = "800"
+_E2E_SECONDS = 10.0
+_E2E_MIN_FRAMES = 6000
+
+
 @pytest.mark.skipif(not MOCK_DEVICE.exists(), reason="T04 mock_device.py not present")
 def test_end_to_end_measured_rate_matches_requested_rate():
     """Acceptance: --drop-rate 0.05 must read back as 4-6%."""
     lines, _ = _run_mock(
-        ["--fps", "60", "--mic-fps", "60", "--drop-rate", "0.05", "--seed", "1234"],
-        seconds=12.0,
+        ["--fps", _E2E_FPS, "--mic-fps", _E2E_FPS, "--drop-rate", "0.05", "--seed", "1234"],
+        seconds=_E2E_SECONDS,
     )
     tracker = DropTracker(window_s=3600.0)
     _feed(tracker, lines)
 
     for stream in ("tof_A", "tof_B", "mic"):
         s = tracker.stats(stream)
-        assert s.expected > 300, f"{stream}: only {s.expected} frames, sample too small"
+        assert s.expected >= _E2E_MIN_FRAMES, (
+            f"{stream}: only {s.expected} frames scheduled; below this the "
+            f"4-6% band is within sampling noise and proves nothing"
+        )
         assert 0.04 <= s.drop_rate <= 0.06, f"{stream}: {s.drop_rate:.4f} outside 4-6%"
         assert s.resyncs == 0 and s.anomalies == 0
 
 
 @pytest.mark.skipif(not MOCK_DEVICE.exists(), reason="T04 mock_device.py not present")
 def test_end_to_end_agrees_with_device_reported_drops():
-    """Acceptance: host-derived rate within 0.5 pp of the firmware's $H."""
+    """Acceptance: host-derived count within 0.5 pp of the firmware's $H.
+
+    Sampled at the same instant (the feed stops at the last ``$H``) the two
+    sides are counting the same coin flips, but they cannot agree exactly,
+    and the direction of the disagreement is fixed. The host infers a drop
+    from the gap between two *received* frames, so a drop with no received
+    frame after it yet is invisible to it: the host always trails the device
+    by exactly the run of drops immediately preceding the ``$H``.
+
+    So the assertion is one-sided. ``delta <= 0`` is a real invariant -- a
+    host counting MORE drops than the device means it invented one -- while
+    the lower bound is just "that trailing run is short", which it is:
+    P(run >= 8) at 5% is about 4e-11.
+    """
     lines, _ = _run_mock(
-        ["--fps", "60", "--mic-fps", "60", "--drop-rate", "0.05", "--seed", "99"],
-        seconds=12.0,
+        ["--fps", _E2E_FPS, "--mic-fps", _E2E_FPS, "--drop-rate", "0.05", "--seed", "99"],
+        seconds=_E2E_SECONDS,
     )
     tracker = DropTracker(window_s=3600.0)
-    device_drops = _feed(tracker, lines)
+    device_drops = _feed(tracker, lines, stop_at_last_h=True)
     assert device_drops is not None, "no $H line seen"
 
     for stream, cmp in tracker.cross_check(device_drops).items():
-        # The device's $H is stamped before the frames that followed it, so
-        # the host legitimately sees a few more drops than the last $H
-        # reported. That is a small positive delta, never a negative one:
-        # the host cannot know about a drop the device has not counted.
-        assert cmp["delta"] >= 0, f"{stream}: host {cmp['host']} < device {cmp['device']}"
-        assert abs(cmp["rate_delta"]) < 0.005, (
-            f"{stream}: {cmp['rate_delta']:.4f} exceeds 0.5 pp "
-            f"(host {cmp['host']} vs device {cmp['device']})"
+        assert tracker.stats(stream).expected >= _E2E_MIN_FRAMES
+        assert -8 <= cmp["delta"] <= 0, (
+            f"{stream}: host counted {cmp['host']} drops, device reported "
+            f"{cmp['device']} ({cmp['rate_delta'] * 100:.3f} pp apart)"
         )
+        assert abs(cmp["rate_delta"]) < 0.005  # the story's stated threshold
 
 
 @pytest.mark.skipif(not MOCK_DEVICE.exists(), reason="T04 mock_device.py not present")
 def test_end_to_end_clean_link_reports_zero():
     """No drop injection: the tracker must not manufacture losses."""
-    lines, _ = _run_mock(["--fps", "60", "--mic-fps", "60", "--seed", "7"], seconds=6.0)
+    lines, _ = _run_mock(
+        ["--fps", _E2E_FPS, "--mic-fps", _E2E_FPS, "--seed", "7"], seconds=5.0
+    )
     tracker = DropTracker(window_s=3600.0)
-    _feed(tracker, lines)
+    device_drops = _feed(tracker, lines, stop_at_last_h=True)
     for stream in ("tof_A", "tof_B", "mic"):
         s = tracker.stats(stream)
-        assert s.expected > 100
+        assert s.expected > 1000
         assert (s.missing, s.resyncs, s.anomalies) == (0, 0, 0)
+        assert device_drops[stream] == 0

@@ -171,18 +171,20 @@ static void print_tof_line(char sensor_letter, uint32_t seq, int64_t t_us,
                             const VL53L7CX_ResultsData *res)
 {
     const int dim = TOF_GRID_DIM * TOF_GRID_DIM;
+    int len = 0;
 
     uart_out_lock();
-    printf("$T,%c,%" PRIu32 ",%" PRId64 ",%d", sensor_letter, seq, t_us, dim);
+    len += printf("$T,%c,%" PRIu32 ",%" PRId64 ",%d", sensor_letter, seq, t_us, dim);
     for (int i = 0; i < dim; i++) {
         bool valid = (res->target_status[i] == 5 || res->target_status[i] == 9);
-        printf(",%d", valid ? res->distance_mm[i] : -1);
+        len += printf(",%d", valid ? res->distance_mm[i] : -1);
     }
     for (int i = 0; i < dim; i++) {
         bool valid = (res->target_status[i] == 5 || res->target_status[i] == 9);
-        printf(",%d", valid ? (int)((res->signal_per_spad[i] + 50) / 100) : -1);
+        len += printf(",%d", valid ? (int)((res->signal_per_spad[i] + 50) / 100) : -1);
     }
-    printf("\n");
+    len += printf("\n");
+    uart_out_add_bytes((size_t)len);   /* A15: bandwidth accounting, see uart_out.h */
     uart_out_unlock();
 }
 
@@ -194,7 +196,8 @@ void tof_print_status(void)
      * every heartbeat request, exactly when B05/B03 need them most. They
      * share seq's session boundary instead (reset only on restart). */
     uart_out_lock();
-    printf("$STATUS,res=%d,proto=%d,fw=%s\n", TOF_GRID_DIM, TOF_PROTO_VERSION, FW_GIT_SHA);
+    int len = printf("$STATUS,res=%d,proto=%d,fw=%s\n", TOF_GRID_DIM, TOF_PROTO_VERSION, FW_GIT_SHA);
+    uart_out_add_bytes((size_t)len);   /* A15: bandwidth accounting, see uart_out.h */
     uart_out_unlock();
 }
 
@@ -219,15 +222,11 @@ void tof_print_heartbeat(void)
      * remove a bias that's inside t_us before the trip even starts. */
     int64_t t_us = esp_timer_get_time();
 
-    /* TODO(A13/A14 交接): bone_mic hasn't exposed a mic-side drop counter
-     * yet -- placeholder 0 until bone_mic_drop_count() lands. */
-    uint32_t drop_M = 0;
-
     printf("$H,%" PRId64 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%d\n",
            t_us,
            tof_get_drop_notready(0) + tof_get_drop_error(0),
            tof_get_drop_notready(1) + tof_get_drop_error(1),
-           drop_M,
+           bone_mic_drop_count(),
            (uint32_t)esp_get_free_heap_size(),
            (int)s_results[0].silicon_temp_degc);
     uart_out_unlock();
@@ -272,12 +271,25 @@ void app_main(void)
      * tof_print_heartbeat(), this just adds the unsolicited once-a-second
      * one CONTRACTS.md #1.1 implies for a live "still alive" signal. */
     int64_t last_heartbeat_us = esp_timer_get_time();
+    unsigned heartbeat_count = 0;
 
     while (1) {
         int64_t now_us = esp_timer_get_time();
         if (now_us - last_heartbeat_us >= 1000000) {
             tof_print_heartbeat();
             last_heartbeat_us = now_us;
+            heartbeat_count++;
+
+            /* A15: stack headroom for THIS task (app_main / the ToF loop).
+             * Logged every 10s, not every heartbeat, so a 5-minute
+             * regression run doesn't flood the monitor log. mic_task's own
+             * headroom is bone_mic.c's (A12/A14) to log -- this task can
+             * only read its own stack. */
+            if (heartbeat_count % 10 == 0) {
+                UBaseType_t words_free = uxTaskGetStackHighWaterMark(NULL);
+                ESP_LOGI(TAG, "a15_perf: tof_task stack headroom = %u bytes",
+                         (unsigned)(words_free * sizeof(StackType_t)));
+            }
         }
 
         for (size_t i = 0; i < NUM_SENSORS; i++) {

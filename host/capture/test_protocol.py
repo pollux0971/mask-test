@@ -12,11 +12,14 @@ import pytest
 
 from host.capture.protocol import (
     MAX_LINE_LEN,
+    PARSERS,
+    V1_WARNING,
     READLINE_BUFFER_MIN,
     N_MELS,
     PROTO_VERSION,
     ProtocolParser,
     parse_line,
+    parse_line_v1,
 )
 
 # ---------------------------------------------------------------- §1.1 範例
@@ -82,8 +85,10 @@ def test_parse_mic_full_scale():
     e = parse_line(MIC_CLAP)
     assert e == {
         "type": "mic",
+        "proto": 2,
         "seq": 3151,
         "t_us": 1737863421126400,
+        "has_timestamp": True,
         "rms": 28901,
         "peak": 32767,
     }
@@ -123,7 +128,7 @@ def test_parse_mel_frame():
 def test_parse_record_line_is_recognised():
     """`$REC` 不是 B01 的四種資料行，但也不能被算成畸形行。"""
     e = parse_line("$REC,start,5")
-    assert e == {"type": "record", "state": "recording", "seconds": 5}
+    assert e == {"type": "record", "proto": 2, "state": "recording", "seconds": 5}
 
 
 def test_parse_8x8_frame_length_not_hardcoded():
@@ -388,3 +393,349 @@ def test_five_minutes_of_synthetic_traffic_never_raises():
     assert p.stats.parsed > 18000
     assert p.stats.malformed == frames // 50 + (1 if frames % 50 > 7 else 0)
     assert p.version_mismatch is False
+
+
+# ================================================================ B02 v1/v2
+
+# 真實舊韌體（`fb286d1:vl53l7cx_test/main/vl53l7cx_test.c:135`）：
+# dim 欄位是**邊長**，且**只有距離沒有 signal**。
+TOF_V1_FW = "$TOF,A,4," + ",".join(["120", "0", "4000", "-1"] * 4)
+# `mock_device.py --proto v1`：dim 欄位是**zone 數**，且**有 signal**。
+TOF_V1_MOCK = "$TOF,B,16," + ",".join(["300"] * 16 + ["70"] * 16)
+MIC_V1 = "$MIC,322.1,498"          # 舊韌體 printf("$MIC,%.1f,%d")
+STATUS_V1 = "$STATUS,res=4"        # 沒有 proto=、沒有 fw=
+
+
+def test_parsers_table_matches_story_sketch():
+    assert PARSERS[1] is parse_line_v1
+    assert PARSERS[2] is parse_line
+
+
+# ------------------------------------------- v1 兩種 $TOF 方言都要解得出來
+
+
+def test_v1_real_firmware_tof_side_dim_no_signal():
+    e = parse_line_v1(TOF_V1_FW)
+    assert e["proto"] == 1
+    assert e["sensor"] == "A"
+    assert e["dim"] == 16                 # 邊長 4 → 16 zones
+    assert e["signal_present"] is False
+    assert e["raw_signal"] is None        # 舊韌體根本沒送，不捏造 0
+    assert all(s is None for s in e["signal"])
+    assert e["distance"][0] == 120 and e["distance"][1] == 0
+    assert e["distance"][3] is None and e["valid"][3] is False
+    assert e["n_valid"] == 12             # 每 4 個有 1 個 -1
+    assert e["pair_violations"] == 0      # 沒有 signal 就沒有配對可違反
+
+
+def test_v1_mock_tof_zone_dim_with_signal():
+    e = parse_line_v1(TOF_V1_MOCK)
+    assert e["dim"] == 16
+    assert e["signal_present"] is True
+    assert e["signal"][0] == 70
+    assert e["n_valid"] == 16
+
+
+def test_v1_8x8_real_firmware_dialect():
+    e = parse_line_v1("$TOF,A,8," + ",".join(["500"] * 64))
+    assert e["dim"] == 64 and e["signal_present"] is False
+
+
+def test_v1_tof_has_no_seq_or_timestamp_and_never_fakes_them():
+    """v1 線上就沒有這兩個欄位。填 None，不補 0、不補現在時間。"""
+    for line in (TOF_V1_FW, TOF_V1_MOCK):
+        e = parse_line_v1(line)
+        assert e["seq"] is None
+        assert e["t_us"] is None
+        assert e["has_timestamp"] is False
+
+
+def test_v1_mic_keeps_float_rms():
+    e = parse_line_v1(MIC_V1)
+    assert e["proto"] == 1
+    assert e["rms"] == pytest.approx(322.1)   # v1 是浮點，不四捨五入假裝是 v2
+    assert e["peak"] == 498
+    assert e["t_us"] is None
+
+
+def test_v1_status_is_version_agnostic_and_reports_no_proto():
+    """`$STATUS` 是唯一兩版格式相同的行，兩個解析器結果要一致。"""
+    assert parse_line_v1(STATUS_V1) == parse_line(STATUS_V1)
+    e = parse_line_v1(STATUS_V1)
+    assert e["res"] == 4 and e["dim"] == 16
+    # 裝置沒講版本 → None。不可以蓋成 1 假裝裝置說了它是 v1。
+    assert e["proto"] is None
+
+
+def test_v1_rec_line_shared_with_v2():
+    assert parse_line_v1("$REC,start,5")["state"] == "recording"
+
+
+@pytest.mark.parametrize("line", [
+    pytest.param("$TOF,A,4,120,0,4000", id="v1-tof-short"),
+    pytest.param("$TOF,A,5," + ",".join(["1"] * 25), id="v1-tof-bad-dim"),
+    pytest.param("$TOF,C,4," + ",".join(["1"] * 16), id="v1-tof-bad-sensor"),
+    pytest.param("$TOF,A,4," + ",".join(["1"] * 24), id="v1-tof-count-between"),
+    pytest.param("$MIC,322.1", id="v1-mic-short"),
+    pytest.param("$MIC,abc,498", id="v1-mic-nan-rms"),
+    pytest.param("$MIC,nan,498", id="v1-mic-literal-nan"),
+    pytest.param("$MIC,inf,498", id="v1-mic-inf"),
+    pytest.param("$MIC,322.1,40000", id="v1-mic-peak-overflow"),
+    pytest.param("$T,A,1,1000,16," + ",".join(["1"] * 32), id="v2-line-into-v1-parser"),
+])
+def test_v1_malformed_returns_none_never_raises(line):
+    assert parse_line_v1(line) is None
+
+
+# ----------------------------------------- 預設嚴格：降級不能是預設行為
+
+
+def test_default_parser_still_rejects_v1_status():
+    p = ProtocolParser()
+    assert p.allow_v1 is False
+    e = p.feed(STATUS_V1)
+    assert e["compatible"] is False
+    assert p.version_mismatch is True
+    assert p.degraded is False
+    assert p.recording_allowed is False
+    assert "allow_v1=True" in p.mismatch_reason   # 告訴使用者有這個選項
+
+
+def test_default_parser_detects_v1_from_data_lines_without_status():
+    """v1 韌體開機只印一次 `$STATUS`。主機中途接上去永遠等不到那一行，
+    所以光看到 `$TOF` 就要能判定版本不符，而不是把它算成畸形行。"""
+    p = ProtocolParser()
+    assert p.feed(TOF_V1_FW) is None
+    assert p.version_mismatch is True
+    assert p.stats.malformed == 0
+    assert p.stats.dropped_version_mismatch == 1
+    assert "$TOF" in p.mismatch_reason
+    for line in (TOF_V1_MOCK, MIC_V1):
+        assert p.feed(line) is None
+    assert p.stats.dropped_version_mismatch == 3
+    assert p.stats.malformed_rate == 0.0     # 錯誤率不該被版本問題污染
+
+
+# ---------------------------------------------- allow_v1=True 的降級模式
+
+
+def test_allow_v1_status_enters_degraded_mode():
+    p = ProtocolParser(allow_v1=True)
+    e = p.feed(STATUS_V1)
+    assert p.version_mismatch is False
+    assert p.protocol_version == 1
+    assert p.degraded is True
+    assert p.proto_confirmed is True
+    assert e["proto_detected"] == 1
+    assert e["degraded"] is True
+    assert e["warning"] == V1_WARNING
+    assert e["recording_allowed"] is False
+
+
+def test_degraded_mode_parses_v1_data_lines():
+    p = ProtocolParser(allow_v1=True)
+    p.feed(STATUS_V1)
+    events = p.feed_many([TOF_V1_FW, TOF_V1_MOCK, MIC_V1, "$REC,start,5"])
+    assert [e["type"] for e in events] == ["tof", "tof", "mic", "record"]
+    assert all(e["proto"] == 1 for e in events)
+    assert p.stats.malformed == 0
+    assert p.stats.v1_lines == 4
+
+
+def test_degraded_mode_warning_and_recording_flag():
+    """驗收條件：v1 模式下錄製功能被停用或明顯警示。"""
+    p = ProtocolParser(allow_v1=True)
+    p.feed(STATUS_V1)
+    assert p.warning == V1_WARNING
+    assert "無時間戳" in p.warning
+    assert p.recording_allowed is False
+    st = p.state()
+    assert st["protocol_version"] == 1
+    assert st["degraded"] is True and st["recording_allowed"] is False
+    assert st["warning"] == V1_WARNING
+
+
+def test_v2_mode_has_no_warning_and_allows_recording():
+    for p in (ProtocolParser(), ProtocolParser(allow_v1=True)):
+        p.feed(STATUS_V2)
+        assert p.protocol_version == 2
+        assert p.degraded is False
+        assert p.warning is None
+        assert p.recording_allowed is True
+        assert p.state()["fw"] == "a1b2c3d"
+
+
+def test_allow_v1_detects_v1_from_data_lines_without_status():
+    """沒收到 `$STATUS` 也要能靠 `$TOF` 認出對方是 v1。"""
+    p = ProtocolParser(allow_v1=True)
+    e = p.feed(TOF_V1_FW)
+    assert e is not None and e["proto"] == 1
+    assert p.protocol_version == 1
+    assert p.degraded is True
+    assert p.recording_allowed is False
+
+
+def test_allow_v1_still_rejects_unknown_future_proto():
+    """允許 v1 不代表什麼版本都收。proto=3 主機不認得，一樣要停。"""
+    p = ProtocolParser(allow_v1=True)
+    e = p.feed("$STATUS,res=4,proto=3,fw=deadbee")
+    assert e["compatible"] is False
+    assert p.version_mismatch is True
+    assert p.degraded is False
+    assert p.feed(TOF_A) is None
+    assert p.feed(TOF_V1_FW) is None
+
+
+# --------------------------------------------------- 韌體切換：雙向都要通
+
+
+def test_switch_v1_to_v2_at_runtime():
+    """燒錄新韌體、裝置重開機 → 重發 `$STATUS`，主機自動切回 v2。"""
+    p = ProtocolParser(allow_v1=True)
+    p.feed(STATUS_V1)
+    assert p.feed(TOF_V1_FW)["proto"] == 1
+    p.feed(STATUS_V2)
+    assert p.degraded is False and p.recording_allowed is True
+    assert p.feed(TOF_A)["proto"] == 2
+    assert p.stats.malformed == 0
+
+
+def test_switch_v2_to_v1_at_runtime():
+    """燒回舊韌體也要通，而且要重新亮出警告。"""
+    p = ProtocolParser(allow_v1=True)
+    p.feed(STATUS_V2)
+    assert p.feed(TOF_A)["proto"] == 2
+    p.feed(STATUS_V1)
+    assert p.degraded is True
+    assert p.warning == V1_WARNING
+    assert p.feed(TOF_V1_FW)["proto"] == 1
+    assert p.stats.malformed == 0
+    # `$STATUS` 兩版共用，不歸給任何一版；只有資料行才計數。
+    assert p.stats.v1_lines == 1 and p.stats.v2_lines == 1
+
+
+def test_mixed_stream_counts_both_versions_separately():
+    p = ProtocolParser(allow_v1=True)
+    p.feed(STATUS_V2)
+    p.feed(TOF_A)
+    p.feed(MIC_CLAP)
+    p.feed(TOF_V1_FW)          # 不該出現的混流，但要看得到而不是崩掉
+    p.feed(MIC_V1)
+    assert p.stats.v2_lines == 2       # $T + $M（$STATUS 不歸給任何一版）
+    assert p.stats.v1_lines == 2
+    assert p.stats.malformed == 0
+
+
+def test_degraded_mode_survives_noise():
+    p = ProtocolParser(allow_v1=True)
+    p.feed(STATUS_V1)
+    stream = [
+        "I (123) main: booting",
+        TOF_V1_FW[:30],                       # 殘行
+        "BEGIN_WAV_B64 rate=16000 bits=16 channels=1 bytes=160000",
+        "AAAA//8AAP//AAA=" * 20,
+        MIC_V1,
+        b"$TOF,A,4,\xff\xfe garbage",
+        TOF_V1_MOCK,
+    ]
+    events = p.feed_many(stream)
+    assert [e["type"] for e in events] == ["mic", "tof"]
+    assert p.stats.malformed == 2
+    assert p.degraded is True                 # 雜訊不該把版本狀態弄丟
+
+
+# ==================================================== §1.1.2 $STATUS 音框參數
+
+STATUS_FULL = (
+    "$STATUS,res=8,proto=2,fw=a1b2c3d,"
+    "sr=16000,mel=1,mel_win=512,mel_hop=256,mic_hop=512"
+)
+
+
+def test_status_exposes_audio_frame_params():
+    e = parse_line(STATUS_FULL)
+    assert e["res"] == 8 and e["dim"] == 64 and e["proto"] == 2
+    assert e["sr"] == 16000
+    assert e["mel"] is True
+    assert e["mel_win"] == 512
+    assert e["mel_hop"] == 256      # A14 之後：$F = 62.5 Hz
+    assert e["mic_hop"] == 512      # $M 維持 31.25 Hz
+    assert e["compatible"] is True
+
+
+def test_status_missing_audio_params_are_none_not_defaults():
+    """§1.1.2：缺欄位一律 None。填預設值會讓舊韌體看起來像新韌體，
+    `B06` 就會用錯的幀間距去對齊。"""
+    e = parse_line(STATUS_V2)       # 只有 res/proto/fw
+    for key in ("sr", "mel", "mel_win", "mel_hop", "mic_hop"):
+        assert e[key] is None, key
+
+
+def test_status_mel_off_is_false_not_none():
+    """`mel=0` 是「韌體說了：關」，跟「韌體沒說」必須分得出來。"""
+    e = parse_line("$STATUS,res=4,proto=2,fw=abc,mel=0")
+    assert e["mel"] is False
+    assert e["mel_win"] is None
+
+
+def test_status_field_order_is_irrelevant():
+    """§1.1.2 硬性規定：key=value、順序無關，不可用固定位置切分。"""
+    a = parse_line(STATUS_FULL)
+    b = parse_line(
+        "$STATUS,mic_hop=512,mel_hop=256,fw=a1b2c3d,mel=1,"
+        "proto=2,mel_win=512,res=8,sr=16000"
+    )
+    assert a["fields"] == b["fields"]
+    for key in ("res", "proto", "fw", "sr", "mel", "mel_win", "mel_hop", "mic_hop"):
+        assert a[key] == b[key], key
+
+
+def test_status_unknown_future_fields_are_ignored_not_fatal():
+    """日後還會再加欄位。多出來的欄位不能讓這行解不出來，但也不能被丟掉。"""
+    e = parse_line(STATUS_FULL + ",imu=1,batt_mv=3900")
+    assert e["compatible"] is True and e["mel_hop"] == 256
+    assert e["fields"]["imu"] == "1"
+    assert e["fields"]["batt_mv"] == "3900"
+
+
+def test_status_broken_optional_field_does_not_kill_version_negotiation():
+    """選用參數壞掉時仍要解得出 `proto=`——那行還扛著版本協商。"""
+    e = parse_line("$STATUS,res=4,proto=2,fw=abc,mel_hop=abc,sr=-1,mel=7")
+    assert e is not None
+    assert e["compatible"] is True
+    assert e["mel_hop"] is None and e["sr"] is None and e["mel"] is None
+    assert e["fields"]["mel_hop"] == "abc"      # 原文仍保留供人工判讀
+
+
+def test_parser_state_carries_audio_params_for_b06_and_panel():
+    p = ProtocolParser()
+    p.feed(STATUS_FULL)
+    st = p.state()
+    assert st["mel_hop"] == 256 and st["mic_hop"] == 512
+    assert st["sr"] == 16000 and st["mel"] is True
+    assert st["mel_win"] == 512
+    assert st["fw"] == "a1b2c3d"
+
+
+def test_parser_state_audio_params_none_before_any_status():
+    p = ProtocolParser()
+    st = p.state()
+    for key in ("sr", "mel", "mel_win", "mel_hop", "mic_hop", "fw"):
+        assert st[key] is None, key
+
+
+def test_v1_status_has_no_audio_params():
+    """舊韌體的 `$STATUS,res=4` 什麼都沒說，五個欄位全是 None。"""
+    p = ProtocolParser(allow_v1=True)
+    p.feed(STATUS_V1)
+    st = p.state()
+    assert st["protocol_version"] == 1
+    for key in ("sr", "mel", "mel_win", "mel_hop", "mic_hop"):
+        assert st[key] is None, key
+
+
+def test_status_line_is_not_counted_as_v1_or_v2():
+    p = ProtocolParser()
+    p.feed(STATUS_FULL)
+    assert p.stats.parsed == 1
+    assert p.stats.v1_lines == 0 and p.stats.v2_lines == 0

@@ -40,3 +40,17 @@ bool bone_mic_mel_enabled(void);
  * reset on $STATUS, so repeated PING-triggered $STATUS reissues don't
  * zero it out from under B05). Safe to call from any task. */
 uint32_t bone_mic_drop_count(void);
+
+/* A15/CONTRACTS.md #1.1.2: the audio frame parameters $STATUS needs to
+ * self-describe which version of the $F/$M format the firmware is sending
+ * (A14 changed mel_hop from 512 to 256 samples without changing the wire
+ * format, so the host can't tell versions apart otherwise). Exposed as a
+ * getter rather than duplicating the constants in vl53l7cx_test.c so a
+ * future change to any of these can't silently desync the two files. Any
+ * output pointer may be NULL if that value isn't needed by the caller.
+ *   sr       -- MIC_SAMPLE_RATE_HZ (Hz)
+ *   win      -- MIC_FRAME_SAMPLES, the FFT/analysis window (samples)
+ *   mel_hop  -- MIC_HOP_SAMPLES, $F's frame spacing (samples)
+ *   mic_hop  -- $M's frame spacing (samples) -- 2x mel_hop, since mic_task
+ *               emits $M on every other hop (see mic_task's emit_m_this_hop) */
+void bone_mic_frame_params(uint32_t *sr, uint16_t *win, uint16_t *mel_hop, uint16_t *mic_hop);

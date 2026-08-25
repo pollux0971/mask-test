@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -54,6 +55,23 @@ bool bone_mic_mel_enabled(void)
 uint32_t bone_mic_drop_count(void)
 {
     return s_drop_count;
+}
+
+void bone_mic_frame_params(uint32_t *sr, uint16_t *win, uint16_t *mel_hop, uint16_t *mic_hop)
+{
+    if (sr) {
+        *sr = MIC_SAMPLE_RATE_HZ;
+    }
+    if (win) {
+        *win = MIC_FRAME_SAMPLES;
+    }
+    if (mel_hop) {
+        *mel_hop = MIC_HOP_SAMPLES;
+    }
+    if (mic_hop) {
+        /* $M is emitted every other hop (mic_task's emit_m_this_hop). */
+        *mic_hop = MIC_HOP_SAMPLES * 2;
+    }
 }
 
 /* ESP32-S3's I2S PDM RX has no hardware high-pass filter
@@ -258,6 +276,11 @@ static void mic_task(void *arg)
      * decoupled per the A14 design discussion: CONTRACTS.md §1.1 never
      * required them to share one, and cross-modal alignment is t_us's job. */
     bool emit_m_this_hop = true;
+    /* A15: this task's own stack headroom, logged periodically (not every
+     * hop -- at 62.5 Hz that would flood the monitor log during a 5-minute
+     * regression run). uxTaskGetStackHighWaterMark() only reads the
+     * calling task's own stack, so this has to live inside mic_task. */
+    int64_t last_stack_log_us = esp_timer_get_time();
 
     for (int i = 0; i < MIC_FRAME_SAMPLES; i++) {
         s_hann_window[i] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * i / MIC_FRAME_SAMPLES);
@@ -278,9 +301,14 @@ static void mic_task(void *arg)
             continue;
         }
 
+        /* A14: slide the ring by one hop -- the previous hop's new half
+         * becomes the old half, then this hop's samples are read straight
+         * into the freed tail. No separate read buffer needed. */
+        memmove(s_ring, s_ring + MIC_HOP_SAMPLES, MIC_HOP_SAMPLES * sizeof(int16_t));
+
         size_t bytes_read = 0;
-        esp_err_t err = i2s_channel_read(s_rx_handle, buf, MIC_FRAME_SAMPLES * sizeof(int16_t),
-                                          &bytes_read, 1000);
+        esp_err_t err = i2s_channel_read(s_rx_handle, s_ring + MIC_HOP_SAMPLES,
+                                          MIC_HOP_SAMPLES * sizeof(int16_t), &bytes_read, 1000);
         /* Captured immediately on return: i2s_channel_read() hands back a
          * buffer DMA already filled, so this timestamp marks the *end* of
          * the frame, not its start (see t_start below). */
@@ -294,63 +322,89 @@ static void mic_task(void *arg)
         }
 
         size_t n = bytes_read / sizeof(int16_t);
-        dc_blocker_apply(&stream_filter, buf, n);
+        dc_blocker_apply(&stream_filter, s_ring + MIC_HOP_SAMPLES, n);
 
-        int64_t sum_sq = 0;
-        int16_t peak = 0;
-        for (size_t i = 0; i < n; i++) {
-            int16_t s = buf[i];
-            sum_sq += (int64_t)s * (int64_t)s;
-            int16_t a = (s < 0) ? (int16_t)(-s) : s;
-            if (a > peak) {
-                peak = a;
-            }
-        }
-        double rms = (n > 0) ? sqrt((double)sum_sq / (double)n) : 0.0;
+        /* CONTRACTS.md 1.3: t_us is the timestamp of the *window's* first
+         * sample, not the read-return time. The ring's oldest sample is
+         * MIC_FRAME_SAMPLES (not just this hop's n) behind t_end -- this is
+         * the start of the full 512-sample analysis window that both $F
+         * and (when emitted) $M below describe. */
+        int64_t t_start = t_end - (int64_t)MIC_FRAME_SAMPLES * 1000000 / MIC_SAMPLE_RATE_HZ;
 
-        /* CONTRACTS.md 1.3: t_us is the timestamp of the frame's first
-         * sample, not the read-return time -- cross-modal alignment with
-         * ToF needs the frame's start, and this 32ms gap is close in
-         * magnitude to the lip-to-voice onset delay being measured. */
-        int64_t t_start = t_end - (int64_t)n * 1000000 / MIC_SAMPLE_RATE_HZ;
-
-        /* $F needs a full MIC_FRAME_SAMPLES frame (fixed FFT length); a
-         * short read is treated like the failure case above -- no $F for
-         * this seq rather than feeding the FFT a partially-stale buffer. */
+        /* $F needs a full hop of fresh samples; a short read is treated
+         * like the failure case above -- no $F for this hop rather than
+         * feeding the FFT a partially-stale ring. */
         int16_t mel_out[MEL_N_FILTERS];
         bool have_mel = false;
         int64_t mel_us = 0;
-        if (fft_ready && s_mel_enabled && n == MIC_FRAME_SAMPLES) {
+        if (fft_ready && s_mel_enabled && n == MIC_HOP_SAMPLES) {
             int64_t t0 = esp_timer_get_time();
-            mic_compute_mel_frame(buf, mel_out);
+            mic_compute_mel_frame(s_ring, mel_out);
             mel_us = esp_timer_get_time() - t0;
             have_mel = true;
         }
 
-        /* One compact line per ~32ms frame for the live monitor panel
-         * (monitor/): plain printf, no ESP_LOG prefix, '$' sentinel so the
-         * host bridge can pick it out cleanly. rms/peak are both i16 raw
-         * PCM amplitude per CONTRACTS.md 1.1 (protocol v2). $F shares this
-         * frame's seq/t_us with $M (CONTRACTS.md §1.1/A12), emitted under
-         * the same lock so the two lines can't be interleaved with output
-         * from another task. */
+        /* A14: $M only on every other hop (~31.25 Hz), computed over the
+         * same 512-sample ring $F just analyzed -- not just this hop's 256
+         * new samples, so it reflects the full window rather than half of
+         * it going unused. */
+        bool have_m = false;
+        int16_t m_rms = 0;
+        int16_t m_peak = 0;
+        if (emit_m_this_hop && n == MIC_HOP_SAMPLES) {
+            int64_t sum_sq = 0;
+            int16_t peak = 0;
+            for (int i = 0; i < MIC_FRAME_SAMPLES; i++) {
+                int16_t s = s_ring[i];
+                sum_sq += (int64_t)s * (int64_t)s;
+                int16_t a = (s < 0) ? (int16_t)(-s) : s;
+                if (a > peak) {
+                    peak = a;
+                }
+            }
+            double rms = sqrt((double)sum_sq / (double)MIC_FRAME_SAMPLES);
+            m_rms = (int16_t)lround(rms);
+            m_peak = peak;
+            have_m = true;
+        }
+        emit_m_this_hop = !emit_m_this_hop;
+
+        /* One compact line per hop for the live monitor panel (monitor/):
+         * plain printf, no ESP_LOG prefix, '$' sentinel so the host bridge
+         * can pick it out cleanly. rms/peak are both i16 raw PCM amplitude
+         * per CONTRACTS.md 1.1 (protocol v2). $F and $M now keep
+         * independent seq counters (A14) but share this hop's t_start,
+         * emitted under the same lock so they can't be interleaved with
+         * output from another task. */
         uart_out_lock();
-        printf("$M,%" PRIu32 ",%" PRId64 ",%d,%d\n", seq, t_start, (int16_t)lround(rms), peak);
+        if (have_m) {
+            printf("$M,%" PRIu32 ",%" PRId64 ",%d,%d\n", m_seq, t_start, m_rms, m_peak);
+            m_seq++;
+        }
         if (have_mel) {
-            printf("$F,%" PRIu32 ",%" PRId64, seq, t_start);
+            printf("$F,%" PRIu32 ",%" PRId64, f_seq, t_start);
             for (int m = 0; m < MEL_N_FILTERS; m++) {
                 printf(",%d", mel_out[m]);
             }
             printf("\n");
+            f_seq++;
         }
         uart_out_unlock();
-        seq++;
 
         if (have_mel) {
             /* A10's GO/NO-GO still needs an on-hardware number; this is
              * where it'll come from once someone raises this tag's log
-             * level (ESP_LOGD is compiled in but filtered by default). */
+             * level (ESP_LOGD is compiled in but filtered by default).
+             * With A14's 50% overlap, this now runs twice as often -- the
+             * number to watch for whether hop 256 holds up in real time. */
             ESP_LOGD(TAG, "mel frame fft+mel=%lld us", (long long)mel_us);
+        }
+
+        if (t_end - last_stack_log_us >= 10 * 1000000) {
+            UBaseType_t words_free = uxTaskGetStackHighWaterMark(NULL);
+            ESP_LOGI(TAG, "a15_perf: mic_task stack headroom = %u bytes",
+                     (unsigned)(words_free * sizeof(StackType_t)));
+            last_stack_log_us = t_end;
         }
     }
 }
