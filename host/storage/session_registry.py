@@ -67,6 +67,7 @@ class SessionInfo:
     warnings: list = field(default_factory=list)
     target_check: str = "not_configured"  # "not_configured" | "ok" | "warning"
     note: str = ""
+    baseline_done: bool = False  # B10：session start 後強制錄 30s baseline，錄好前不能進 trial
 
     def to_dict(self) -> dict:
         return {
@@ -74,6 +75,7 @@ class SessionInfo:
             "mode": self.mode, "distance_mm": self.distance_mm, "angle_deg": self.angle_deg,
             "ambient": self.ambient, "notes": self.notes, "started_at": self.started_at,
             "warnings": list(self.warnings), "target_check": self.target_check, "note": self.note,
+            "baseline_done": self.baseline_done,
         }
 
 
@@ -201,6 +203,14 @@ class SessionRegistry:
         ended = self._current
         self._current = None
         return ended
+
+    def mark_baseline_recorded(self) -> None:
+        """B10：baseline 品質檢查通過、trial_000 已經寫進 HDF5 之後呼叫。
+        `B11`（trial 狀態機）應該在允許任何非 baseline 的 trial 開始前檢查
+        `current.baseline_done`——這裡只負責記錄狀態，不負責擋（B11 的事）。"""
+        if self._current is None:
+            raise NoActiveSessionError("沒有進行中的 session")
+        self._current.baseline_done = True
 
     def _next_session_id(self, now: datetime) -> str:
         """`<date>_S<NN>`，跟 B07 story 範例的 session 檔名慣例一致

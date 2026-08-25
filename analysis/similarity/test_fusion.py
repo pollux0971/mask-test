@@ -158,31 +158,39 @@ def test_reject_tof_still_works_after_wiring_into_d07():
     還能不能正常運作——不是只驗證分數，要驗證 reject_tof 這個判定本身。
 
     跟 D06 自己的測試一樣用統計方式驗證（很多次試驗看整體比例），不是斷言
-    單一一次抽樣的結果——D06 已經證實這個門檻機制本身是機率性的（大約
-    5-10% 的真詞會落在誤拒的尾端），單一樣本斷言碰到那個尾端就會不穩定
-    (flaky)，用整體比例驗證「機制還有沒有正常運作」才是誠實的做法。
+    單一一次抽樣的結果——D06 已經證實這個門檻機制本身是機率性的，單一樣本
+    斷言碰到尾端就會不穩定 (flaky)，用整體比例驗證「機制還有沒有正常運作」
+    才是誠實的做法。
+
+    **合成資料的坑（值得記錄）：** 一開始我用「每個類別中心 = 隨機向量 +
+    `i*某常數`（常數加到每一維）」，結果所有類別的向量幾乎指向同一個方向
+    （常數項在所有維度上是共同的，隨機項相對很小），cosine 距離幾乎分不出
+    類別，導致這裡的拒識判定整個崩潰（100% 誤拒真詞）。改成每個類別中心是
+    各自獨立、正規化到相同量級的隨機方向（`_random_direction`）才正確。
     """
     rng = np.random.default_rng(2)
     slices = {"tof": slice(0, 8), "mel": slice(8, 12)}
     n_dims = 12
     n_trials = 100
+    n_templates = 30
+    noise = 0.15
 
-    word_centers = {f"w{i}": rng.normal(size=n_dims) * 5 + i * 50 for i in range(4)}
+    def _random_direction(rng, dims, magnitude=10.0):
+        v = rng.normal(size=dims)
+        return v / np.linalg.norm(v) * magnitude
+
+    word_centers = {f"w{i}": _random_direction(rng, n_dims) for i in range(4)}
     templates_by_class = {
-        label: [_make_seq(center, rng, noise=0.2) for _ in range(20)]
+        label: [_make_seq(center, rng, noise=noise) for _ in range(n_templates)]
         for label, center in word_centers.items()
     }
-    # 拒識類別要有自己明確的方向、且量級跟詞類別相當——cosine 距離只看方向，
-    # 近零向量的方向在雜訊下不穩定（D05 踩過這個坑），量級差太多也會讓同樣的
-    # 加性雜訊在拒識類別上造成的角度擾動遠小於詞類別（量級越大，同樣的雜訊
-    # 造成的方向偏移越小），使 theta_reject 校準得過緊而誤拒真詞。
-    reject_center = rng.normal(size=n_dims) * 5 + 200.0
-    reject_templates = [_make_seq(reject_center, rng, noise=0.2) for _ in range(20)]
+    reject_center = _random_direction(rng, n_dims)
+    reject_templates = [_make_seq(reject_center, rng, noise=noise) for _ in range(n_templates)]
 
     # 情境一：query 真的是某個詞 -> ToF 大多數情況不應該拒識
     word_rejects = []
     for _ in range(n_trials):
-        word_query = _make_seq(word_centers["w2"], rng, noise=0.2)
+        word_query = _make_seq(word_centers["w2"], rng, noise=noise)
         tri = compute_tri_result(word_query, templates_by_class, reject_templates, slices, cosine_dist)
         word_rejects.append(tri.reject_tof)
     word_false_reject_rate = np.mean(word_rejects)
@@ -191,7 +199,7 @@ def test_reject_tof_still_works_after_wiring_into_d07():
     # 情境二：query 真的是靜止（貼近 reject 中心）-> ToF 大多數情況應該拒識
     rest_rejects = []
     for _ in range(n_trials):
-        rest_query = _make_seq(reject_center, rng, noise=0.2)
+        rest_query = _make_seq(reject_center, rng, noise=noise)
         tri = compute_tri_result(rest_query, templates_by_class, reject_templates, slices, cosine_dist)
         rest_rejects.append(tri.reject_tof)
     rest_reject_rate = np.mean(rest_rejects)

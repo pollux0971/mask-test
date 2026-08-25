@@ -870,3 +870,37 @@ def test_mock_device_heartbeat_with_bw_field_shape():
     assert e["bw_bytes_since_last"] == 28388
     assert e["heap"] == 151142 and e["temp_c"] == 38
     assert e["extra"] == []
+
+
+# ==================================================== mock device 的 $F（T04）
+
+def test_mel_frame_from_mock_device_parses():
+    """`mock_device.py --mel 1` 實際送出的 `$F`（抄自實跑輸出的前幾個 band）。"""
+    bands = [-605, -587, -612, -608, -603, -611, -615, -617, -625, -626]
+    line = "$F,0,184," + ",".join(str(b) for b in bands + [-620] * 30)
+    e = parse_line(line)
+    assert e["type"] == "mel" and e["proto"] == 2
+    assert e["seq"] == 0 and e["t_us"] == 184
+    assert len(e["mel_q"]) == N_MELS
+    assert e["mel_q"][:10] == bands
+    # §3.1：int16 = round(log_mel * 100)，所以 -605 → -6.05
+    assert e["log_mel"][0] == pytest.approx(-6.05)
+    assert e["extra"] == []
+
+
+def test_mel_seq_is_independent_of_mic_seq():
+    """§1.1.1：`$F` 與 `$M` 是兩條獨立串流，各自的 `seq` 沒有固定關係。
+    解析器只要忠實暴露各自的 `seq`，不可以假設任何比例。"""
+    mel = parse_line("$F,900,5000," + ",".join(["-600"] * N_MELS))
+    mic = parse_line("$M,7,5000,120,900")
+    assert mel["seq"] == 900 and mic["seq"] == 7
+    assert mel["t_us"] == mic["t_us"]        # 同一個 ring 快照可以共用 t_us
+    assert mel["type"] != mic["type"]
+
+
+def test_mel_full_scale_and_noise_floor_values():
+    """§3.1 的值域：log10(max(power, 1e-10)) * 100 → [-1000, 0]。"""
+    floor = parse_line("$F,1,1," + ",".join(["-1000"] * N_MELS))
+    assert floor["log_mel"][0] == pytest.approx(-10.0)
+    ceiling = parse_line("$F,2,1," + ",".join(["0"] * N_MELS))
+    assert ceiling["log_mel"][0] == pytest.approx(0.0)

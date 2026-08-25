@@ -11,6 +11,8 @@ from host.storage.session_registry import (
     load_session_targets,
 )
 
+# B10 補的測試都放在檔案最下面，見 "baseline_done" 區段。
+
 NOT_CONFIGURED = {
     "target_distance_mm": None, "target_angle_deg": None,
     "tolerance_distance_mm": None, "tolerance_angle_deg": None,
@@ -290,3 +292,38 @@ def test_session_id_sequence_increments_within_same_day(tmp_path):
 
     assert info1.session_id == "2026-09-01_S01"
     assert info2.session_id == "2026-09-01_S02"
+
+
+# ---------------------------------------------------------------------------
+# B10：baseline_done — session start 後強制錄 baseline，未錄完不能進 trial
+# （這裡只驗證狀態本身；「擋 trial 開始」是 B11 的事，B11 要檢查這個旗標）
+
+
+def test_baseline_done_defaults_false_on_new_session(tmp_path):
+    reg = _registry(tmp_path)
+    info = reg.start(_valid_metadata())
+    assert info.baseline_done is False
+
+
+def test_mark_baseline_recorded_sets_flag(tmp_path):
+    reg = _registry(tmp_path)
+    reg.start(_valid_metadata())
+    reg.mark_baseline_recorded()
+    assert reg.current.baseline_done is True
+
+
+def test_mark_baseline_recorded_without_active_session_raises(tmp_path):
+    reg = _registry(tmp_path)
+    with pytest.raises(NoActiveSessionError):
+        reg.mark_baseline_recorded()
+
+
+def test_baseline_done_resets_for_new_session(tmp_path):
+    reg = _registry(tmp_path)
+    reg.start(_valid_metadata())
+    reg.mark_baseline_recorded()
+    reg.end()
+
+    info = reg.start(_valid_metadata())
+
+    assert info.baseline_done is False

@@ -26,7 +26,7 @@ DEFAULT_RANDOM_STATE = 0
 P_VALUE_THRESHOLD = 0.01  # 驗收條件：p < 0.01 算通過
 
 
-def _make_estimator():
+def make_estimator():
     """StandardScaler + SVM，跟 story 實作段落一致（無額外 PCA——這是監督式
     分類顯著性檢定，跟 D13 的非監督分群分數是不同工具，不用照搬 D13 的
     PCA(50) 前處理）。"""
@@ -76,7 +76,7 @@ def run_permutation_test(feature_seqs, labels, modality="all",
     cv = max(2, min(cv, min_class_count))
 
     cv_splitter = StratifiedKFold(n_splits=cv, shuffle=True, random_state=random_state)
-    estimator = _make_estimator()
+    estimator = make_estimator()
 
     score, permutation_scores, pvalue = permutation_test_score(
         estimator, X, y,

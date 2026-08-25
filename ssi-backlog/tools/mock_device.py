@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """T04 — synthetic ESP32 mask-sensor device.
 
-Opens a pty, prints the slave path, and streams synthetic $T/$M/$H/$STATUS
-lines (protocol v2, see CONTRACTS.md chapter 1) or, with --proto v1, the
+Opens a pty, prints the slave path, and streams synthetic
+$T/$M/$F/$H/$STATUS lines (protocol v2, see CONTRACTS.md chapter 1) or,
+with --proto v1, the
 legacy $TOF/$MIC/$STATUS lines that the current, unmodified
 vl53l7cx_test/monitor/bridge_server.py already parses.
 
@@ -48,6 +49,12 @@ Fault injection (all optional, off by default):
                                closed and the process exits (simulates an
                                unplugged board)
     --fault clock-jump,disconnect   both, comma-separated
+
+$F (Mel) streaming is off at boot (--mel 1, or MEL:1 at runtime, turns it
+on) and $STATUS's mel= field always reflects the current state. The 40
+bands are a synthetic formant SHAPE, not speech -- see MelModel. Turning it
+on costs ~15.6 KB/s (#1.4), which bw_bytes_since_last will show: 4x4@30Hz
+goes from roughly 25% to 60% of the 460800-baud budget.
 """
 
 import argparse
@@ -62,9 +69,11 @@ import time
 PROTO_VERSION = 2
 
 # $STATUS self-description fields (CONTRACTS.md #1.1.2). Fixed rather than
-# CLI-configurable: T04 does not generate $F, so these describe the firmware
-# the host should expect to be talking to, not anything the mock varies.
-# mel_hop is 256 -- the post-A14 value, matching the current firmware.
+# CLI-configurable: they describe the firmware the host should expect to be
+# talking to. mel_hop is 256 -- the post-A14 value, matching the current
+# firmware -- and the $F emission rate is DERIVED from these two constants
+# (16000/256 = 62.5 Hz), so what the mock advertises and what it actually
+# sends can never drift apart.
 AUDIO_SR_HZ = 16000
 MEL_WIN_SAMPLES = 512
 MEL_HOP_SAMPLES = 256
@@ -78,6 +87,9 @@ def parse_args():
     p.add_argument("--fps", type=float, default=30.0, help="ToF frames/sec per sensor (default 30)")
     p.add_argument("--mic-fps", type=float, default=20.0, help="mic stat frames/sec (default 20)")
     p.add_argument("--heartbeat-interval", type=float, default=1.0, help="seconds between $H lines (default 1.0)")
+    p.add_argument("--mel", choices=["0", "1"], default="0",
+                   help="stream $F Mel frames at boot (default 0 = off, matching the "
+                        "firmware's own default). MEL:1 turns it on at runtime either way.")
     p.add_argument("--dim", type=int, choices=[4, 8], default=4, help="grid side: 4 (16 zones) or 8 (64 zones)")
     p.add_argument("--scenario", choices=["idle", "round", "spread", "random"], default="idle",
                    help="synthetic lip-shape pattern (default idle)")
@@ -164,6 +176,68 @@ class Scenario:
         return int(max(1, min(250, round(val))))
 
 
+class MelModel:
+    """Synthetic 40-band log-mel frames for $F (CONTRACTS.md #1.1 / #3.1).
+
+    This is a *shape*, not speech. No FFT runs here and no audio exists to
+    transform -- the bands are drawn from a formant-like model driven by the
+    same --scenario / bump() envelope that moves the ToF distances, so a
+    frame's Mel energy rises and falls in step with the synthetic "utterance"
+    the ToF grid is showing. That coupling is the point: C10's PCA trajectory
+    and C08's waterfall need structure that correlates across modalities, and
+    pure noise would show none. Do not treat these numbers as acoustically
+    meaningful -- they will not match reference_mel.py on any real audio.
+
+    Wire encoding is #3.1's: int16 = round(log_mel * 100), log_mel being
+    log10(max(power, 1e-10)), so the value range is [-1000, 0].
+    """
+
+    N_MELS = 40
+    NOISE_FLOOR_LOG = -6.0      # quiet room, well above the 1e-10 clamp
+    PEAK_LOG = -1.2             # loud band during an utterance
+
+    # Formant-ish band centres per scenario. "round" (lip-rounded /u/-like)
+    # keeps energy low; "spread" (/i/-like) pushes the second formant up.
+    FORMANTS = {
+        "idle": [],
+        "round": [(3, 2.2, 1.0), (7, 2.8, 0.72)],
+        "spread": [(2, 1.8, 0.95), (21, 4.5, 0.85), (30, 5.0, 0.35)],
+    }
+
+    def __init__(self, rng):
+        self.rng = rng
+
+    def _shape(self, name, t):
+        if name == "random":
+            # Seed with a str, not a tuple: random.Random() rejects tuples.
+            # (Scenario.delta has the same pattern with a tuple and raises --
+            #  see the completion report; not fixed here, it is not this
+            #  story's file section.)
+            prng = random.Random(f"mel-{int(t // PERIOD)}")
+            name = prng.choice(["round", "spread", "idle"])
+        return self.FORMANTS.get(name, [])
+
+    def frame(self, t, scenario_name):
+        """Return 40 int16 values for the $F line at time `t`."""
+        env = bump(t % PERIOD)
+        bands = []
+        for band in range(self.N_MELS):
+            # Gentle spectral tilt: high bands sit a little below low ones
+            # even in silence, like a real noise floor.
+            value = self.NOISE_FLOOR_LOG - 0.9 * (band / (self.N_MELS - 1))
+            # Formants combine by max(), not by sum: two overlapping peaks
+            # summing linearly would push bands past PEAK_LOG and clip at the
+            # 0 ceiling, flattening the very structure C10/C08 need to see.
+            gain = 0.0
+            for centre, width, weight in self._shape(scenario_name, t):
+                gain = max(gain, weight * math.exp(-0.5 * ((band - centre) / width) ** 2))
+            value += (self.PEAK_LOG - self.NOISE_FLOOR_LOG) * env * gain
+            value += self.rng.gauss(0, 0.06)
+            value = max(-10.0, min(0.0, value))
+            bands.append(int(round(value * 100)))
+        return bands
+
+
 class MicModel:
     def __init__(self, rng):
         self.rng = rng
@@ -225,9 +299,15 @@ class MockDevice:
         self.bw_bytes = 0
 
         self.sensor_enabled = {"A": True, "B": True}
-        self.mel_enabled = False  # accepted, no-op: $F is out of T04 scope
+        # Default off, matching the firmware's own default -- and $STATUS says
+        # mel=0 at boot, which the host relies on. MEL:1 (or --mel 1) turns it on.
+        self.mel_enabled = (args.mel == "1")
+        self.mel = MelModel(self.rng)
 
-        self.seq = {"A": 0, "B": 0, "M": 0}
+        # $F has its OWN seq (CONTRACTS.md #1.1.1: four independent streams).
+        # It must not be shared with $M -- they run at different rates, so any
+        # fixed relationship between the two counters would be a lie.
+        self.seq = {"A": 0, "B": 0, "M": 0, "F": 0}
         self.drop = {"A": 0, "B": 0, "M": 0}
 
         self.master_fd, self.slave_fd = pty.openpty()
@@ -322,6 +402,23 @@ class MockDevice:
         else:
             self._write(f"$MIC,{rms:.1f},{peak}")
 
+    def emit_mel(self, t):
+        """$F,<seq>,<t_us>,<m0>..<m39> -- 40 int16 log-mel*100 values (#3.1).
+
+        Not dropped by --drop-rate: $H carries drop_A/drop_B/drop_M and has no
+        drop_F counter, so a dropped $F would be invisible except as a seq gap.
+        Inventing a fault mode the firmware may not have -- and that the host
+        has no counter to cross-check against -- is how a fixture stops being
+        a faithful stand-in. If A-track adds drop_F to $H, revisit this.
+        """
+        if not self.mel_enabled or self.args.proto != "v2":
+            return
+        seq = self.seq["F"]
+        self.seq["F"] += 1
+        t_us = self.now_us()
+        bands = ",".join(str(v) for v in self.mel.frame(t, self.args.scenario))
+        self._write(f"$F,{seq},{t_us},{bands}")
+
     def emit_heartbeat(self, t):
         t_us = self.now_us()
         heap = int(150000 + 20000 * math.sin(t / 37.0) + self.rng.gauss(0, 500))
@@ -379,9 +476,9 @@ class MockDevice:
                 print(f"[mock_device] ignoring malformed MEL: {line}", file=sys.stderr)
                 return
             self.mel_enabled = (val == "1")
-            # $F generation is still out of T04 scope, but the mel= field in
-            # $STATUS is not: the host reads it to know the stream's state.
-            self.resend_status()
+            print(f"[mock_device] MEL={val} ($F streaming {'on' if self.mel_enabled else 'off'})",
+                  file=sys.stderr)
+            self.resend_status()  # output config changed (CONTRACTS.md #1.1)
             return
         if line.startswith("REC:"):
             print(f"[mock_device] REC ignored (WAV dump simulation out of T04 scope): {line}", file=sys.stderr)
@@ -418,9 +515,16 @@ class MockDevice:
         now0 = time.monotonic()
         next_a = next_b = now0
         next_m = now0
+        next_f = now0
         next_h = now0
         tof_period = 1.0 / self.args.fps
         mic_period = 1.0 / self.args.mic_fps
+        # Derived from the very constants $STATUS advertises, not from a
+        # separate CLI knob: 16000/256 = 62.5 Hz. If the mock streamed $F at
+        # some other rate while telling the host mel_hop=256, B06 would
+        # compute the wrong frame spacing and the mock would be lying about
+        # itself -- exactly the class of bug #1.1.2 was added to prevent.
+        mel_period = MEL_HOP_SAMPLES / AUDIO_SR_HZ
 
         try:
             while self._running:
@@ -441,6 +545,17 @@ class MockDevice:
                 if now >= next_m:
                     self.emit_mic(t)
                     next_m += mic_period
+                if now >= next_f:
+                    self.emit_mel(t)
+                    next_f += mel_period
+                    if next_f < now:
+                        # Fell behind -- either the loop was slow, or $F was
+                        # off for a while (next_f is excluded from `due` then,
+                        # so it only advances one period per iteration). Snap
+                        # forward instead of catching up: a backlog would come
+                        # out as a burst of frames with bunched-up t_us, which
+                        # is not something a real device ever does.
+                        next_f = now + mel_period
                 if now >= next_h:
                     self.emit_heartbeat(t)
                     next_h += self.args.heartbeat_interval
@@ -449,7 +564,9 @@ class MockDevice:
 
                 due = min(next_a if self.sensor_enabled["A"] else now + 1,
                           next_b if self.sensor_enabled["B"] else now + 1,
-                          next_m, next_h)
+                          next_m,
+                          next_f if self.mel_enabled else now + 1,
+                          next_h)
                 time.sleep(max(0.0, min(0.02, due - time.monotonic())))
         except KeyboardInterrupt:
             pass
@@ -457,7 +574,8 @@ class MockDevice:
             self.shutdown()
 
     def shutdown(self):
-        print(f"[mock_device] stopping. seq A={self.seq['A']} B={self.seq['B']} M={self.seq['M']} "
+        print(f"[mock_device] stopping. seq A={self.seq['A']} B={self.seq['B']} "
+              f"M={self.seq['M']} F={self.seq['F']} "
               f"drop A={self.drop['A']} B={self.drop['B']} M={self.drop['M']}", file=sys.stderr)
         for fd in (self.slave_fd, self.master_fd):
             try:

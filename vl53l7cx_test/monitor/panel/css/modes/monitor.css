@@ -37,7 +37,7 @@
 }
 
 #mode-monitor .tof-grids {
-  flex: 1;
+  flex: 3;
   min-height: 0;
   display: grid;
   grid-template-columns: repeat(2, 1fr);
@@ -92,3 +92,53 @@
   overflow: hidden;
 }
 #mode-monitor .cell.invalid { color: var(--text-dim); font-weight: 400; }
+
+/* --- C10: PCA live trajectory --- */
+#mode-monitor .pca-panel {
+  flex: 2;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+}
+.pca-model-badge {
+  font-size: 11px;
+  letter-spacing: normal;
+  text-transform: none;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.pca-model-badge.stub { color: var(--warn); }
+.pca-model-badge.live { color: var(--good); }
+.pca-variance {
+  font-size: 11px;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text-dim);
+  margin-left: auto;
+}
+#mode-monitor .pca-canvas-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+#mode-monitor .pca-canvas-wrap canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+/* D08 enrollment templates (confidence ellipses) have no data source yet;
+   this note says so instead of silently showing an empty canvas. Removed
+   once C10's ellipse rendering has real D08 data to draw. */
+.pca-empty-note {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  pointer-events: none;
+}

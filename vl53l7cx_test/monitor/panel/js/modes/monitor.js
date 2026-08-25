@@ -96,6 +96,143 @@ function renderChannel(cells, values, validArr, colorFn) {
 
 let warnedBadLength = false;
 
+// --- C10: live PCA trajectory --------------------------------------------
+//
+// C10.md: "模型參數由 D03 算好透過 API 給前端，前端不做擬合" -- the real
+// model comes from a server endpoint (GET /pca?model=tof_only|enrollment,
+// per esp-mask-test-ad's coordination with B19). That endpoint doesn't
+// exist yet, so this ships with a client-side live-fit STUB for tof_only:
+// a genuine (not fabricated) PCA(2) fit via power iteration over a sliding
+// window of live ToF frames, clearly badged as a stub with drifting axes.
+// enrollment has no legitimate stand-in (its numbers are supposed to mean
+// something specific -- faking them would be worse than not showing them),
+// so it stays unavailable until the real endpoint responds.
+//
+// Model shape is deliberately generic (not "hardcode 64 dims") so a real
+// server model swaps in with no code change:
+//   { mean: number[], components: [number[], number[]], dims: number,
+//     source: "tof_only" | "enrollment", stub: boolean,
+//     explainedVarianceRatio: [number, number] | null }
+//
+// Feature vector for tof_only, built from what's actually on the wire
+// today (CONTRACTS.md 3.2/3.3 style: distance + signal per sensor):
+//   [A.dist(dim), A.sig(dim), B.dist(dim), B.sig(dim)]  -- length 4*dim
+// (4*16 = 64 at the project's usual 4x4 resolution -- 64 isn't hardcoded,
+// it falls out of whatever `dim` actually is right now.)
+
+const PCA_TRAIL_MS = 2000;        // "最近 2 秒" per C10.md
+const PCA_TRAIL_MAX_POINTS = 60;  // per C10.md's "60 個點"
+const FIT_WINDOW_MS = 15000;      // sliding window the stub fits from
+const REFIT_INTERVAL_MS = 2000;
+const MIN_FIT_SAMPLES = 40;       // well above the 64-dim rank-deficiency floor
+const SERVER_MODEL_CHECK_MS = 10000; // auto-upgrade stub -> real once the endpoint exists
+
+function vecSub(vec, mean) {
+  const out = new Array(vec.length);
+  for (let i = 0; i < vec.length; i++) out[i] = vec[i] - mean[i];
+  return out;
+}
+
+function dot(a, b) {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+  return s;
+}
+
+function normalize(v) {
+  const n = Math.sqrt(dot(v, v)) || 1;
+  return v.map((x) => x / n);
+}
+
+function matVec(flatMat, n, v) {
+  const out = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    let s = 0;
+    const base = i * n;
+    for (let j = 0; j < n; j++) s += flatMat[base + j] * v[j];
+    out[i] = s;
+  }
+  return out;
+}
+
+// Top eigenvector/eigenvalue of a symmetric matrix via power iteration --
+// avoids needing a full eigendecomposition library for a 2-component PCA.
+function powerIteration(flatMat, n, iterations = 60) {
+  let v = normalize(Array.from({ length: n }, () => Math.random() - 0.5));
+  for (let it = 0; it < iterations; it++) {
+    v = normalize(Array.from(matVec(flatMat, n, v)));
+  }
+  const eigenvalue = dot(Array.from(matVec(flatMat, n, v)), v);
+  return { vector: v, eigenvalue };
+}
+
+// samples: array of same-length plain arrays. Returns a tof_only stub model.
+function fitPCA2Stub(samples) {
+  const m = samples.length;
+  const n = samples[0].length;
+  const mean = new Array(n).fill(0);
+  for (const s of samples) for (let i = 0; i < n; i++) mean[i] += s[i];
+  for (let i = 0; i < n; i++) mean[i] /= m;
+
+  const cov = new Float64Array(n * n);
+  for (const s of samples) {
+    const c = vecSub(s, mean);
+    for (let i = 0; i < n; i++) {
+      const ci = c[i];
+      const base = i * n;
+      for (let j = 0; j < n; j++) cov[base + j] += ci * c[j];
+    }
+  }
+  for (let k = 0; k < cov.length; k++) cov[k] /= Math.max(1, m - 1);
+
+  const pc1 = powerIteration(cov, n);
+  const deflated = new Float64Array(n * n);
+  for (let i = 0; i < n; i++) {
+    const base = i * n;
+    for (let j = 0; j < n; j++) {
+      deflated[base + j] = cov[base + j] - pc1.eigenvalue * pc1.vector[i] * pc1.vector[j];
+    }
+  }
+  const pc2 = powerIteration(deflated, n);
+
+  let totalVariance = 0;
+  for (let i = 0; i < n; i++) totalVariance += cov[i * n + i];
+  totalVariance = totalVariance || 1e-9;
+
+  return {
+    mean,
+    components: [pc1.vector, pc2.vector],
+    dims: n,
+    source: "tof_only",
+    stub: true,
+    explainedVarianceRatio: [pc1.eigenvalue / totalVariance, pc2.eigenvalue / totalVariance],
+  };
+}
+
+function projectPCA(model, vec) {
+  const c = vecSub(vec, model.mean);
+  return [dot(c, model.components[0]), dot(c, model.components[1])];
+}
+
+async function tryFetchServerPcaModel(source) {
+  try {
+    const res = await fetch(`/pca?model=${encodeURIComponent(source)}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json || !Array.isArray(json.mean) || !Array.isArray(json.components)) return null;
+    return {
+      mean: json.mean,
+      components: json.components,
+      dims: json.mean.length,
+      source: json.source || source,
+      stub: false,
+      explainedVarianceRatio: json.explained_variance_ratio || json.explainedVarianceRatio || null,
+    };
+  } catch {
+    return null; // endpoint doesn't exist yet (expected right now) or the network hiccuped
+  }
+}
+
 const SENSORS = ["A", "B"];
 const CHANNELS = ["dist", "sig"];
 const VIEW_MODES = ["distance", "signal", "both"];
@@ -117,6 +254,129 @@ registerMode("monitor", (() => {
   let rafId = null;
   let viewMode = "distance";
   let gridsContainer = null;
+
+  // --- C10: PCA trajectory state ---
+  let pcaCanvas = null, pcaCtx = null, pcaBadgeEl = null, pcaVarianceEl = null;
+  let pcaModel = null;
+  let fitWindow = []; // { t, vec }
+  let trail = [];      // { t, x, y }
+  let lastFitAt = 0;
+  let lastServerCheckAt = 0;
+
+  function combinedVectorNow() {
+    const a = latestFrame.A, b = latestFrame.B;
+    if (!a || !b || a.dim !== b.dim) return null;
+    return a.dValues.concat(a.sValues, b.dValues, b.sValues);
+  }
+
+  function setModel(model) {
+    const axesChanged = !pcaModel || pcaModel.source !== model.source || pcaModel.dims !== model.dims;
+    pcaModel = model;
+    if (axesChanged) trail = []; // different model = different axes; old points would mislead (esp-mask-test-ad's instruction
+    updatePcaBadge();
+  }
+
+  function updatePcaBadge() {
+    if (!pcaBadgeEl) return;
+    if (!pcaModel) {
+      pcaBadgeEl.textContent = "PCA 模型：累積資料中…";
+      pcaBadgeEl.className = "pca-model-badge mono";
+    } else {
+      const label = pcaModel.source === "enrollment" ? "enrollment（104 維）" : "ToF-only（64 維）";
+      const stubTag = pcaModel.stub ? "，即時擬合、座標軸會漂移" : "";
+      pcaBadgeEl.textContent = `PCA 模型：${label}${stubTag}`;
+      pcaBadgeEl.className = "pca-model-badge mono " + (pcaModel.stub ? "stub" : "live");
+    }
+    if (pcaVarianceEl) {
+      const evr = pcaModel && pcaModel.explainedVarianceRatio;
+      pcaVarianceEl.textContent = Array.isArray(evr) && evr.length >= 2
+        ? `PC1 ${(evr[0] * 100).toFixed(1)}% + PC2 ${(evr[1] * 100).toFixed(1)}% = ${((evr[0] + evr[1]) * 100).toFixed(1)}%`
+        : "解釋變異比例：N/A";
+    }
+  }
+
+  function pcaBookkeeping(now) {
+    const vec = combinedVectorNow();
+    if (vec) {
+      fitWindow.push({ t: now, vec });
+      while (fitWindow.length && now - fitWindow[0].t > FIT_WINDOW_MS) fitWindow.shift();
+    }
+
+    if ((!pcaModel || pcaModel.stub) && now - lastFitAt >= REFIT_INTERVAL_MS) {
+      const n = vec ? vec.length : null;
+      const samples = n ? fitWindow.filter((s) => s.vec.length === n).map((s) => s.vec) : [];
+      if (samples.length >= MIN_FIT_SAMPLES) {
+        setModel(fitPCA2Stub(samples));
+        lastFitAt = now;
+      }
+    }
+
+    if (now - lastServerCheckAt >= SERVER_MODEL_CHECK_MS) {
+      lastServerCheckAt = now;
+      const wanted = pcaModel && pcaModel.source === "enrollment" ? "enrollment" : "tof_only";
+      tryFetchServerPcaModel(wanted).then((model) => {
+        if (model) setModel(model); // upgrades stub -> real automatically once the endpoint exists
+      });
+    }
+
+    if (pcaModel && vec && vec.length === pcaModel.dims) {
+      const [x, y] = projectPCA(pcaModel, vec);
+      trail.push({ t: now, x, y });
+    }
+    while (trail.length && now - trail[0].t > PCA_TRAIL_MS) trail.shift();
+    while (trail.length > PCA_TRAIL_MAX_POINTS) trail.shift();
+  }
+
+  function resizePcaCanvas() {
+    if (!pcaCanvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = pcaCanvas.clientWidth, h = pcaCanvas.clientHeight;
+    if (w === 0 || h === 0) return;
+    pcaCanvas.width = w * dpr;
+    pcaCanvas.height = h * dpr;
+    pcaCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function drawTrail() {
+    if (!pcaCtx) return;
+    const w = pcaCanvas.clientWidth, h = pcaCanvas.clientHeight;
+    // Redraw from scratch every frame -- C10.md explicitly warns that
+    // canvas globalAlpha stacking accumulates ghosting instead of a clean
+    // fade, same lesson as the old mic waveform's per-frame clearRect.
+    pcaCtx.clearRect(0, 0, w, h);
+    if (trail.length < 2) return;
+
+    // Autoscale to the trail's own spread: a stub's axes drift over time
+    // (new fits rotate/rescale the components), so a fixed scale would
+    // eventually push the trajectory off-canvas.
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const p of trail) {
+      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    }
+    const spanX = Math.max(maxX - minX, 1e-6), spanY = Math.max(maxY - minY, 1e-6);
+    const scale = Math.min((w * 0.7) / spanX, (h * 0.7) / spanY);
+    const midX = (minX + maxX) / 2, midY = (minY + maxY) / 2;
+    const cx = w / 2, cy = h / 2;
+
+    const now = performance.now();
+    for (let i = 0; i < trail.length; i++) {
+      const p = trail[i];
+      const alpha = Math.max(0, 1 - (now - p.t) / PCA_TRAIL_MS);
+      const sx = cx + (p.x - midX) * scale;
+      const sy = cy - (p.y - midY) * scale; // flip: screen y grows down, PCA space doesn't
+      pcaCtx.beginPath();
+      pcaCtx.arc(sx, sy, 3 + 2 * alpha, 0, Math.PI * 2);
+      pcaCtx.fillStyle = `rgba(232, 163, 61, ${alpha.toFixed(3)})`;
+      pcaCtx.fill();
+    }
+    const last = trail[trail.length - 1];
+    pcaCtx.beginPath();
+    pcaCtx.arc(cx + (last.x - midX) * scale, cy - (last.y - midY) * scale, 6, 0, Math.PI * 2);
+    pcaCtx.strokeStyle = "#f3f6f2";
+    pcaCtx.lineWidth = 1.5;
+    pcaCtx.stroke();
+  }
 
   function ensureGrids(sensor, dim) {
     if (currentDim[sensor] === dim) return;
@@ -166,6 +426,7 @@ registerMode("monitor", (() => {
       const hz = (rateCounters[sensor].length / 2).toFixed(1) + " Hz"; // 2s sliding window, unchanged from C05
       rateEls[sensor].forEach((el) => { el.textContent = hz; });
     }
+    drawTrail();
     rafId = requestAnimationFrame(paint);
   }
 
@@ -189,6 +450,16 @@ registerMode("monitor", (() => {
             </div>
           `).join("")).join("")}
         </div>
+        <div class="pca-panel">
+          <div class="section-label">PCA 即時軌跡
+            <span class="pca-model-badge mono" data-pca-badge></span>
+            <span class="pca-variance mono" data-pca-variance></span>
+          </div>
+          <div class="pca-canvas-wrap">
+            <canvas data-pca-canvas></canvas>
+            <div class="pca-empty-note">尚無 enrollment 樣板可顯示信賴橢圓（等 D08）</div>
+          </div>
+        </div>
       `;
       gridsContainer = root.querySelector("[data-grids]");
       rateEls.A = [];
@@ -202,9 +473,21 @@ registerMode("monitor", (() => {
       }
       applyViewMode();
       document.addEventListener("keydown", onKeydown);
+
+      pcaCanvas = root.querySelector("[data-pca-canvas]");
+      pcaCtx = pcaCanvas.getContext("2d");
+      pcaBadgeEl = root.querySelector("[data-pca-badge]");
+      pcaVarianceEl = root.querySelector("[data-pca-variance]");
+      updatePcaBadge();
+      resizePcaCanvas();
+      window.addEventListener("resize", resizePcaCanvas);
+      // Try once immediately at startup too, not just the periodic check --
+      // no reason to wait 10s if the endpoint already happens to exist.
+      tryFetchServerPcaModel("tof_only").then((model) => { if (model) setModel(model); });
     },
 
     onEnter() {
+      resizePcaCanvas(); // canvas may have had 0 size while this section was display:none
       if (rafId == null) rafId = requestAnimationFrame(paint);
     },
 
@@ -234,6 +517,12 @@ registerMode("monitor", (() => {
       const arr = rateCounters[sensor];
       arr.push(now);
       while (arr.length && now - arr[0] > 2000) arr.shift();
+
+      // Runs every onData call regardless of visibility -- per C05/C07's
+      // established pattern and C10.md's explicit requirement, trajectory
+      // history and the live-fit model both keep accumulating while
+      // hidden; only drawTrail() (in the rAF loop) actually stops.
+      pcaBookkeeping(now);
     },
   };
 })());

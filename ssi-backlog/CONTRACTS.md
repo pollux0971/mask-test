@@ -19,6 +19,10 @@
 | 日期 | 章節 | 變更 | 影響的 story | 已通知 |
 |---|---|---|---|---|
 | 2026-08-26 | 1. 序列埠協定 v2 | `A15`：`$H` 新增 `bw_bytes_since_last:u32`（第 7 個資料欄），韌體端在 `uart_out.c` 累計、`tof_print_heartbeat()` 每次回報自上次 `$H` 以來送出的位元組數。**⚠️ 破壞性變更且尚未修好**：`host/capture/protocol.py` 的 `_parse_heartbeat()` 目前硬性要求 `len(parts) == 7`（對應舊格式），本變更讓每行 `$H` 變成 8 段，在該函式更新（放寬成 `>= 7` 或改成 key=value）之前，**每一行 `$H` 都無法解析**，不只是新欄位讀不到。`B03`/`dropwatch.py` 的掉幀判定不受影響（純靠 `seq` 缺口，不吃 `$H`），但 heap／溫度／新頻寬欄位在此之前對主機端全部不可見 | `A15`, `B01`, `B03`, `C04` | ⬜ 待通知（見完成回報） |
+| 2026-08-26 | 4. HTTP / SSE 介面 | §4.3 `TriResult` 的 `theta_reject` 拆成 `theta_reject_tof` / `theta_reject_mel` 兩個獨立欄位。原因：兩模態的原始距離尺度與 `_reject` 樣板距離分布都不同，共用一個閾值必有一邊校準不準，而且失準會安靜地表現為「全部拒識」或「完全不拒識」（`D07` 實作時發現） | `D06`, `D07`, `D09`, `C17`, `C18` | 是 |
+| 2026-08-26 | 1 + 2 | 新增 §1.1.3 `$A` ambient 幀（第五條獨立串流）與 §1.2 的 `AMB:<0|1>` 指令，HDF5 對應 `tof_ambient_A/B (Ta,16)` + `tof_ambient_t_us (Ta,)`。原因：`D10` 明訂 `ambient_per_spad` 是 crosstalk 最靈敏的指標，但該欄位從韌體到 schema **整條管線都不存在**。設計成獨立行 + 預設關閉 + 1 Hz，而非塞進 `$T`：ambient 變化慢，塞進 `$T` 每幀會讓 8×8 多約 190 bytes/行，而 §1.4 顯示 8×8 開 Mel 已達 70%。韌體實作見新增的 `A16` | `A16`, `B01`, `B07`, `D10`, `E02` | 是 |
+| 2026-08-26 | 2. HDF5 Session Schema | `mel` 的時間軸由 `(M, 40)` 改為 **`(F, 40)`**，並新增成對的 `mel_t_us (F,) int64`。原因：`A14` 之後 `$F` 62.5 Hz、`$M` 31.25 Hz，兩者幀數不相等（§1.1.1），原 schema 是 §1.1.1 凍結**之前**的假設。`B11` 實作時撞到 `session_writer.py` 的「mel 幀數必須等於 mic_t_us 長度」檢查才發現。**寫入端必須移除該檢查**，且不可用內插把 mic 湊到 mel 網格（那是捏造未量測的數值） | `B07`, `B11`, `B17`, `D02`, `D03` | 是 |
+| 2026-08-26 | 2. HDF5 Session Schema | `/meta` 新增時鐘漂移欄位：`clock_drift_us` / `clock_drift_ppm` / `clock_sync_span_us` / `clock_sync_confirmed`，以及 session 首尾各三個校時欄位（`device_us` / `host_us` / `rtt_min_us`，重算漂移所需的最小集合）。原因：`B05` 的驗收要求「漂移量寫進 metadata」，但 §2 凍結時沒有任何漂移欄位。註：兩點法漂移（`B05`）與回歸法 slope（`B04`）互為獨立檢查，`B07` 寫入時應比對，差太多要標 quality | `B04`, `B05`, `B07`, `D12` | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | §2.2 補充：`n_frames` 明訂為 **ToF 幀數**（`tof_A.shape[0]`，即 `T`），因為 ToF 與麥克風長度不同而原欄位名沒指明（`B08` 實作時才發現）；`session_path` 明訂為「相對於某個 `root`」，且增量與重建必須用同一個 `root` | `B08`, `B19`, `D12` | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | 明訂無效 zone 在 `tof_A`/`tof_B` 數值陣列填 **`NaN`**（不是 `-1` 也不是 `0`）。原 §2 只說「不要塞 -1」，沒講具體填什麼，`B07` 實作時必須自己決定。選 `NaN` 的理由：算術會正確傳染錯誤逼讀取端注意到，而 `-1`/`0` 會被當成合理的近距離值悄悄算進統計 | `B07`, `B17`, `D01`, `D10`, `D13` | 是 |
 | 2026-08-26 | 1. 序列埠協定 v2 | `$H` 尾端新增 `bw_bytes_since_last:u32`（自上次 `$H` 以來送出的 bytes，供 `A14` 的「總頻寬 < 70%」驗收與 `C04` 狀態列使用）。**同時新增 §1.1「前向相容規定」**：所有 `$` 資料行的解析一律用「至少 N 段」而非 `len(parts) != N`，多餘尾端欄位忽略不判畸形。起因：`host/capture/protocol.py:259` 的 `_parse_heartbeat()` 寫死 `!= 7`，韌體加一欄後**整條 `$H` 事件消失**（連 `heap`/`drop_*` 一起丟掉）且無任何錯誤訊息 | `A06`, `A15`, `B01`, `B19`, `C04` | 是 |
@@ -57,6 +61,7 @@ $T,<A|B>,<seq:u32>,<t_us:i64>,<dim>,<d0>..<dN>,<s0>..<sN>
 $M,<seq:u32>,<t_us:i64>,<rms:i16>,<peak:i16>
 $F,<seq:u32>,<t_us:i64>,<m0>..<m39>
 $H,<t_us:i64>,<drop_A:u32>,<drop_B:u32>,<drop_M:u32>,<heap:u32>,<temp_c:i8>,<bw_bytes_since_last:u32>
+$A,<A|B>,<seq:u32>,<t_us:i64>,<dim>,<a0>..<aN>
 $STATUS,res=<dim>,proto=2,fw=<git_sha>
 $REC,start,<seconds>
 BEGIN_WAV_B64 rate=.. bits=.. channels=.. bytes=..
@@ -69,6 +74,32 @@ END_WAV_B64
 不保證跨版本相容。裝置每次開機、每次收到 `PING`、以及每次
 `SENS`/`MEL`/`switch` 改變輸出組態後都要重發一次 `$STATUS`，讓主機隨時
 能重新確認版本與目前解析度。
+
+#### 1.1.3 `$A`（ambient 幀，crosstalk 分析用）
+
+```
+$A,<A|B>,<seq:u32>,<t_us:i64>,<dim>,<a0>..<aN>
+```
+
+| 欄位 | 型別 | 單位 | 範圍 | 說明 |
+|---|---|---|---|---|
+| `a0..aN` | i16 | `ambient_per_spad / 100` | `-1`（無效）或 ≥0 | 環境光子率，`dim` 個（zone 數） |
+
+其餘欄位語意與 `$T` 相同（`seq` 為本串流已送出的行數，`t_us` 取樣點同 `$T`）。
+**`$A` 是第五條獨立串流**，`seq` 不與 `$T` 共用（§1.1.1）。
+
+**預設關閉，由 `AMB:<0|1>` 開啟**（§1.2）。開啟時建議 **1 Hz**，不要跟著 `$T` 走：
+
+> **為什麼要獨立成一行而且預設關閉**：`ambient_per_spad` 是 crosstalk 最靈敏的
+> 指標（比距離偏移更早顯現，`D10`），但它**變化很慢**，不需要 30 Hz。
+> 若塞進 `$T` 每一幀，8×8 會多約 190 bytes/行——§1.4 顯示 8×8 開 Mel 已經到 **70%**，
+> 再加就爆了。而 `D10`／`E02` 是**專門的短時實驗**，不是持續監測，
+> 開一個旗標跑一段就好。
+
+**HDF5**：對應 `/trial_NNN/tof_ambient_A`、`tof_ambient_B`，形狀 `(Ta, 16) float32`，
+配一個 `tof_ambient_t_us (Ta,) int64`。**`Ta` 是自己的時間軸**，
+不與 `tof_t_us` 共用——理由同 §2 的 `mel`／`mel_t_us`（不同取樣率不可假設等長）。
+無效 zone 一律 `NaN`（§2）。
 
 **前向相容規定（所有 `$` 資料行）**：主機端解析器一律以「**至少** N 段」
 檢查欄位數，**多出來的尾端欄位必須忽略，不可判定為畸形行**；
@@ -227,6 +258,7 @@ $STATUS,res=4,proto=2,fw=a1b2c3d
 REC:<seconds>            錄音並 dump
 SENS:<A|B>=<0|1>         感測器開關（真的 stop_ranging，不只跳過輸出）
 MEL:<0|1>                Mel 串流開關
+AMB:<0|1>                ambient 串流開關（$A，預設關閉，見 1.1.3）
 PING                     立即回一行 $H
 ```
 
@@ -300,6 +332,9 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
     distance_mm, angle_deg, ambient, notes,
     fw_sha, proto_version, tof_dim,
     clock_slope, clock_offset, clock_residual_p95,
+    clock_drift_us, clock_drift_ppm, clock_sync_span_us, clock_sync_confirmed,
+    session_start_device_us, session_start_host_us, session_start_rtt_min_us,
+    session_end_device_us,   session_end_host_us,   session_end_rtt_min_us,
     baseline_mu_A (32,), baseline_sigma_A (32,),
     baseline_mu_B (32,), baseline_sigma_B (32,),
     noise_floor_mu, noise_floor_sigma
@@ -313,7 +348,11 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
     mic_rms     (M,)    float32
     mic_peak    (M,)    int16
     mic_t_us    (M,)    int64
-    mel         (M, 40) float32    選填
+    tof_ambient_A    (Ta, 16) float32  選填  ambient_per_spad/100，無效填 NaN
+    tof_ambient_B    (Ta, 16) float32  選填
+    tof_ambient_t_us (Ta,)    int64    選填  與 tof_ambient_* 成對
+    mel         (F, 40) float32    選填  ⚠ 軸是 F 不是 M，見下方說明
+    mel_t_us    (F,)    int64      選填  與 mel 成對，缺一不可
     audio       (N,)    int16      選填
     audio_t0_us         int64
   (attrs)
@@ -331,6 +370,19 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
 而 `-1` 或 `0` 會被當成一個合理的近距離值悄悄算進統計，錯了也不會有人發現。
 有效與否仍以 `tof_valid_A` / `tof_valid_B`（`(T,16) bool`）為準，
 `NaN` 是給「沒讀 valid 就直接算」的人的安全網。
+
+> **⚠ `mel` 的時間軸是 `F`，不是 `M`。**
+> `A14` 之後 `$F` 是 62.5 Hz、`$M` 是 31.25 Hz——**兩者幀數不相等**（§1.1.1：
+> 四條獨立串流，各自維護 `seq`，對齊一律靠 `t_us`）。
+> 原本 schema 把 `mel` 寫成 `(M, 40)`，是 §1.1.1 凍結**之前**留下的假設。
+>
+> 所以 `mel` 必須有自己的時間軸 `mel_t_us (F,) int64`，
+> **寫入端不可以檢查「`mel` 幀數 == `mic_t_us` 長度」**，
+> 也**不可以**把 `mic_rms` 內插到 mel 的網格上來湊——
+> 那是在沒有實際量測的時間點捏造數值，違反 §2.1「無效值用 mask 不要填造的值」。
+>
+> `mel` 與 `mel_t_us` **成對出現，缺一不可**：只有陣列沒有時間軸，
+> 下游就只能猜取樣率，而那正是 §1.1.2 加自我描述欄位要解決的問題。
 
 ### 2.1 兩個不可妥協的設計決定
 
@@ -567,6 +619,12 @@ bridge 每秒比一次 mtime，**改完存檔即時生效，不需重啟**。
 因此獨立成警報而非放寬容忍度。前端應顯著標示，不要當成掉幀率的一部分。
 
 ### 4.3 TriResult（`D07` / `D09`）
+
+> **`theta_reject` 拆成 `theta_reject_tof` 與 `theta_reject_mel` 兩個獨立欄位。**
+> ToF 與 Mel 的原始距離尺度不同（32 維 z-score vs 40 維 CMN），
+> `_reject` 樣板的距離分布也不同——**共用一個閾值，其中一個模態一定校準不準**，
+> 而且不準的那一邊會安靜地要嘛全部拒識、要嘛完全不拒識。
+> 融合後的拒識判定由 `D07` 依 `w` 決定，不在序列化層合併。
 
 ```json
 {"classes": ["八","五","一","啊","四","好","停","不要"],
