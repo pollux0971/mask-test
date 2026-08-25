@@ -50,7 +50,7 @@
 $T,<A|B>,<seq:u32>,<t_us:i64>,<dim>,<d0>..<dN>,<s0>..<sN>
 $M,<seq:u32>,<t_us:i64>,<rms:i16>,<peak:i16>
 $F,<seq:u32>,<t_us:i64>,<m0>..<m39>
-$H,<t_us:i64>,<drop_A:u32>,<drop_B:u32>,<drop_M:u32>,<heap:u32>,<temp_c:i8>
+$H,<t_us:i64>,<drop_A:u32>,<drop_B:u32>,<drop_M:u32>,<heap:u32>,<temp_c:i8>,<bw_bytes_since_last:u32>
 $STATUS,res=<dim>,proto=2,fw=<git_sha>
 $REC,start,<seconds>
 BEGIN_WAV_B64 rate=.. bits=.. channels=.. bytes=..
@@ -139,6 +139,7 @@ $F,<seq:u32>,<t_us:i64>,<m0>..<m39>
 | `drop_A` / `drop_B` / `drop_M` | u32 | 累積掉幀數 | ≥0 | **自開機起算**，不被 `$STATUS` 重置（見變更紀錄：PING 會重發 `$STATUS`，若重置會讓 B05 校時期間指標失效）。與 `seq` 同為 session 計數，重開機歸零 |
 | `heap` | u32 | bytes | ≥0 | 目前可用 heap |
 | `temp_c` | i8 | °C | -40–125 | 晶片溫度 |
+| `bw_bytes_since_last` | u32 | bytes | ≥0 | **A15 新增**：自「上一行 `$H`」以來送出的位元組數，不是固定的「最近一秒」——用兩行 `$H` 各自的 `t_us` 相減換算成真正的秒數再除。目前只計入 `$T`/`$STATUS`/`$H` 本身（`uart_out_add_bytes()` 的 opt-in 呼叫者），`$M`/`$F`/錄音 dump 尚未加入，是頻寬的下界不是總量。**⚠️ 已知相容性缺口**：`host/capture/protocol.py` 的 `_parse_heartbeat()` 目前硬性要求 `len(parts) == 7`（對應舊的 6 欄格式），這個新欄位讓 `$H` 變成 8 段，在該函式更新前**每一行 `$H` 都會被判成畸形行、整行事件消失**，不只是新欄位讀不到。掉幀率判定不受影響（`B03`/`dropwatch.py` 完全靠 `seq` 缺口，不吃 `$H`），但 heap／`bw` 相關的下游（`C04`?）在此之前拿不到任何 `$H` 事件 |
 
 #### `$STATUS`
 | 欄位 | 型別 | 單位 | 範圍 | 說明 |
@@ -171,11 +172,11 @@ $M,3150,1737863421124800,12,340
 # 麥克風幀：拍手瞬間，接近 16-bit 滿刻度
 $M,3151,1737863421126400,28901,32767
 
-# 心跳：一切正常
-$H,1737863421130000,0,0,0,142300,42
+# 心跳：一切正常（含 A15 新增的 bw_bytes_since_last）
+$H,1737863421130000,0,0,0,142300,42,3840
 
 # 心跳：ToF-A 掉了 3 幀、heap 偏低（接近告警）
-$H,1737863431130000,3,0,0,18200,58
+$H,1737863431130000,3,0,0,18200,58,3712
 
 # 開機／PING 回應，proto 版本協商用
 $STATUS,res=4,proto=2,fw=a1b2c3d

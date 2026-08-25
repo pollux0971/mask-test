@@ -1,2 +1,77 @@
-/* monitor mode styles — owned by the story that builds this mode
-   (see ssi-backlog/README.md track C). Empty shell from C01. */
+/* Monitor mode: dual ToF heatmap, migrated verbatim (visuals unchanged --
+   C25 does cross-mode visual unification) from the old single-file
+   panel.html. Rules below are copied 1:1 from its <style> block; only the
+   selectors' container changed (was body-level `section.tof`, is now
+   scoped under #mode-monitor). See js/modes/monitor.js. */
+
+#mode-monitor {
+  min-height: 0;
+  gap: 10px;
+}
+
+#mode-monitor .section-label {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+/* D11 flagged the zone->physical-position mapping (row-major) as an
+   unverified assumption -- surfaced here per that finding so it's visible
+   right on the grid, not just in a doc, until someone verifies it on real
+   hardware (cover one corner, see which cell moves). */
+.assumed-badge {
+  font-size: 11px;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--warn);
+  font-weight: 600;
+}
+
+#mode-monitor .tof-grids {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 18px;
+}
+#mode-monitor .sensor-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  min-width: 0;
+}
+#mode-monitor .sensor-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 13px;
+}
+#mode-monitor .sensor-name { font-weight: 600; }
+#mode-monitor .sensor-hz { color: var(--text-dim); font-size: 11px; }
+#mode-monitor .grid {
+  flex: 1;
+  display: grid;
+  gap: 3px;
+  min-height: 0;
+}
+#mode-monitor .cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+  overflow: hidden;
+}
+#mode-monitor .cell.invalid { color: var(--text-dim); font-weight: 400; }

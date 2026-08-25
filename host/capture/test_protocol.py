@@ -498,6 +498,10 @@ def test_default_parser_still_rejects_v1_status():
     assert p.version_mismatch is True
     assert p.degraded is False
     assert p.recording_allowed is False
+    # 認得出來是 v1，只是不接受——panel 才能顯示「偵測到協定 v1 韌體」
+    # 而不是「未知版本」。
+    assert p.protocol_version == 1
+    assert p.state()["protocol_version"] == 1
     assert "allow_v1=True" in p.mismatch_reason   # 告訴使用者有這個選項
 
 
@@ -509,6 +513,7 @@ def test_default_parser_detects_v1_from_data_lines_without_status():
     assert p.version_mismatch is True
     assert p.stats.malformed == 0
     assert p.stats.dropped_version_mismatch == 1
+    assert p.protocol_version == 1
     assert "$TOF" in p.mismatch_reason
     for line in (TOF_V1_MOCK, MIC_V1):
         assert p.feed(line) is None

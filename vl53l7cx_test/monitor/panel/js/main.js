@@ -7,6 +7,7 @@
 // restart just resumes the same pipeline without any code here noticing.
 import "./shell.js";
 import { handleEvent } from "./bus.js";
+import "./modes/monitor.js"; // C05; other modes import themselves in as they're built
 
 const es = new EventSource("/events");
 

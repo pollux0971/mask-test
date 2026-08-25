@@ -716,6 +716,7 @@ class ProtocolParser:
         # 不是畸形行。直接進入不符狀態並說清楚原因（v1 韌體開機只印一次
         # `$STATUS`，主機中途接上去的話永遠等不到那一行）。
         if line_version == 1 and not self.allow_v1:
+            self.protocol_version = 1        # 認出來了，只是不接受
             self._enter_mismatch(
                 f"韌體版本不符：收到協定 v1 的 {prefix} 行，主機支援 "
                 f"proto={PROTO_VERSION}。已停止解析所有 $ 資料行；"
@@ -817,7 +818,11 @@ class ProtocolParser:
             self.version_mismatch = False
             self.mismatch_reason = None
         else:
-            self.protocol_version = reported
+            # 「沒送 proto 欄位」在協定上只有一個可能：凍結前的舊韌體。
+            # 即使不接受它，也要把推論結果講出來，`C04` 才能顯示「偵測到
+            # 協定 v1 韌體」而不是「未知版本」。`degraded` 與
+            # `recording_allowed` 仍然靠 `version_mismatch` 擋住。
+            self.protocol_version = 1 if reported is None else reported
             got = (
                 "無 proto 欄位（協定 v1 韌體）" if reported is None
                 else f"proto={reported}"

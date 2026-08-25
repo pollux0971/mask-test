@@ -41,6 +41,15 @@ import time
 
 PROTO_VERSION = 2
 
+# $STATUS self-description fields (CONTRACTS.md #1.1.2). Fixed rather than
+# CLI-configurable: T04 does not generate $F, so these describe the firmware
+# the host should expect to be talking to, not anything the mock varies.
+# mel_hop is 256 -- the post-A14 value, matching the current firmware.
+AUDIO_SR_HZ = 16000
+MEL_WIN_SAMPLES = 512
+MEL_HOP_SAMPLES = 256
+MIC_HOP_SAMPLES = 512
+
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -215,9 +224,26 @@ class MockDevice:
 
     def emit_status(self):
         if self.args.proto == "v2":
-            self._write(f"$STATUS,res={self.args.dim},proto={PROTO_VERSION},fw={self.fw_sha}")
+            self._write(
+                f"$STATUS,res={self.args.dim},proto={PROTO_VERSION},fw={self.fw_sha}"
+                f",sr={AUDIO_SR_HZ},mel={1 if self.mel_enabled else 0}"
+                f",mel_win={MEL_WIN_SAMPLES},mel_hop={MEL_HOP_SAMPLES}"
+                f",mic_hop={MIC_HOP_SAMPLES}"
+            )
         else:
             self._write(f"$STATUS,res={self.args.dim}")
+
+    def resend_status(self):
+        """Re-send $STATUS after a PING or a config change (CONTRACTS.md #1.1).
+
+        v2 only. --proto v1 emulates the unmodified pre-A09 firmware, whose
+        uart_cmd.c understood REC: and nothing else -- it ignored PING/SENS/
+        MEL rather than answering them. Re-sending here would make v1 mode
+        behave like firmware that does not exist, which defeats the point of
+        having it (B02's dual-protocol compatibility fixture).
+        """
+        if self.args.proto == "v2":
+            self.emit_status()
 
     def emit_tof(self, sensor, t):
         if self.faults.should_drop():
@@ -273,7 +299,13 @@ class MockDevice:
         if not line:
             return
         if line == "PING":
+            # $H first, then $STATUS: CONTRACTS.md #1.1 requires a $STATUS
+            # re-send on every PING, but $H is the reply B05 times its clock
+            # alignment against, so anything ahead of it is added latency.
+            # The A09 firmware emits them in this order; the mock has to
+            # match it or the host sees a different stream than the board.
             self.emit_heartbeat(time.monotonic() - self._t0)
+            self.resend_status()
             return
         if line.startswith("SENS:"):
             try:
@@ -282,10 +314,15 @@ class MockDevice:
                 print(f"[mock_device] SENS {sensor}={val}", file=sys.stderr)
             except ValueError:
                 pass
+            else:
+                self.resend_status()  # output config changed (CONTRACTS.md #1.1)
             return
         if line.startswith("MEL:"):
             self.mel_enabled = line.endswith("1")
-            return  # no-op: $F generation is out of T04 scope
+            # $F generation is still out of T04 scope, but the mel= field in
+            # $STATUS is not: the host reads it to know the stream's state.
+            self.resend_status()
+            return
         if line.startswith("REC:"):
             print(f"[mock_device] REC ignored (WAV dump simulation out of T04 scope): {line}", file=sys.stderr)
             return

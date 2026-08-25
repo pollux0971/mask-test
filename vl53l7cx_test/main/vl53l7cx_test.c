@@ -91,6 +91,13 @@ static bool     s_have_last_ready_t_us[NUM_SENSORS];
 
 #define TOF_EXPECTED_PERIOD_US (1000000 / TOF_RANGING_FREQUENCY_HZ)
 
+/* A15: last uart_out_bytes_since_boot() reading, so tof_print_heartbeat()
+ * can report a delta (bytes sent since the previous $H) instead of a raw
+ * cumulative total -- the host can turn that into a rate using the t_us
+ * of two consecutive $H lines, which is robust to $H itself firing off a
+ * strict 1 Hz cadence (e.g. a PING landing between ticks). */
+static uint32_t s_bw_bytes_last_h;
+
 static bool init_bus_and_sensor(size_t idx)
 {
     const sensor_pins_t *cfg = &pins[idx];
@@ -195,8 +202,17 @@ void tof_print_status(void)
      * PING, and resetting drop_* there would zero the health counters on
      * every heartbeat request, exactly when B05/B03 need them most. They
      * share seq's session boundary instead (reset only on restart). */
+    /* CONTRACTS.md #1.1.2: self-describing audio frame params, sourced from
+     * bone_mic.c (not duplicated here) so an A14-style hop change can't
+     * silently desync $STATUS from what mic_task is actually doing. */
+    uint32_t sr;
+    uint16_t mel_win, mel_hop, mic_hop;
+    bone_mic_frame_params(&sr, &mel_win, &mel_hop, &mic_hop);
+
     uart_out_lock();
-    int len = printf("$STATUS,res=%d,proto=%d,fw=%s\n", TOF_GRID_DIM, TOF_PROTO_VERSION, FW_GIT_SHA);
+    int len = printf("$STATUS,res=%d,proto=%d,fw=%s,sr=%" PRIu32 ",mel=%d,mel_win=%u,mel_hop=%u,mic_hop=%u\n",
+                      TOF_GRID_DIM, TOF_PROTO_VERSION, FW_GIT_SHA,
+                      sr, bone_mic_mel_enabled() ? 1 : 0, mel_win, mel_hop, mic_hop);
     uart_out_add_bytes((size_t)len);   /* A15: bandwidth accounting, see uart_out.h */
     uart_out_unlock();
 }
@@ -222,13 +238,24 @@ void tof_print_heartbeat(void)
      * remove a bias that's inside t_us before the trip even starts. */
     int64_t t_us = esp_timer_get_time();
 
-    printf("$H,%" PRId64 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%d\n",
-           t_us,
-           tof_get_drop_notready(0) + tof_get_drop_error(0),
-           tof_get_drop_notready(1) + tof_get_drop_error(1),
-           bone_mic_drop_count(),
-           (uint32_t)esp_get_free_heap_size(),
-           (int)s_results[0].silicon_temp_degc);
+    /* A15/CONTRACTS.md #1.1 changelog: bandwidth accounting. Only bytes
+     * from callers that opted into uart_out_add_bytes() are reflected here
+     * -- as of this story that's $T/$STATUS/$H, NOT $M/$F or the recording
+     * dump (see uart_out.h). This undercounts real bandwidth; it's a lower
+     * bound, not a true total, until bone_mic.c/uart_cmd.c opt in too. */
+    uint32_t bw_bytes_now = uart_out_bytes_since_boot();
+    uint32_t bw_bytes_since_last = bw_bytes_now - s_bw_bytes_last_h;
+    s_bw_bytes_last_h = bw_bytes_now;
+
+    int len = printf("$H,%" PRId64 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%d,%" PRIu32 "\n",
+                      t_us,
+                      tof_get_drop_notready(0) + tof_get_drop_error(0),
+                      tof_get_drop_notready(1) + tof_get_drop_error(1),
+                      bone_mic_drop_count(),
+                      (uint32_t)esp_get_free_heap_size(),
+                      (int)s_results[0].silicon_temp_degc,
+                      bw_bytes_since_last);
+    uart_out_add_bytes((size_t)len);   /* A15: bandwidth accounting, see uart_out.h */
     uart_out_unlock();
 }
 
