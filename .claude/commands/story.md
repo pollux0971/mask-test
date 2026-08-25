@@ -4,20 +4,48 @@ argument-hint: <story-id 例如 A04>
 allowed-tools: Bash(python3 ssi-backlog/tools/prompt.py:*)
 ---
 
-!`python3 ssi-backlog/tools/prompt.py $1`
+## 派工提示
+
+!`python3 ssi-backlog/tools/prompt.py "$ARGUMENTS" 2>&1 || python3 ssi-backlog/tools/prompt.py --ready`
 
 ---
 
-以上是這個 story 的派工提示（由 tools/prompt.py 從 dag.json 產生）。
+以上是派工提示（由 `ssi-backlog/tools/prompt.py` 從 `dag.json` 產生）。
 
-若上面沒有印出內容（$1 是空的或找不到這個 ID），改執行
-`python3 ssi-backlog/tools/prompt.py --ready` 列出目前可開工的 story，
-請使用者選一個 ID 重新下指令，然後停在這裡，不要繼續。
+**如果上面印的是「可開工 (N):」清單**，代表沒給 story ID 或 ID 不存在。
+請把清單顯示給使用者、請他選一個 ID，然後**停在這裡不要繼續**。
 
-否則，請照派工提示的指示直接開始實作：
-1. 依「讀取順序」把 CONTRACTS.md、story 檔案、負責的檔案讀過一遍。
-2. 只在提示列出的「可修改路徑」內動手，FORBIDDEN 區塊列的路徑不要碰。
-3. 完成後，照提示裡的「完成報告」格式回報（驗收條件逐項打勾、修改的檔案、
-   需要人工驗證的項目、對 CONTRACTS.md 的疑問、注意到但沒動的問題）。
-4. 遇到提示裡「應該停下來問」的情況（規格不清楚、需要動別人負責的檔案、
-   驗收條件互相矛盾、前置條件沒做完），立刻停下來問使用者，不要自己猜。
+**否則，照派工提示直接開始實作：**
+
+1. 依「讀取順序」把 `ssi-backlog/CONTRACTS.md`、story 檔案、你負責的檔案讀過一遍。
+2. 只在「你只能修改這些路徑」內動手；「禁止讀取」的路徑不要碰。
+3. 程式要**寫完整、能實際跑**，不要留空殼或 `pass`。沒有硬體無法驗證的部分，
+   照實列進「需要人工驗證的項目」，**不要假裝已驗證，也不要捏造量測數字**。
+4. 完成後照派工提示的「完成報告」格式回報。
+
+## 平行開發鐵則（現在通常有多個 agent 同時在跑）
+
+- `ssi-backlog/CONTRACTS.md` 是共用檔案。**一律用 Edit 做小範圍取代，
+  絕對不要用 Write 覆寫整檔**，那會蓋掉別人剛寫的章節。每次 Edit 前先重新 Read。
+- 只改屬於你這個 story 的章節，別人的章節看到也不要順手修。
+- 不確定某個檔案是誰的，查 `ssi-backlog/CONTRACTS.md` 第 5 章「檔案所有權」。
+
+## 版控
+
+專案已是 git repo（remote：`https://github.com/pollux0971/mask-test.git`）。
+**你不要自己 commit 或 push**，交給調度員統一處理，避免多個 agent 互相打架。
+
+## 收尾
+
+做完用 `SendMessage` 把完成回報傳給調度員 session **`esp-mask-test-ad`**。
+（若該 session 不存在，就直接印在自己視窗給使用者看。）
+
+## 遇到這些情況要停下來問調度員，不要自己決定
+
+1. `CONTRACTS.md` 對你要用的介面沒有規定或規定不清
+2. 你需要修改不屬於你的路徑才能完成
+3. story 的驗收條件彼此矛盾，或與 `CONTRACTS.md` 衝突
+4. 你發現這個 story 的前置其實沒做完
+
+問法：用 `SendMessage` 傳給 `esp-mask-test-ad`，把選項和你的傾向一起寫出來，
+然後停下來等回覆，不要自己猜著往下做。

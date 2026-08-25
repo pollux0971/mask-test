@@ -12,8 +12,8 @@ void bone_mic_init(void);
  * markers, for a host-side script to capture and turn into a .wav file. */
 void bone_mic_record_and_dump(uint32_t seconds);
 
-/* Spawns a background task that continuously streams RMS/peak amplitude
- * ($MIC lines) for the live monitor panel. Also owns the on-demand
+/* Spawns a background task that continuously streams seq/timestamp/RMS/peak
+ * ($M lines, protocol v2) for the live monitor panel. Also owns the on-demand
  * recording flow: bone_mic_request_recording() can be called from any
  * other task to have this same task pause streaming, capture `seconds` of
  * audio, dump it (see bone_mic_record_and_dump), and resume streaming. */

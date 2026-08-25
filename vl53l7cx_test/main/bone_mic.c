@@ -1,5 +1,6 @@
 #include "bone_mic.h"
 
+#include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,7 @@
 #include "freertos/queue.h"
 #include "driver/i2s_pdm.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "mbedtls/base64.h"
 
 #include "uart_out.h"
@@ -172,6 +174,7 @@ static void mic_task(void *arg)
         return;
     }
     dc_blocker_t stream_filter = { 0 };
+    uint32_t seq = 0;
 
     while (1) {
         uint32_t requested_seconds;
@@ -183,6 +186,10 @@ static void mic_task(void *arg)
         size_t bytes_read = 0;
         esp_err_t err = i2s_channel_read(s_rx_handle, buf, MIC_FRAME_SAMPLES * sizeof(int16_t),
                                           &bytes_read, 1000);
+        /* Captured immediately on return: i2s_channel_read() hands back a
+         * buffer DMA already filled, so this timestamp marks the *end* of
+         * the frame, not its start (see t_start below). */
+        int64_t t_end = esp_timer_get_time();
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "i2s_channel_read failed: %s", esp_err_to_name(err));
             continue;
@@ -203,12 +210,20 @@ static void mic_task(void *arg)
         }
         double rms = (n > 0) ? sqrt((double)sum_sq / (double)n) : 0.0;
 
+        /* CONTRACTS.md 1.3: t_us is the timestamp of the frame's first
+         * sample, not the read-return time -- cross-modal alignment with
+         * ToF needs the frame's start, and this 32ms gap is close in
+         * magnitude to the lip-to-voice onset delay being measured. */
+        int64_t t_start = t_end - (int64_t)n * 1000000 / MIC_SAMPLE_RATE_HZ;
+
         /* One compact line per ~32ms frame for the live monitor panel
          * (monitor/): plain printf, no ESP_LOG prefix, '$' sentinel so the
-         * host bridge can pick it out cleanly. */
+         * host bridge can pick it out cleanly. rms/peak are both i16 raw
+         * PCM amplitude per CONTRACTS.md 1.1 (protocol v2). */
         uart_out_lock();
-        printf("$MIC,%.1f,%d\n", rms, peak);
+        printf("$M,%" PRIu32 ",%" PRId64 ",%d,%d\n", seq, t_start, (int16_t)lround(rms), peak);
         uart_out_unlock();
+        seq++;
     }
 }
 

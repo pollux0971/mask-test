@@ -183,10 +183,11 @@ void app_main(void)
                 }
             }
         }
-        /* Poll well above the 30 Hz sensor output rate so this loop never
-         * misses a ready frame. CONFIG_FREERTOS_HZ=100 means the tick period
-         * is 10 ms, so pdMS_TO_TICKS(5) rounds up to 1 tick (10 ms, 100 Hz
-         * polling) -- 3.3x oversampling of the fastest (30 Hz) sensor mode. */
-        vTaskDelay(pdMS_TO_TICKS(5));
+        /* CONFIG_FREERTOS_HZ=100 -> 1 tick = 10 ms. pdMS_TO_TICKS() truncates
+         * (integer division), so anything under 10 ms yields 0 ticks and
+         * vTaskDelay(0) does NOT block -- it busy-spins and starves IDLE,
+         * tripping the task watchdog. 10 ms is the shortest real delay here:
+         * 100 Hz polling, 3.3x oversampling of the 30 Hz sensor. */
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
