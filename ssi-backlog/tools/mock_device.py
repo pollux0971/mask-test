@@ -12,6 +12,17 @@ B02 (v1/v2 dual-protocol compatibility) will need later. Both modes share
 the same synthetic scenario/fault engine; only the line-formatting layer
 differs.
 
+The v1 wire format replays the pre-T01 firmware exactly (baseline commit
+fb286d1, vl53l7cx_test/main/):
+
+    $TOF,<A|B>,<side 4|8>,<side^2 distances>   # side, not zone count; no signal
+    $MIC,<rms %.1f>,<peak int>                 # rms was a float back then
+    $STATUS,res=<side>                         # no proto=, no fw=, printed once
+
+There is no $H and no $F in v1, and PING/SENS/MEL are ignored rather than
+answered (see resend_status). Anything else would be a format no firmware
+has ever spoken.
+
 Usage:
     python3 mock_device.py --fps 30 --dim 4 --scenario round --drop-rate 0.02
     # -> prints "[mock_device] pty ready: /dev/pts/N", then:

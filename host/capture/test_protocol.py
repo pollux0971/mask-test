@@ -91,6 +91,7 @@ def test_parse_mic_full_scale():
         "has_timestamp": True,
         "rms": 28901,
         "peak": 32767,
+        "extra": [],
     }
 
 
@@ -128,7 +129,9 @@ def test_parse_mel_frame():
 def test_parse_record_line_is_recognised():
     """`$REC` 不是 B01 的四種資料行，但也不能被算成畸形行。"""
     e = parse_line("$REC,start,5")
-    assert e == {"type": "record", "proto": 2, "state": "recording", "seconds": 5}
+    assert e == {
+        "type": "record", "proto": 2, "state": "recording", "seconds": 5, "extra": [],
+    }
 
 
 def test_parse_8x8_frame_length_not_hardcoded():
@@ -177,7 +180,6 @@ def test_all_zones_invalid():
 
 MALFORMED = [
     pytest.param("$T,A,105,1737863421123456,16,120,0,4000", id="tof-truncated"),
-    pytest.param("$T,A,105,1737863421123456,16," + ",".join(["1"] * 33), id="tof-one-extra"),
     pytest.param("$T,C,1,1000,16," + ",".join(["1"] * 32), id="tof-bad-sensor"),
     pytest.param("$T,A,1,1000,32," + ",".join(["1"] * 64), id="tof-bad-dim"),
     pytest.param("$T,A,1,-5,16," + ",".join(["1"] * 32), id="tof-negative-t_us"),
@@ -185,13 +187,11 @@ MALFORMED = [
     pytest.param("$T,A,1,1000,16," + ",".join(["1"] * 31 + ["40000"]), id="tof-i16-overflow"),
     pytest.param("$T,A,4294967296,1000,16," + ",".join(["1"] * 32), id="tof-u32-overflow"),
     pytest.param("$M,3150,1737863421124800,12", id="mic-missing-field"),
-    pytest.param("$M,3150,1737863421124800,12,340,99", id="mic-extra-field"),
     pytest.param("$M,3150,1737863421124800,12.5,340", id="mic-float-rms"),
     pytest.param("$M,,1737863421124800,12,340", id="mic-empty-seq"),
     pytest.param("$H,1737863421130000,0,0,0,142300", id="hb-missing-temp"),
     pytest.param("$H,1737863421130000,0,0,0,142300,999", id="hb-temp-out-of-i8"),
     pytest.param("$F,7,1000," + ",".join(["1"] * 39), id="mel-39-coeffs"),
-    pytest.param("$F,7,1000," + ",".join(["1"] * 41), id="mel-41-coeffs"),
     pytest.param("$STATUS,res=5,proto=2,fw=abc", id="status-bad-res"),
     pytest.param("$STATUS,proto=2,fw=abc", id="status-no-res"),
     pytest.param("$STATUS,res=4,protoo", id="status-token-without-eq"),
@@ -397,10 +397,12 @@ def test_five_minutes_of_synthetic_traffic_never_raises():
 
 # ================================================================ B02 v1/v2
 
-# 真實舊韌體（`fb286d1:vl53l7cx_test/main/vl53l7cx_test.c:135`）：
-# dim 欄位是**邊長**，且**只有距離沒有 signal**。
+# 真實舊韌體（`fb286d1:vl53l7cx_test/main/vl53l7cx_test.c:135`）與現在的
+# `mock_device.py --proto v1`：dim 欄位是**邊長**，且**只有距離沒有 signal**。
 TOF_V1_FW = "$TOF,A,4," + ",".join(["120", "0", "4000", "-1"] * 4)
-# `mock_device.py --proto v1`：dim 欄位是**zone 數**，且**有 signal**。
+# 另一種方言：dim 欄位是 zone 數且帶 signal。`mock_device.py` 原本送這種，
+# 已修正成上面那種（見回報）。解析器**保留**這條路徑：舊 mock 產生的紀錄
+# 檔還在，而且多認一種自描述、無歧義的格式不會有壞處。
 TOF_V1_MOCK = "$TOF,B,16," + ",".join(["300"] * 16 + ["70"] * 16)
 MIC_V1 = "$MIC,322.1,498"          # 舊韌體 printf("$MIC,%.1f,%d")
 STATUS_V1 = "$STATUS,res=4"        # 沒有 proto=、沒有 fw=
@@ -744,3 +746,118 @@ def test_status_line_is_not_counted_as_v1_or_v2():
     p.feed(STATUS_FULL)
     assert p.stats.parsed == 1
     assert p.stats.v1_lines == 0 and p.stats.v2_lines == 0
+
+
+def test_v1_mock_device_line_shape_matches_real_firmware():
+    """`mock_device.py --proto v1` 修正後實際送出的樣子（dim=4）。
+    抄自實跑輸出，確保夾具與解析器不會各自漂移。"""
+    line = "$TOF,A,4," + ",".join(["17"] * 16)
+    e = parse_line_v1(line)
+    assert e["proto"] == 1 and e["dim"] == 16
+    assert e["signal_present"] is False
+    assert e["n_valid"] == 16
+    assert parse_line_v1("$STATUS,res=4")["proto"] is None
+    assert parse_line_v1("$MIC,274.4,485")["rms"] == pytest.approx(274.4)
+
+
+# ============================================ §1.1 前向相容（比我新的韌體）
+
+def test_heartbeat_with_bw_field_parses():
+    """`A15` 在 `$H` 尾端加了 `bw_bytes_since_last`（第 8 段）。"""
+    e = parse_line("$H,1737863421130000,3,0,0,18200,58,45678")
+    assert e["type"] == "heartbeat"
+    assert e["bw_bytes_since_last"] == 45678
+    # 舊欄位一個都不能掉——這才是這個 bug 真正的危害
+    assert e["heap"] == 18200 and e["temp_c"] == 58
+    assert (e["drop_A"], e["drop_B"], e["drop_M"]) == (3, 0, 0)
+
+
+def test_heartbeat_without_bw_field_is_none_not_zero():
+    """舊韌體沒有第 8 段 → `None`。0 是一個合法的頻寬讀數，拿它當缺值
+    會讓舊韌體看起來像「這段期間完全沒傳東西」。"""
+    e = parse_line(HB_DROP)
+    assert e["bw_bytes_since_last"] is None
+    assert e["heap"] == 18200
+
+
+def test_truncated_heartbeat_is_still_malformed():
+    """放寬不能放寬到連截斷都吃下去。截斷是傳輸損壞最常見的形態。"""
+    assert parse_line("$H,1737863421130000,0,0,0,142300") is None      # 6 段
+    assert parse_line("$H,1737863421130000,0,0,0") is None             # 4 段
+    assert parse_line("$H,1737863421130000") is None
+
+
+def test_heartbeat_beyond_bw_goes_to_extra():
+    e = parse_line("$H,1737863421130000,0,0,0,142300,42,45678,999,abc")
+    assert e["bw_bytes_since_last"] == 45678
+    assert e["extra"] == ["999", "abc"]
+
+
+def test_heartbeat_bad_bw_field_does_not_kill_the_frame():
+    """第 8 段壞掉只讓它變 None，不能連 heap/temp 一起弄丟。"""
+    e = parse_line("$H,1737863421130000,0,0,0,142300,42,notanumber")
+    assert e is not None
+    assert e["bw_bytes_since_last"] is None
+    assert e["heap"] == 142300
+
+
+@pytest.mark.parametrize("line,key,expected_extra", [
+    pytest.param(TOF_A + ",777", "tof", ["777"], id="tof-extra"),
+    pytest.param(MIC_CLAP + ",777", "mic", ["777"], id="mic-extra"),
+    pytest.param(mel_line() + ",777", "mel", ["777"], id="mel-extra"),
+    pytest.param("$REC,start,5,777", "record", ["777"], id="rec-extra"),
+])
+def test_trailing_fields_are_ignored_not_fatal(line, key, expected_extra):
+    """§1.1 前向相容通則：多出來的尾端欄位忽略，但不丟棄。"""
+    e = parse_line(line)
+    assert e is not None and e["type"] == key
+    assert e["extra"] == expected_extra
+
+
+def test_trailing_fields_do_not_corrupt_payload():
+    """多的欄位不能被誤當成資料。"""
+    e = parse_line(TOF_A + ",777")
+    base = parse_line(TOF_A)
+    assert e["distance"] == base["distance"]
+    assert e["signal"] == base["signal"]
+    assert e["n_valid"] == base["n_valid"]
+
+    m = parse_line(mel_line(value=1234) + ",777")
+    assert len(m["mel_q"]) == N_MELS and set(m["mel_q"]) == {1234}
+
+
+@pytest.mark.parametrize("line", [
+    pytest.param("$T,A,105,1737863421123456,16," + ",".join(["1"] * 31), id="tof-one-short"),
+    pytest.param("$M,3150,1737863421124800,12", id="mic-one-short"),
+    pytest.param("$F,7,1000," + ",".join(["1"] * 39), id="mel-one-short"),
+    pytest.param("$REC,start", id="rec-short"),
+    pytest.param("$MIC,322.1", id="v1-mic-short-again"),
+])
+def test_truncation_still_detected_after_relaxing(line):
+    """放寬成「至少 N 段」之後，少一段仍然要被抓出來。"""
+    assert parse_line(line) is None or parse_line_v1(line) is None
+
+
+def test_v1_mic_tolerates_trailing_fields():
+    e = parse_line_v1("$MIC,322.1,498,777")
+    assert e["rms"] == pytest.approx(322.1) and e["extra"] == ["777"]
+
+
+def test_parser_does_not_count_newer_firmware_as_malformed():
+    """整條的效果：比主機新的韌體不該讓錯誤率上升。"""
+    p = ProtocolParser()
+    p.feed(STATUS_FULL)
+    p.feed("$H,1737863421130000,0,0,0,142300,42,45678")
+    p.feed(TOF_A + ",777")
+    p.feed(MIC_CLAP + ",888")
+    assert p.stats.malformed == 0
+    assert p.stats.parsed == 4
+
+
+def test_v1_tof_keeps_exact_count_check_on_purpose():
+    """v1 是凍結的歷史格式，不會長新欄位；這裡的值數還兼任方言判別，
+    放寬會讓截斷的「距離+signal」行被誤讀成完整的「只有距離」行。"""
+    assert parse_line_v1("$TOF,A,4," + ",".join(["1"] * 17)) is None   # 16+1
+    assert parse_line_v1("$TOF,A,4," + ",".join(["1"] * 24)) is None   # 截斷的 32
+    assert parse_line_v1("$TOF,A,4," + ",".join(["1"] * 16)) is not None
+    assert parse_line_v1("$TOF,A,4," + ",".join(["1"] * 32)) is not None

@@ -1,0 +1,8 @@
+{
+  "_comment": "目標配戴幾何。E01 上機量測前一律為 null，不可填猜測值。",
+  "_source": "provisional — pending E01 bring-up measurement",
+  "target_distance_mm": null,
+  "target_angle_deg": null,
+  "tolerance_distance_mm": null,
+  "tolerance_angle_deg": null
+}

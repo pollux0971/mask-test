@@ -1,8 +1,13 @@
-/* Monitor mode: dual ToF heatmap, migrated verbatim (visuals unchanged --
-   C25 does cross-mode visual unification) from the old single-file
-   panel.html. Rules below are copied 1:1 from its <style> block; only the
-   selectors' container changed (was body-level `section.tof`, is now
-   scoped under #mode-monitor). See js/modes/monitor.js. */
+/* Monitor mode: dual ToF heatmap. Base cell/panel rules below are copied
+   1:1 from the old single-file panel.html's <style> block (C05); the
+   view-distance/view-signal/view-both rules are C07's addition for the
+   distance/signal channel toggle. See js/modes/monitor.js. */
+
+#mode-monitor .view-hint {
+  color: var(--text-dim);
+  font-size: 11px;
+  margin-left: auto;
+}
 
 #mode-monitor {
   min-height: 0;
@@ -34,12 +39,24 @@
 #mode-monitor .tof-grids {
   flex: 1;
   min-height: 0;
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
   gap: 18px;
 }
+
+/* distance/signal: 2 panels visible, side by side (2 grid columns, 1 row).
+   both: all 4 panels, 2x2 -- fits 1080p per C07.md. Order in the DOM is
+   A-dist, A-sig, B-dist, B-sig, so row-major grid auto-flow lands them as
+   [A-dist A-sig] / [B-dist B-sig] in "both", matching that spec order. */
+#mode-monitor .tof-grids.view-both {
+  grid-template-rows: repeat(2, 1fr);
+}
+#mode-monitor .sensor-panel { display: none; }
+#mode-monitor .tof-grids.view-distance .sensor-panel[data-panel$="-dist"] { display: flex; }
+#mode-monitor .tof-grids.view-signal .sensor-panel[data-panel$="-sig"] { display: flex; }
+#mode-monitor .tof-grids.view-both .sensor-panel { display: flex; }
+
 #mode-monitor .sensor-panel {
-  flex: 1;
-  display: flex;
   flex-direction: column;
   gap: 8px;
   background: var(--surface);

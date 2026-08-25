@@ -71,6 +71,21 @@ I8_MIN, I8_MAX = -128, 127
 MALFORMED_SAMPLE_LIMIT = 20
 
 
+# ------------------------------------------------------- 前向相容（§1.1）
+#
+# 契約通則：主機端一律以「**至少** N 段」檢查欄位數，**多出來的尾端欄位
+# 必須忽略，不可判定為畸形行**；不可用 `len(parts) != N` 這種等號檢查。
+#
+# 為什麼：`A15` 在 `$H` 尾端加了 `bw_bytes_since_last` 之後，寫死 `!= 7`
+# 的解析器會把**整行**判成畸形——不是「新欄位讀不到」，是 `heap`、
+# `drop_*`、`temp_c` 連同心跳一起消失，而且沒有任何錯誤訊息。比自己新的
+# 韌體不該長得像壞掉的韌體。
+#
+# 「至少 N 段」仍然抓得到**截斷**（傳輸損壞最常見的形態），只是不再把
+# 「比我新」誤判成「壞掉」。多出來的欄位收進事件的 `extra`，原封不動，
+# 這樣即使本模組還不認得它們，下游或人工判讀仍看得到。
+
+
 def _to_int(text: str) -> int | None:
     """`int(text)` 但不拋例外。順手拒絕 `int()` 會接受但協定不允許的寫法
     （空字串、`+5`、`0x10`、`1_000`、前後空白以外的雜訊）。"""
@@ -135,8 +150,10 @@ def _parse_tof(parts: list[str]) -> dict | None:
         return None
 
     values = parts[5:]
-    if len(values) != 2 * dim:
+    if len(values) < 2 * dim:
         return None  # 被截斷、或兩行黏在一起
+    extra = values[2 * dim:]          # 未來新增的尾端欄位，忽略但不丟棄
+    values = values[:2 * dim]
 
     nums = [_i16(v) for v in values]
     if any(n is None for n in nums):
@@ -162,6 +179,7 @@ def _parse_tof(parts: list[str]) -> dict | None:
         "raw_distance": raw_d,         # 原始值（含 -1），給要自己判斷的下游
         "raw_signal": raw_s,
         "pair_violations": pair_violations,
+        "extra": extra,
     }
 
 
@@ -213,7 +231,7 @@ def _parse_mic(parts: list[str]) -> dict | None:
     注意 `rms` 是 **i16 定點**（16-bit PCM 原始振幅），不是草案的浮點 `f1`
     ——見 CONTRACTS 變更紀錄的破壞性變更那一行。
     """
-    if len(parts) != 5:
+    if len(parts) < 5:
         return None
     seq = _u32(parts[1])
     t_us = _nonneg_i64(parts[2])
@@ -229,18 +247,19 @@ def _parse_mic(parts: list[str]) -> dict | None:
         "has_timestamp": True,
         "rms": rms,
         "peak": peak,
+        "extra": parts[5:],
     }
 
 
 def _parse_mel(parts: list[str]) -> dict | None:
     """`$F,<seq>,<t_us>,<m0>..<m39>`（固定 40 個係數）。"""
-    if len(parts) != 3 + N_MELS:
+    if len(parts) < 3 + N_MELS:
         return None
     seq = _u32(parts[1])
     t_us = _nonneg_i64(parts[2])
     if seq is None or t_us is None:
         return None
-    coeffs = [_i16(v) for v in parts[3:]]
+    coeffs = [_i16(v) for v in parts[3:3 + N_MELS]]
     if any(c is None for c in coeffs):
         return None
     return {
@@ -251,13 +270,14 @@ def _parse_mel(parts: list[str]) -> dict | None:
         "has_timestamp": True,
         "mel_q": coeffs,                                   # 線上原始 int16
         "log_mel": [c / MEL_SCALE for c in coeffs],        # §3.1 還原
+        "extra": parts[3 + N_MELS:],
     }
 
 
 def _parse_heartbeat(parts: list[str]) -> dict | None:
     """`$H,<t_us>,<drop_A>,<drop_B>,<drop_M>,<heap>,<temp_c:i8>`"""
-    if len(parts) != 7:
-        return None
+    if len(parts) < 7:
+        return None                    # 截斷仍然要抓得到
     t_us = _nonneg_i64(parts[1])
     drops = [_u32(p) for p in parts[2:5]]
     heap = _u32(parts[5])
@@ -266,6 +286,12 @@ def _parse_heartbeat(parts: list[str]) -> dict | None:
         return None
     if temp_c is None or not (I8_MIN <= temp_c <= I8_MAX):
         return None
+
+    # `A15` 加的第 8 段。舊韌體沒有這一段 → `None`，不是 0：§1.1.2 的
+    # 「缺漏不填預設值」同樣適用——0 是一個合法的頻寬讀數，用它當缺值
+    # 會讓舊韌體看起來像「這段期間完全沒傳東西」。
+    bw = _u32(parts[7]) if len(parts) > 7 else None
+
     return {
         "type": "heartbeat",
         "proto": 2,
@@ -276,6 +302,8 @@ def _parse_heartbeat(parts: list[str]) -> dict | None:
         "drop_M": drops[2],
         "heap": heap,
         "temp_c": temp_c,
+        "bw_bytes_since_last": bw,     # A15：自上次 $H 起送出的位元組數
+        "extra": parts[8:],
     }
 
 
@@ -348,13 +376,19 @@ def _opt_bool(fields: dict, key: str) -> bool | None:
 def _parse_record(parts: list[str]) -> dict | None:
     """`$REC,start,<seconds>`。不是 B01 的四種資料行，但它是 `$` 開頭，
     不認得就會被算成畸形行、污染錯誤率統計，所以這裡要認得它。"""
-    if len(parts) != 3 or parts[1].strip() != "start":
+    if len(parts) < 3 or parts[1].strip() != "start":
         return None
     seconds = _to_int(parts[2])
     if seconds is None or seconds < 0:
         return None
     # `$REC` 在 v1／v2 格式相同，`proto` 由呼叫端補（`parse_line_v1` 會蓋成 1）。
-    return {"type": "record", "proto": 2, "state": "recording", "seconds": seconds}
+    return {
+        "type": "record",
+        "proto": 2,
+        "state": "recording",
+        "seconds": seconds,
+        "extra": parts[3:],
+    }
 
 
 _HANDLERS = {
@@ -420,6 +454,12 @@ def _parse_tof_v1(parts: list[str]) -> dict | None:
         return None
 
     values = parts[3:]
+    # 這裡刻意用等號，是 §1.1 前向相容通則的例外：v1 是**已凍結的歷史
+    # 格式**，不會再長出新欄位，所以「多出來的段」只可能是傳輸損壞。
+    # 而且這裡的值數本身就是用來分辨兩種方言的（zones = 只有距離、
+    # 2×zones = 距離＋signal），放寬成「至少」會讓一條被截斷的
+    # 距離＋signal 行被誤讀成一條完整的「只有距離」行——那是靜默地
+    # 接受壞資料，比誤判成畸形嚴重得多。
     if len(values) == zones:
         has_signal = False
     elif len(values) == 2 * zones:
@@ -464,7 +504,7 @@ def _parse_mic_v1(parts: list[str]) -> dict | None:
     ——兩個版本的數值單位一樣（16-bit PCM 振幅），但精度來源不同，混在一起
     之後就分不出哪些樣本是估的。
     """
-    if len(parts) != 3:
+    if len(parts) < 3:
         return None
     try:
         rms = float(parts[1].strip())
@@ -483,6 +523,7 @@ def _parse_mic_v1(parts: list[str]) -> dict | None:
         "has_timestamp": False,
         "rms": rms,             # v1 是 float，v2 是 int，用 proto 分辨
         "peak": peak,
+        "extra": parts[3:],
     }
 
 

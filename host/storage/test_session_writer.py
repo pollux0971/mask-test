@@ -253,6 +253,50 @@ def test_zero_length_trial_does_not_crash():
 
 
 # ---------------------------------------------------------------------------
+# 驗收條件：「產出的檔案通過 T02 的 schema 驗證腳本」
+
+
+def _assert_matches_t02_schema(path):
+    """比照 T02 story 的驗收精神，逐項斷言 CONTRACTS.md §2 列出的所有
+    attrs / datasets / shape / dtype。"""
+    with h5py.File(path, "r") as f:
+        assert "meta" in f
+        meta = f["meta"]
+        for key in REQUIRED_META_KEYS:
+            assert key in meta.attrs, f"/meta 缺少 {key}"
+        assert meta.attrs["schema_version"] == 1
+
+        trial_names = sorted(k for k in f.keys() if k.startswith("trial_"))
+        assert trial_names
+        for name in trial_names:
+            trial = f[name]
+            for ds in ("tof_A", "tof_B", "tof_t_us", "tof_valid_A", "tof_valid_B",
+                       "mic_rms", "mic_peak", "mic_t_us"):
+                assert ds in trial, f"{name} 缺少 dataset {ds}"
+            for attr in REQUIRED_TRIAL_ATTRS + ("label", "trial_idx"):
+                assert attr in trial.attrs, f"{name} 缺少 attr {attr}"
+
+            assert trial["tof_A"].shape[1] == 32
+            assert trial["tof_valid_A"].shape[1] == 16
+            assert trial["tof_valid_A"].dtype == np.bool_
+            assert trial["tof_A"].dtype == np.float32
+            assert trial["mic_t_us"].dtype == np.int64
+            if "mel" in trial:
+                assert trial["mel"].shape[1] == 40
+            if "audio" in trial:
+                assert "audio_t0_us" in trial.attrs
+
+
+def test_output_passes_t02_schema_validation(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=30, M=40, include_mel=True, include_audio=True))
+        w.write_trial(1, **_sample_trial_kwargs(T=15, M=20, include_mel=False, include_audio=False))
+
+    _assert_matches_t02_schema(path)
+
+
+# ---------------------------------------------------------------------------
 # 完整性檢查：REQUIRED_* 常數跟 CONTRACTS.md 的欄位清單要對得上
 # （防止改 schema 時漏改常數，或改常數時漏改 schema）
 

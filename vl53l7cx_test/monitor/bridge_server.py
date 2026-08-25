@@ -58,6 +58,16 @@ VOICE_DIR.mkdir(parents=True, exist_ok=True)
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+# B19: these are stdlib-only (no librosa, no h5py), so unlike the mel backend
+# below they can be imported eagerly -- the bridge cannot do its job without
+# them any more.
+from host.capture.protocol import ProtocolParser          # noqa: E402
+from host.capture.dropwatch import DropTracker, tof_stream  # noqa: E402
+from host.clock.align import ClockAligner                 # noqa: E402
+from host.quality.metrics import QualityAggregator, ThresholdTable  # noqa: E402
+
+THRESHOLDS_PATH = ROOT_DIR / "config" / "quality_thresholds.json"
+
 # Imported lazily: mel_pipeline pulls in librosa, which is a heavy optional
 # dependency. The bridge's core job -- serving the panel and relaying $-lines
 # over SSE -- must still start on a machine that only has pyserial, and the
@@ -138,34 +148,148 @@ serial_write_lock = threading.Lock()
 current_serial_holder = {"ser": None}
 
 
-def parse_line(line):
-    line = line.strip()
-    if not line.startswith("$"):
+# B19: one ProtocolParser per serial connection (it carries the version
+# negotiation state), plus the quality machinery that watches the same
+# stream. Re-created on every reconnect so a reboot starts a clean session.
+protocol_state = {"parser": None}
+
+drop_tracker = DropTracker()
+quality_thresholds = ThresholdTable(THRESHOLDS_PATH)
+clock_aligner = ClockAligner()
+quality = QualityAggregator(
+    quality_thresholds,
+    drop_tracker=drop_tracker,
+    clock_aligner=clock_aligner,
+)
+
+
+def to_sse_event(event):
+    """Translate one host.capture.protocol event into its CONTRACTS #4.2 shape.
+
+    The wire names and the SSE names differ (`distance` vs `dist`, `log_mel`
+    vs `bands`), so this is a rename layer, not a second parser -- all the
+    validation already happened in protocol.py.
+
+    Fields the firmware did not send stay absent rather than being filled
+    with a default (CONTRACTS #1.1.2). A v1 line has no `seq`/`t_us` at all,
+    and a panel that received `seq: 0` could not tell that apart from a real
+    first frame.
+    """
+    kind = event.get("type")
+
+    if kind == "tof":
+        out = {"type": "tof", "sensor": event["sensor"], "dim": event["dim"],
+               "dist": event["distance"], "signal": event["signal"],
+               "valid": event["valid"]}
+    elif kind == "mic":
+        out = {"type": "mic", "rms": event["rms"], "peak": event["peak"]}
+    elif kind == "mel":
+        out = {"type": "mel", "bands": event["log_mel"]}
+    elif kind == "heartbeat":
+        out = {"type": "heartbeat", "drop_A": event["drop_A"],
+               "drop_B": event["drop_B"], "drop_M": event["drop_M"],
+               "heap": event["heap"], "temp_c": event["temp_c"]}
+    elif kind == "status":
+        # parser.state() is the seam B02 built for exactly this: it already
+        # carries protocol_version / degraded / warning / recording_allowed,
+        # so the panel can grey out the record button without re-deriving
+        # any of it. `dim` is in there too, which keeps the event shape
+        # backward-compatible with the panel's existing status handler.
+        parser = protocol_state["parser"]
+        out = {"type": "status"}
+        if parser is not None:
+            out.update(parser.state())
+        else:
+            out["dim"] = event.get("dim")
+        return out
+    elif kind == "record":
+        return {"type": "record", "state": event["state"], "seconds": event["seconds"]}
+    else:
         return None
-    try:
-        if line.startswith("$TOF,"):
-            _, sensor, dim, *values = line.split(",")
-            return {
-                "type": "tof",
-                "sensor": sensor,
-                "dim": int(dim),
-                "values": [int(v) for v in values],
-            }
-        if line.startswith("$MIC,"):
-            _, rms, peak = line.split(",")
-            return {"type": "mic", "rms": float(rms), "peak": int(peak)}
-        if line.startswith("$STATUS,"):
-            m = re.search(r"res=(\d+)", line)
-            if m:
-                dim = int(m.group(1))
-                current_resolution["dim"] = dim
-                return {"type": "status", "dim": dim}
-        if line.startswith("$REC,start,"):
-            seconds = int(line.split(",")[2])
-            return {"type": "record", "state": "recording", "seconds": seconds}
-    except (ValueError, IndexError):
-        return None
-    return None
+
+    for key in ("seq", "t_us"):
+        if event.get(key) is not None:
+            out[key] = event[key]
+    if event.get("proto") == 1:
+        # Marked explicitly so the panel can label degraded data rather than
+        # silently mixing it in with timestamped v2 frames.
+        out["proto"] = 1
+        out["has_timestamp"] = False
+    return out
+
+
+def observe_for_quality(event):
+    """Feed one parsed event to the drop tracker and the quality metrics."""
+    kind = event.get("type")
+    seq = event.get("seq")
+    if kind == "tof":
+        if seq is not None:
+            drop_tracker.observe(tof_stream(event["sensor"]), seq)
+        quality.observe_tof(event)
+    elif kind == "mic":
+        if seq is not None:
+            drop_tracker.observe("mic", seq)
+        quality.observe_mic(event)
+    elif kind == "mel":
+        if seq is not None:
+            drop_tracker.observe("mel", seq)
+        quality.observe_mel(event)
+    elif kind == "heartbeat":
+        quality.observe_heartbeat(event)
+    elif kind == "status":
+        # Arms a possible session restart; it does NOT reset the counters.
+        # $STATUS is re-sent on every PING and every SENS/MEL change, so a
+        # reset here would zero the gauge roughly a hundred times during
+        # B05's clock calibration (CONTRACTS #1.1, amended 2026-08-26).
+        drop_tracker.on_status()
+
+
+def quality_emitter(interval=1.0):
+    """Publishes the `quality` event at 1 Hz for the lifetime of the process.
+
+    Independent of the serial reader on purpose: the panel's health lights
+    must keep updating while the link is down or a flash is running, and a
+    dashboard that freezes at the moment something goes wrong is the one
+    that is least useful.
+    """
+    while True:
+        time.sleep(interval)
+        try:
+            broadcaster.publish(quality.snapshot())
+        except Exception as exc:  # never let a metric bug kill the stream
+            print(f"[bridge] quality snapshot failed: {exc}")
+
+
+# --- B09 / B11 seams -------------------------------------------------------
+# The state machines themselves are not built yet. These exist so that when
+# they are, both stories emit the shapes CONTRACTS #4.2 already froze rather
+# than each inventing their own -- which is the failure mode that made the
+# $STATUS/drop_* mismatch expensive to find.
+
+TRIAL_STATES = ("PROMPT", "COUNTDOWN", "CAPTURE", "SAVE", "REST")
+SESSION_STATES = ("started", "baseline", "ended")
+
+
+def publish_trial_state(state, label=None, idx=None, **extra):
+    """Emit a `trial` event. Called by B11's trial state machine."""
+    if state not in TRIAL_STATES:
+        raise ValueError(f"trial state must be one of {TRIAL_STATES}, got {state!r}")
+    event = {"type": "trial", "state": state, **extra}
+    if label is not None:
+        event["label"] = label
+    if idx is not None:
+        event["idx"] = idx
+    broadcaster.publish(event)
+
+
+def publish_session_state(state, progress=None, **extra):
+    """Emit a `session` event. Called by B09's session lifecycle."""
+    if state not in SESSION_STATES:
+        raise ValueError(f"session state must be one of {SESSION_STATES}, got {state!r}")
+    event = {"type": "session", "state": state, **extra}
+    if progress is not None:
+        event["progress"] = progress
+    broadcaster.publish(event)
 
 
 def save_wav(rate, bits, channels, pcm_bytes):
@@ -226,7 +350,7 @@ def _process_mfcc(filename):
     broadcaster.publish(event)
 
 
-def serial_reader(port, baud):
+def serial_reader(port, baud, allow_v1=False):
     """Runs for the lifetime of the process; pauses itself while `flashing`
     is set so the flash subprocess can have the port exclusively."""
     import serial
@@ -246,6 +370,10 @@ def serial_reader(port, baud):
             with serial_lock:
                 ser = serial.Serial(port, baud, timeout=1)
             current_serial_holder["ser"] = ser
+            # A fresh parser per connection: version negotiation state
+            # belongs to one link, and reconnecting after a reflash means
+            # re-reading the new firmware's $STATUS from scratch.
+            protocol_state["parser"] = ProtocolParser(allow_v1=allow_v1)
             print(f"[bridge] serial open: {port} @ {baud}")
             broadcaster.publish({"type": "link", "state": "up"})
             try:
@@ -253,6 +381,11 @@ def serial_reader(port, baud):
                     raw = ser.readline()
                     if not raw:
                         continue
+                    # Counted at the port, before parsing: malformed lines
+                    # and the base64 dump occupy real link capacity, and the
+                    # bandwidth metric is about how full the link is, not
+                    # how much of it turned out to be useful.
+                    quality.note_bytes(len(raw))
                     try:
                         text = raw.decode("utf-8", errors="replace")
                     except Exception:
@@ -298,9 +431,15 @@ def serial_reader(port, baud):
                         wav_chunks.append(stripped)
                         continue
 
-                    event = parse_line(text)
-                    if event:
-                        broadcaster.publish(event)
+                    parsed = protocol_state["parser"].feed(text)
+                    if not parsed:
+                        continue
+                    if parsed.get("type") == "status" and parsed.get("dim"):
+                        current_resolution["dim"] = parsed["dim"]
+                    observe_for_quality(parsed)
+                    sse = to_sse_event(parsed)
+                    if sse:
+                        broadcaster.publish(sse)
             finally:
                 current_serial_holder["ser"] = None
                 ser.close()
@@ -464,8 +603,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         q = broadcaster.subscribe()
         try:
             # tell the freshly-connected client what we currently know
+            # Everything we already know, so a tab opened mid-session is
+            # not blank until the next $STATUS: the protocol state (B02's
+            # recording_allowed / warning included) and one quality frame.
+            parser = protocol_state["parser"]
             initial = {"type": "status", "dim": current_resolution["dim"]}
-            self.wfile.write(f"data: {json.dumps(initial)}\n\n".encode())
+            if parser is not None:
+                initial.update(parser.state())
+            for event in (initial, quality.snapshot()):
+                self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
             self.wfile.flush()
 
             last_ping = time.time()
@@ -544,6 +690,10 @@ def main():
     parser.add_argument("--baud", type=int, default=460800, help="must match CONFIG_ESP_CONSOLE_UART_BAUDRATE")
     parser.add_argument("--http-port", type=int, default=8765)
     parser.add_argument(
+        "--allow-v1", action="store_true",
+        help="B02 降級模式：接受舊韌體的 $TOF/$MIC 行。預設關閉——v1 沒有 "
+             "t_us，錄下來的 session 無法做時間對齊，所以必須明確打開。")
+    parser.add_argument(
         "--h5-session", default=None,
         help="B14 備援路線：每次錄音完成後，除了存 .npy，也把 log-mel 寫進這個 "
              "session HDF5 檔（trial group 要已經存在，例如用 "
@@ -553,8 +703,13 @@ def main():
     if args.h5_session:
         mfcc_target["h5_path"] = Path(args.h5_session)
 
-    reader = threading.Thread(target=serial_reader, args=(args.port, args.baud), daemon=True)
+    reader = threading.Thread(
+        target=serial_reader, args=(args.port, args.baud, args.allow_v1), daemon=True)
     reader.start()
+
+    # Runs whether or not the link is up: a health dashboard that freezes
+    # when something breaks is useless exactly when it is needed.
+    threading.Thread(target=quality_emitter, daemon=True).start()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.http_port), Handler)
     server.serial_port = args.port

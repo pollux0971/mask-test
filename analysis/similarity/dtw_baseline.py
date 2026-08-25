@@ -15,18 +15,34 @@ DTW 存在的意義就是在時間軸上做非線性對齊，固定長度重採�
 產生病態的小距離，反而降低判別力。`band_ratio` 限制對齊路徑偏離對角線
 的比例（0.2 表示最多偏離 20%），把這種病態對齊排除掉。`band_ratio`
 留成參數不寫死，因為 `D08` 的 LOOCV 之後要拿真實資料校準它。
+
+**單幀距離用 `metric="cosine"`，跟 `host/features/dtw_compare.py`（用
+`euclidean`）不同，這是刻意的選擇，理由有兩個：**
+1. 這個 story 的驗收條件要求「DTW 距離明顯小於餘弦距離」——這只有在
+   兩者的數值尺度可比時才有意義。`cosine_baseline.cosine_dist()` 的值
+   界在 `[0, 2]`；DTW 用 `euclidean` 累加 104 維特徵的逐幀距離，數值
+   尺度完全不同（量級可以差到幾十倍），兩者的原始數字根本不能放在一起比大小。
+   用 `cosine` 當單幀距離，累加後除以路徑長度，數值一樣界在 `[0, 2]`，
+   才是同一把尺。
+2. 這裡的輸入是 D01/D02 已經 z-score／CMN 過的特徵，本來就沒有穩定的
+   絕對原點與尺度（只有「方向」有意義），`euclidean` 對這種資料其實
+   不是最自然的選擇；`cosine` 跟前面正規化的精神一致。
+   （B14 的 `dtw_compare.py` 處理的是還沒 CMN 的原始 log-mel，
+   拿來驗證跟 librosa 標準答案逐幀是否一致，用 `euclidean` 沒問題，
+   跟這裡是不同情境，不是互相矛盾的決定。）
 """
 import numpy as np
 from librosa.sequence import dtw as _librosa_dtw
 
 DEFAULT_BAND_RATIO = 0.2
+DEFAULT_METRIC = "cosine"
 
 
-def dtw_dist(a, b, band_ratio=DEFAULT_BAND_RATIO):
+def dtw_dist(a, b, band_ratio=DEFAULT_BAND_RATIO, metric=DEFAULT_METRIC):
     """兩個 (T, D) 序列（長度可以不同）的 Sakoe-Chiba 限制 DTW 距離。
 
-    回傳值除以對齊路徑長度做正規化，讓不同長度的序列也能互相比較——
-    跟 `host/features/dtw_compare.dtw_distance()` 用同樣的正規化方式。
+    回傳值除以對齊路徑長度做正規化，讓不同長度的序列也能互相比較，
+    也讓數值尺度不隨路徑長度膨脹（維持在跟 `cosine_dist` 相近的範圍）。
     """
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
@@ -36,27 +52,27 @@ def dtw_dist(a, b, band_ratio=DEFAULT_BAND_RATIO):
         raise ValueError(f"band_ratio 應在 (0, 1] 之間，收到 {band_ratio}")
 
     cost, wp = _librosa_dtw(
-        X=a.T, Y=b.T, metric="euclidean",
+        X=a.T, Y=b.T, metric=metric,
         global_constraints=True, band_rad=band_ratio,
     )
     return float(cost[-1, -1] / len(wp))
 
 
-def modality_dtw_dist(a, b, slices, modality, band_ratio=DEFAULT_BAND_RATIO):
+def modality_dtw_dist(a, b, slices, modality, band_ratio=DEFAULT_BAND_RATIO, metric=DEFAULT_METRIC):
     """只用單一模態算 DTW 距離。
 
     a, b: (T, D) 完整特徵序列（各自可以不同長度）
     slices: 對應 D03 `FeatureSeq.slices`
     """
     sl = slices[modality]
-    return dtw_dist(a[:, sl], b[:, sl], band_ratio=band_ratio)
+    return dtw_dist(a[:, sl], b[:, sl], band_ratio=band_ratio, metric=metric)
 
 
-def batch_dtw_dist(query, templates, band_ratio=DEFAULT_BAND_RATIO):
+def batch_dtw_dist(query, templates, band_ratio=DEFAULT_BAND_RATIO, metric=DEFAULT_METRIC):
     """一個 query 對 N 個 templates 的 DTW 距離。
 
     templates 是長度可以互不相同的序列組成的 list（不重採樣正是重點），
     DTW 沒有 D04 餘弦那種矩陣乘法捷徑，這裡就是逐一呼叫 `dtw_dist()`。
     回傳 (N,) 距離陣列。
     """
-    return np.array([dtw_dist(query, t, band_ratio=band_ratio) for t in templates])
+    return np.array([dtw_dist(query, t, band_ratio=band_ratio, metric=metric) for t in templates])

@@ -40,7 +40,15 @@ const modeEntered = Object.fromEntries(MODES.map((mode) => [mode, false]));
 // comment below for why the first one is needed.
 function enterMode(mode) {
   if (modeEntered[mode]) return;
-  if (typeof modeHooks[mode].onEnter === "function") modeHooks[mode].onEnter();
+  const onEnter = modeHooks[mode].onEnter;
+  // If this mode hasn't registered yet (e.g. the initial #/quiz-style hash
+  // activation runs before any mode module has imported), there's nothing
+  // to call -- and importantly, don't mark it entered: leave the flag false
+  // so registerMode()'s own "already current mode" check gets a real chance
+  // to call the hook once it exists, instead of finding modeEntered already
+  // (wrongly) true and skipping it forever.
+  if (typeof onEnter !== "function") return;
+  onEnter();
   modeEntered[mode] = true;
 }
 
@@ -138,7 +146,7 @@ export function activateMode(mode, { instant = false } = {}) {
   currentMode = mode;
   syncHashTo(mode);
 
-  if (typeof modeHooks[mode].onEnter === "function") modeHooks[mode].onEnter();
+  enterMode(mode);
 
   document.dispatchEvent(new CustomEvent("panel:modechange", { detail: { mode, previous: prevMode } }));
 }

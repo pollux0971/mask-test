@@ -1,42 +1,51 @@
-// Monitor mode (C05): dual ToF heatmap. Migration of the old single-file
-// panel.html's buildGrid/renderTof/distColor -- behavior unchanged, only
-// wired into the C03 mode lifecycle (registerMode/onEnter/onLeave/onData)
-// instead of a page-global <script>.
+// Monitor mode. C05 migrated the distance heatmap from the old single-file
+// panel.html. C07 adds the signal-rate channel: press S to cycle
+// distance -> signal -> both (A-dist/A-sig/B-dist/B-sig, 2x2), each
+// channel keeps its own color scale so they can't be misread for one
+// another, and signal uses a log scale (its dynamic range is much wider
+// than distance's).
 //
-// Two real adaptations beyond a straight copy-paste (per C05.md):
-//
-// 1. `$T`'s values are now [d0..d(dim-1), s0..s(dim-1)] -- 2*dim entries,
-//    not dim entries. This mode only shows distance (signal rate display
-//    is C07), so it slices off the first `dim` values and ignores the
-//    rest. NOTE: C05.md's implementation note says "2 x dim^2", which
-//    assumes `dim` means grid side. It doesn't: CONTRACTS.md 1.1 defines
-//    the wire's `dim` field as *zone count* (16|64), and that's what's
-//    empirically on the wire today -- captured live SSE during C01-C03
-//    testing showed {"type":"tof",...,"dim":16,"values":[...32 entries]}.
-//    So the real length is 2*dim, and grid side is round(sqrt(dim)). Also
-//    worth knowing: the separate {"type":"status"} event's `dim` is grid
-//    side (4|8, tied to bridge_server.py's /switch?res=4|8), NOT zone
-//    count -- the same field name means two different things on two event
-//    types from the *same*, unmodified bridge_server.py right now. This
-//    mode never reads status's dim for grid sizing to avoid that trap; it
-//    only ever trusts a tof event's own dim.
-// 2. onLeave() cancels the rAF loop; onEnter() restarts it. onData() only
-//    updates cheap local state (latest frame + rate-counter timestamps),
-//    so a hidden monitor mode keeps its Hz readout and last-known frame
-//    current without spending any paint time -- painting is what the rAF
-//    loop does, and that's the part that actually stops.
+// Wire notes (see monitor.js's original C05 comment / T04/C03/C05 reports
+// for how these were confirmed against live traffic, not assumed):
+// - `$T` values are [d0..d(dim-1), s0..s(dim-1)], 2*dim entries; `dim` is
+//   zone count (16|64), grid side is round(sqrt(dim)).
+// - Invalid zones report -1 for BOTH d and s together (CONTRACTS.md 1.1) --
+//   one shared invalid check covers both channels.
+// - zone layout (row-major) is still an unverified assumption per D11; the
+//   warning badge covers both channels since it's the same physical data,
+//   and it's rendered unconditionally (not tied to a specific channel's
+//   visibility) so it's on screen no matter which view is selected.
 
 import { registerMode } from "../shell.js";
 
-const DIST_MIN = 0, DIST_MAX = 1200; // mm, clamps the color scale
-const NEAR = [23, 73, 90];    // rgb, close object
-const FAR = [223, 231, 226];  // rgb, far / no object nearby
+const DIST_MIN = 0, DIST_MAX = 1200; // mm, clamps the distance color scale
+const DIST_NEAR = [23, 73, 90];      // rgb, close object
+const DIST_FAR = [223, 231, 226];    // rgb, far / no object nearby
 
 function distColor(mm) {
   const t = Math.max(0, Math.min(1, mm / DIST_MAX));
-  const r = Math.round(NEAR[0] + (FAR[0] - NEAR[0]) * t);
-  const g = Math.round(NEAR[1] + (FAR[1] - NEAR[1]) * t);
-  const b = Math.round(NEAR[2] + (FAR[2] - NEAR[2]) * t);
+  const r = Math.round(DIST_NEAR[0] + (DIST_FAR[0] - DIST_NEAR[0]) * t);
+  const g = Math.round(DIST_NEAR[1] + (DIST_FAR[1] - DIST_NEAR[1]) * t);
+  const b = Math.round(DIST_NEAR[2] + (DIST_FAR[2] - DIST_NEAR[2]) * t);
+  return { rgb: `rgb(${r},${g},${b})`, luminance: (0.299 * r + 0.587 * g + 0.114 * b) / 255 };
+}
+
+// signal_per_spad/100 has no theoretical upper bound (CONTRACTS.md 1.1) but
+// "實務值多落在 0-200" -- clamp the color scale there, log-spaced so a
+// near-zero (unaimed / absorbing) zone is visibly distinct from a merely
+// "not maximal" one instead of the whole low end looking the same.
+// Deliberately a different family (violet -> amber) from distance's
+// teal -> pale gray, per C07.md "色系明顯不同，不會誤讀".
+const SIG_MIN = 1, SIG_MAX = 200;
+const SIG_LOW = [45, 24, 74];    // deep violet: little/no reflection
+const SIG_HIGH = [255, 191, 64]; // amber: strong reflection
+
+function signalColor(s) {
+  const clamped = Math.max(SIG_MIN, Math.min(SIG_MAX, Math.max(s, SIG_MIN)));
+  const t = Math.log(clamped / SIG_MIN) / Math.log(SIG_MAX / SIG_MIN);
+  const r = Math.round(SIG_LOW[0] + (SIG_HIGH[0] - SIG_LOW[0]) * t);
+  const g = Math.round(SIG_LOW[1] + (SIG_HIGH[1] - SIG_LOW[1]) * t);
+  const b = Math.round(SIG_LOW[2] + (SIG_HIGH[2] - SIG_LOW[2]) * t);
   return { rgb: `rgb(${r},${g},${b})`, luminance: (0.299 * r + 0.587 * g + 0.114 * b) / 255 };
 }
 
@@ -55,18 +64,22 @@ function buildGrid(el, side) {
   return cells;
 }
 
-function renderTof(cells, dValues) {
-  if (!cells || cells.length !== dValues.length) return;
-  for (let i = 0; i < dValues.length; i++) {
-    const v = dValues[i];
+// `values` is whichever channel's slice (d or s) plus the *other* channel's
+// slice at the same index, so a zone invalid in one is invalid in both
+// (CONTRACTS.md 1.1) without each caller re-deriving that.
+function renderChannel(cells, values, invalidValues, colorFn) {
+  if (!cells || cells.length !== values.length) return;
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
+    const invalid = v == null || v < 0 || (invalidValues[i] != null && invalidValues[i] < 0);
     const c = cells[i];
-    if (v == null || v < 0) {
+    if (invalid) {
       c.className = "cell invalid";
       c.textContent = "·";
       c.style.background = "var(--cell-invalid)";
       c.style.color = "";
     } else {
-      const { rgb, luminance } = distColor(v);
+      const { rgb, luminance } = colorFn(v);
       c.className = "cell";
       c.textContent = v;
       c.style.background = rgb;
@@ -77,31 +90,75 @@ function renderTof(cells, dValues) {
 
 let warnedBadLength = false;
 
-registerMode("monitor", (() => {
-  let gridEls = { A: null, B: null };
-  let rateEls = { A: null, B: null };
-  let cells = { A: [], B: [] };
-  let currentDim = { A: null, B: null }; // zone count (16|64), per-sensor
-  let latestFrame = { A: null, B: null }; // { dim, dValues }
-  let rateCounters = { A: [], B: [] }; // timestamps of recent frames, for a rough Hz readout -- unchanged from the original, per C05.md ("這個 story 先不動它")
-  let rafId = null;
+const SENSORS = ["A", "B"];
+const CHANNELS = ["dist", "sig"];
+const VIEW_MODES = ["distance", "signal", "both"];
+const PANEL_LABEL = { dist: "距離", sig: "訊號" };
 
-  function ensureGrid(sensor, dim) {
+function isTypingTarget(el) {
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
+}
+
+registerMode("monitor", (() => {
+  const gridEls = {};   // "A-dist" -> element
+  const rateEls = {};   // "A" -> element (shared by both channel panels for that sensor)
+  const cells = {};     // "A-dist" -> cell array
+  const currentDim = { A: null, B: null };
+  const latestFrame = { A: null, B: null }; // { dim, dValues, sValues }
+  const rateCounters = { A: [], B: [] };
+  let rafId = null;
+  let viewMode = "distance";
+  let gridsContainer = null;
+
+  function ensureGrids(sensor, dim) {
     if (currentDim[sensor] === dim) return;
     const side = Math.round(Math.sqrt(dim));
-    cells[sensor] = buildGrid(gridEls[sensor], side);
+    for (const ch of CHANNELS) {
+      cells[`${sensor}-${ch}`] = buildGrid(gridEls[`${sensor}-${ch}`], side);
+    }
     currentDim[sensor] = dim;
   }
 
+  function applyViewMode() {
+    gridsContainer.classList.remove("view-distance", "view-signal", "view-both");
+    gridsContainer.classList.add(`view-${viewMode}`);
+  }
+
+  function cycleView() {
+    const idx = VIEW_MODES.indexOf(viewMode);
+    viewMode = VIEW_MODES[(idx + 1) % VIEW_MODES.length];
+    applyViewMode();
+  }
+
+  function isMonitorModeActive() {
+    const section = document.getElementById("mode-monitor");
+    return !!section && section.classList.contains("active");
+  }
+
+  function onKeydown(e) {
+    if (isTypingTarget(e.target) || e.altKey || e.ctrlKey || e.metaKey) return;
+    if (!isMonitorModeActive()) return;
+    if (e.key.toLowerCase() === "s") {
+      e.preventDefault();
+      cycleView();
+    }
+  }
+
   function paint() {
-    for (const sensor of ["A", "B"]) {
+    // All four panels are kept current every frame regardless of which are
+    // visible -- cheap (four small grids) and means switching views (or
+    // side-by-side) never shows stale data, satisfying "四張圖同步更新"
+    // trivially instead of tracking per-view dirty state.
+    for (const sensor of SENSORS) {
       const frame = latestFrame[sensor];
       if (!frame) continue;
-      ensureGrid(sensor, frame.dim);
-      renderTof(cells[sensor], frame.dValues);
-      const arr = rateCounters[sensor];
-      const hz = arr.length / 2; // 2s sliding window, see onData
-      rateEls[sensor].textContent = hz.toFixed(1) + " Hz";
+      ensureGrids(sensor, frame.dim);
+      renderChannel(cells[`${sensor}-dist`], frame.dValues, frame.sValues, distColor);
+      renderChannel(cells[`${sensor}-sig`], frame.sValues, frame.dValues, signalColor);
+      const hz = (rateCounters[sensor].length / 2).toFixed(1) + " Hz"; // 2s sliding window, unchanged from C05
+      rateEls[sensor].forEach((el) => { el.textContent = hz; });
     }
     rafId = requestAnimationFrame(paint);
   }
@@ -109,30 +166,36 @@ registerMode("monitor", (() => {
   return {
     init(root) {
       root.innerHTML = `
-        <div class="section-label">ToF depth grids (mm)
-          <span class="assumed-badge" title="zone 的實體排列方式（row-major）是未驗證的假設，見 D11">
-            ⚠ zone 佈局 row-major — ASSUMED, unverified
+        <div class="section-label">ToF depth / signal grids
+          <span class="assumed-badge" title="zone 的實體排列方式（row-major）是未驗證的假設，見 D11 -- 距離與訊號兩種畫面皆適用">
+            ⚠ zone 佈局 row-major — ASSUMED, unverified（距離／訊號皆適用）
           </span>
+          <span class="view-hint mono">按 S 切換：距離 / 訊號 / 並排</span>
         </div>
-        <div class="tof-grids">
-          <div class="sensor-panel">
-            <div class="sensor-head">
-              <span class="sensor-name">Sensor A</span>
-              <span class="sensor-hz mono" data-rate="A">--</span>
+        <div class="tof-grids view-distance" data-grids>
+          ${SENSORS.map((sensor) => CHANNELS.map((ch) => `
+            <div class="sensor-panel" data-panel="${sensor}-${ch}">
+              <div class="sensor-head">
+                <span class="sensor-name">Sensor ${sensor} · ${PANEL_LABEL[ch]}</span>
+                <span class="sensor-hz mono" data-rate="${sensor}">--</span>
+              </div>
+              <div class="grid" data-grid="${sensor}-${ch}"></div>
             </div>
-            <div class="grid" data-grid="A"></div>
-          </div>
-          <div class="sensor-panel">
-            <div class="sensor-head">
-              <span class="sensor-name">Sensor B</span>
-              <span class="sensor-hz mono" data-rate="B">--</span>
-            </div>
-            <div class="grid" data-grid="B"></div>
-          </div>
+          `).join("")).join("")}
         </div>
       `;
-      gridEls = { A: root.querySelector('[data-grid="A"]'), B: root.querySelector('[data-grid="B"]') };
-      rateEls = { A: root.querySelector('[data-rate="A"]'), B: root.querySelector('[data-rate="B"]') };
+      gridsContainer = root.querySelector("[data-grids]");
+      rateEls.A = [];
+      rateEls.B = [];
+      for (const sensor of SENSORS) {
+        for (const ch of CHANNELS) {
+          const key = `${sensor}-${ch}`;
+          gridEls[key] = root.querySelector(`[data-grid="${key}"]`);
+          rateEls[sensor].push(root.querySelector(`[data-panel="${key}"] [data-rate="${sensor}"]`));
+        }
+      }
+      applyViewMode();
+      document.addEventListener("keydown", onKeydown);
     },
 
     onEnter() {
@@ -160,7 +223,7 @@ registerMode("monitor", (() => {
         }
         return;
       }
-      latestFrame[sensor] = { dim, dValues: values.slice(0, dim) };
+      latestFrame[sensor] = { dim, dValues: values.slice(0, dim), sValues: values.slice(dim) };
 
       const now = performance.now();
       const arr = rateCounters[sensor];

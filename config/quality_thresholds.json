@@ -1,5 +1,59 @@
 {
-  "_note": "佔位骨架。CONTRACTS.md 未給出具體門檻值，實際數字待負責 quality 事件（4.2 quality metrics）的 story 填入。",
-  "drop_rate": {"green": null, "yellow": null},
-  "valid_zone_ratio": {"green": null, "yellow": null}
+  "_note": "B19 quality 事件的門檻與診斷建議。bridge_server.py 每秒重讀一次（比 mtime），改完存檔即時生效，不需重啟。metric 名稱對應 CONTRACTS.md #4.2 的 quality.metrics。",
+  "_direction": "lower_better：value <= green 為綠、<= yellow 為黃、其餘紅。higher_better：>= green 為綠、>= yellow 為黃、其餘紅。green/yellow 任一為 null 代表這格還沒定，該指標一律回 level=\"unknown\"（不是綠——沒人設定過的指標不等於通過）。",
+  "_provenance": "標 [契約] 的數字有出處；標 [暫定] 的是初次上機前的工程判斷，實測後應該回頭調整。",
+
+  "drop_rate": {
+    "direction": "lower_better",
+    "green": 0.01,
+    "yellow": 0.05,
+    "_source": "[暫定] CONTRACTS 未給掉幀率門檻。1% 是「偶爾掉一幀」，5% 是 T04 用來當故障注入基準的量級。",
+    "yellow_hint": "掉幀率偏高。先確認 bridge 沒有跟其他吃 CPU 的程式搶資源；若同時在錄音，dump 期間吃掉 92% 頻寬（CONTRACTS §1.4），這段掉幀是預期的。",
+    "red_hint": "掉幀嚴重。依序檢查：(1) 是否正在錄音 dump；(2) 解析度是否為 8x8 且 Mel 開著（CONTRACTS §1.4 估 70% 頻寬）；(3) USB 線或 hub 是否不穩。"
+  },
+
+  "valid_zones": {
+    "direction": "higher_better",
+    "green": 0.8,
+    "yellow": 0.5,
+    "_source": "[暫定] 有效判定為 target_status ∈ {5,9}（CONTRACTS §1.3）。真實戴上時多數 zone 應該打到嘴唇附近；比例低通常是沒戴好或距離超出量程。",
+    "yellow_hint": "部分 zone 量不到。多半是感測器離目標太遠或角度偏了，先確認裝置有戴上並貼合。",
+    "red_hint": "大多數 zone 無效。感測器可能對著空氣或超出 4000mm 量程；確認裝置戴上、鏡頭沒被遮住、排線沒鬆脫。"
+  },
+
+  "symmetry": {
+    "direction": "lower_better",
+    "green": 0.15,
+    "yellow": 0.3,
+    "_source": "[暫定] 定義為 |meanA - meanB| / ((meanA+meanB)/2)，相對差而非絕對 mm。門檻取法讓 story B19 舉例的 0.21 落在黃燈，與該範例一致。",
+    "yellow_hint": "左右不對稱。其中一顆感測器離嘴唇比較遠，微調骨架讓兩側等距，否則 crosstalk 實驗與雙側特徵會有系統性偏差。",
+    "red_hint": "左右嚴重不對稱。檢查骨架是否變形、其中一顆是否被遮擋或鬆脫；這個狀態下錄的資料不適合做左右比較分析。"
+  },
+
+  "clock_resid": {
+    "direction": "lower_better",
+    "green": 0.005,
+    "yellow": 0.01,
+    "_source": "[契約] 綠燈門檻 5ms 直接取自 B04 的驗收條件（殘差 p95 < 5ms）。黃燈 10ms 為其兩倍。單位是秒。",
+    "yellow_hint": "時鐘對齊殘差超過 B04 的 5ms 目標。多半是主機端排程抖動；PING 校時請用最小值統計而非平均值（CONTRACTS §1.3）。",
+    "red_hint": "時鐘對齊不可信，跨模態的時間對齊會出錯。檢查是否有 clock jump（裝置重開機或 t_us 跳變），必要時重新做一次 PING 校時。"
+  },
+
+  "noise_floor": {
+    "direction": "lower_better",
+    "green": 300,
+    "yellow": 1000,
+    "_source": "[暫定] 單位是 16-bit PCM 原始振幅（CONTRACTS §1.1 的 $M rms，0-32767）。取近期 rms 的第 10 百分位當底噪。門檻待實際環境量測後校正。",
+    "yellow_hint": "底噪偏高。環境可能有風扇或空調；骨傳導麥克風也可能貼合不良而收到摩擦聲。",
+    "red_hint": "底噪過高，音訊模態的辨識會失效。確認麥克風沒有被衣物摩擦、線材沒有拉扯，並遠離噪音源後重新量測。"
+  },
+
+  "bandwidth": {
+    "direction": "lower_better",
+    "green": 0.6,
+    "yellow": 0.8,
+    "_source": "[契約] 取自 CONTRACTS §1.4 頻寬預算表：4x4@30Hz+Mel256 為 54%（綠）、8x8@10Hz+Mel256 為 70%（黃，該表已用粗體標示為需留意）、錄音 dump 期間 +92% 為超載（紅）。分母為 460800 baud / 10 bits per byte。",
+    "yellow_hint": "鏈路使用率偏高。8x8 加上 Mel 串流約需 70%（CONTRACTS §1.4），此時錄音 dump 會直接超載並造成掉幀。",
+    "red_hint": "鏈路已飽和，掉幀無法避免。關掉 Mel 串流（MEL:0）或改回 4x4；若正在錄音 dump，這是預期狀態，等傳輸結束即可。"
+  }
 }
