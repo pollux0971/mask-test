@@ -3,6 +3,12 @@
 <head>
 <meta charset="utf-8">
 <title>VL53L7CX x2 + Bone Mic — Live Monitor</title>
+<!-- bridge_server.py serves this same file at both "/" and "/panel/" (see
+     CONTRACTS.md ch.1 note re: mock_device.py / panel routing); without a
+     fixed base, relative asset URLs resolve differently depending on which
+     one loaded the page and 404 at "/". Absolute API calls (fetch, SSE)
+     elsewhere in this app already use a leading slash and are unaffected. -->
+<base href="/panel/">
 <link rel="stylesheet" href="css/tokens.css">
 <link rel="stylesheet" href="css/shell.css">
 <link rel="stylesheet" href="css/modes/monitor.css">

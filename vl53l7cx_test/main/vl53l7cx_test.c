@@ -7,6 +7,7 @@
 #include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 
 #include "vl53l7cx_api.h"
 #include "bone_mic.h"
@@ -73,16 +74,22 @@ static uint32_t s_seq[NUM_SENSORS];
  * 的累積值"). Two independent causes, kept separate because they point at
  * different hardware problems (see tof_get_drop_notready/tof_get_drop_error
  * in the header):
- *   notready -- the sensor produced a frame we never picked up. Detected
- *     from VL53L7CX_ResultsData.streamcount, which the sensor firmware
- *     auto-increments every ranging cycle regardless of whether we read it
- *     (vl53l7cx_api.h:270) -- a gap in consecutive streamcount values is a
- *     direct hardware-reported count of missed frames, not a time guess.
+ *   notready -- the sensor produced a frame we never picked up. There is no
+ *     application-visible per-frame counter to detect this directly: the
+ *     ULD's only "streamcount" field lives on VL53L7CX_Configuration (an
+ *     internal, "do not touch" driver handle documented for its own I2C
+ *     bookkeeping), not on VL53L7CX_ResultsData, so it is not a usable
+ *     frame sequence number here. Falls back to A05.md's time-based method:
+ *     a gap between consecutive check_data_ready()-true timestamps that is
+ *     more than 1.5x the sensor's ranging period implies missed cycles in
+ *     between.
  *   error -- get_ranging_data() returned non-zero (I2C read failure). */
 static uint32_t s_drop_notready[NUM_SENSORS];
 static uint32_t s_drop_error[NUM_SENSORS];
-static uint8_t  s_last_streamcount[NUM_SENSORS];
-static bool     s_have_streamcount[NUM_SENSORS];
+static int64_t  s_last_ready_t_us[NUM_SENSORS];
+static bool     s_have_last_ready_t_us[NUM_SENSORS];
+
+#define TOF_EXPECTED_PERIOD_US (1000000 / TOF_RANGING_FREQUENCY_HZ)
 
 static bool init_bus_and_sensor(size_t idx)
 {
@@ -181,16 +188,11 @@ static void print_tof_line(char sensor_letter, uint32_t seq, int64_t t_us,
 
 void tof_print_status(void)
 {
-    /* A05/CONTRACTS.md #1.3: drop_* counters are cumulative since the last
-     * $STATUS, so every re-send is also a reset point. This does not touch
-     * s_have_streamcount[]/s_last_streamcount[] -- those track sensor-side
-     * continuity, which $STATUS re-sends (e.g. from PING) don't interrupt;
-     * only a SENS restart does (handled where drop_next[] is set). */
-    for (size_t i = 0; i < NUM_SENSORS; i++) {
-        s_drop_notready[i] = 0;
-        s_drop_error[i] = 0;
-    }
-
+    /* A05/CONTRACTS.md #1.1+#1.3 (revised): drop_* counters are cumulative
+     * since BOOT, not since the last $STATUS -- $STATUS is re-sent on every
+     * PING, and resetting drop_* there would zero the health counters on
+     * every heartbeat request, exactly when B05/B03 need them most. They
+     * share seq's session boundary instead (reset only on restart). */
     uart_out_lock();
     printf("$STATUS,res=%d,proto=%d,fw=%s\n", TOF_GRID_DIM, TOF_PROTO_VERSION, FW_GIT_SHA);
     uart_out_unlock();
@@ -204,6 +206,31 @@ uint32_t tof_get_drop_notready(size_t idx)
 uint32_t tof_get_drop_error(size_t idx)
 {
     return (idx < NUM_SENSORS) ? s_drop_error[idx] : 0;
+}
+
+void tof_print_heartbeat(void)
+{
+    uart_out_lock();
+    /* CONTRACTS.md #1.3 "PING 回應延遲": t_us must be sampled after the
+     * lock is held, not on entry. Up to ~2 ms of queuing delay while
+     * waiting for the lock would otherwise become a systematic, always-
+     * early bias baked into the timestamp itself -- "take the minimum" on
+     * the host side only filters jitter in round-trip time, it can't
+     * remove a bias that's inside t_us before the trip even starts. */
+    int64_t t_us = esp_timer_get_time();
+
+    /* TODO(A13/A14 交接): bone_mic hasn't exposed a mic-side drop counter
+     * yet -- placeholder 0 until bone_mic_drop_count() lands. */
+    uint32_t drop_M = 0;
+
+    printf("$H,%" PRId64 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%d\n",
+           t_us,
+           tof_get_drop_notready(0) + tof_get_drop_error(0),
+           tof_get_drop_notready(1) + tof_get_drop_error(1),
+           drop_M,
+           (uint32_t)esp_get_free_heap_size(),
+           (int)s_results[0].silicon_temp_degc);
+    uart_out_unlock();
 }
 
 void app_main(void)
@@ -240,7 +267,19 @@ void app_main(void)
     bone_mic_start_monitor();
     uart_cmd_start();
 
+    /* A06: periodic 1 Hz $H heartbeat. The PING-triggered heartbeat is a
+     * separate path handled in uart_cmd.c (A09) -- both call the same
+     * tof_print_heartbeat(), this just adds the unsolicited once-a-second
+     * one CONTRACTS.md #1.1 implies for a live "still alive" signal. */
+    int64_t last_heartbeat_us = esp_timer_get_time();
+
     while (1) {
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - last_heartbeat_us >= 1000000) {
+            tof_print_heartbeat();
+            last_heartbeat_us = now_us;
+        }
+
         for (size_t i = 0; i < NUM_SENSORS; i++) {
             if (!ok[i]) {
                 continue;
@@ -257,11 +296,10 @@ void app_main(void)
                     ranging[i] = want;
                     drop_next[i] = want;
                     if (want) {
-                        /* A05: streamcount resets its own cadence across a
-                         * restart, so the pre-restart baseline is not
-                         * comparable -- reseed on the next successful read
-                         * instead of diffing against stale state. */
-                        s_have_streamcount[i] = false;
+                        /* A05: the gap across a stop/start is expected and
+                         * not a real drop -- reseed the timing baseline on
+                         * the next ready read instead of diffing across it. */
+                        s_have_last_ready_t_us[i] = false;
                     }
                     ESP_LOGI(TAG, "[%s] ranging %s", pins[i].name,
                              want ? "started" : "stopped");
@@ -280,25 +318,23 @@ void app_main(void)
                  * transfer is ~2-4 ms and taking t_us after it would bake
                  * that in as a systematic bias (CONTRACTS.md #1.3). */
                 int64_t t_us = esp_timer_get_time();
+
+                /* A05 notready: a gap between consecutive ready timestamps
+                 * bigger than 1.5 ranging periods implies whole cycles were
+                 * missed in between (CPU too slow to poll, or the sensor
+                 * stalled) -- see A05.md, this is its own suggested method. */
+                if (s_have_last_ready_t_us[i]) {
+                    int64_t delta = t_us - s_last_ready_t_us[i];
+                    if (delta > (int64_t)(TOF_EXPECTED_PERIOD_US * 3 / 2)) {
+                        s_drop_notready[i] += (uint32_t)(delta / TOF_EXPECTED_PERIOD_US) - 1;
+                    }
+                } else {
+                    s_have_last_ready_t_us[i] = true;
+                }
+                s_last_ready_t_us[i] = t_us;
+
                 status = vl53l7cx_get_ranging_data(&s_dev[i], &s_results[i]);
                 if (status == 0) {
-                    /* A05 notready: streamcount auto-increments on the
-                     * sensor every ranging cycle, whether or not we read
-                     * it, so a gap > 1 between two reads we DID make is a
-                     * direct count of frames produced in between that we
-                     * missed. Unsigned subtraction wraps correctly at the
-                     * field's uint8_t range. */
-                    uint8_t sc = s_results[i].streamcount;
-                    if (s_have_streamcount[i]) {
-                        uint8_t gap = (uint8_t)(sc - s_last_streamcount[i]);
-                        if (gap > 1) {
-                            s_drop_notready[i] += (uint32_t)(gap - 1);
-                        }
-                    } else {
-                        s_have_streamcount[i] = true;
-                    }
-                    s_last_streamcount[i] = sc;
-
                     if (drop_next[i]) {
                         drop_next[i] = false;   /* unsettled first frame */
                     } else {

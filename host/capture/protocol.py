@@ -280,8 +280,9 @@ _HANDLERS = {
     "$REC": _parse_record,
 }
 
-# `$` 資料行（相對於 `$STATUS` 這種控制行）。版本不符時要停掉的就是這些。
-DATA_PREFIXES = frozenset({"$T", "$M", "$F", "$H", "$REC"})
+# 版本協商用的控制行。版本不符時只有它還會被解析——其餘所有 `$` 開頭的行
+# （含舊協定的 `$TOF`/`$MIC`）一律停掉，見 §1.1。
+STATUS_PREFIX = "$STATUS"
 
 
 def parse_line(line: str | bytes | bytearray) -> dict | None:
@@ -388,8 +389,11 @@ class ProtocolParser:
 
         prefix = text.split(",", 1)[0].strip()
 
-        # 版本不符：`$STATUS` 還是要看（換韌體要能恢復），資料行全部丟掉。
-        if self.version_mismatch and prefix in DATA_PREFIXES:
+        # 版本不符：`$STATUS` 還是要看（換韌體要能恢復），其餘 `$` 行全丟。
+        # 這裡刻意不只擋 v2 的那幾種前綴——舊韌體送的是 `$TOF`/`$MIC`，
+        # 若讓它們掉進畸形計數，錯誤率會衝到 ~100%，`C04` 就會顯示成
+        # 「連線異常」而不是「韌體版本不符」，把真正的原因蓋掉。
+        if self.version_mismatch and prefix != STATUS_PREFIX:
             self.stats.dropped_version_mismatch += 1
             return None
 

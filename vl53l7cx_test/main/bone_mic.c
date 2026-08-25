@@ -27,6 +27,35 @@ static const char *TAG = "bone_mic";
 static i2s_chan_handle_t s_rx_handle;
 static QueueHandle_t s_record_queue; /* depth 1, holds a pending recording length in seconds */
 
+/* A13: $F on/off switch, default enabled. A single bool flag read once per
+ * ~32ms frame -- no locking, a torn read just means one frame's decision
+ * is a beat late, never a crash. */
+static volatile bool s_mel_enabled = true;
+
+/* A13: count of mic frames dropped (i2s_channel_read failure) since the
+ * last bone_mic_drop_count_and_reset() call, for $H's drop_M. */
+static portMUX_TYPE s_drop_spinlock = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_drop_count = 0;
+
+void bone_mic_set_mel_enabled(bool on)
+{
+    s_mel_enabled = on;
+}
+
+bool bone_mic_mel_enabled(void)
+{
+    return s_mel_enabled;
+}
+
+uint32_t bone_mic_drop_count_and_reset(void)
+{
+    portENTER_CRITICAL(&s_drop_spinlock);
+    uint32_t count = s_drop_count;
+    s_drop_count = 0;
+    portEXIT_CRITICAL(&s_drop_spinlock);
+    return count;
+}
+
 /* ESP32-S3's I2S PDM RX has no hardware high-pass filter
  * (SOC_I2S_SUPPORTS_PDM_RX_HP_FILTER is not defined for this chip), so DC
  * bias and sub-100Hz rumble -- desk vibration, handling, the bone
@@ -250,6 +279,9 @@ static void mic_task(void *arg)
         int64_t t_end = esp_timer_get_time();
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "i2s_channel_read failed: %s", esp_err_to_name(err));
+            portENTER_CRITICAL(&s_drop_spinlock);
+            s_drop_count++;
+            portEXIT_CRITICAL(&s_drop_spinlock);
             continue;
         }
 
@@ -280,7 +312,7 @@ static void mic_task(void *arg)
         int16_t mel_out[MEL_N_FILTERS];
         bool have_mel = false;
         int64_t mel_us = 0;
-        if (fft_ready && n == MIC_FRAME_SAMPLES) {
+        if (fft_ready && s_mel_enabled && n == MIC_FRAME_SAMPLES) {
             int64_t t0 = esp_timer_get_time();
             mic_compute_mel_frame(buf, mel_out);
             mel_us = esp_timer_get_time() - t0;

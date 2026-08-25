@@ -310,6 +310,18 @@ def test_v1_status_without_proto_is_a_mismatch():
     assert p.feed(TOF_A) is None
 
 
+def test_v1_lines_count_as_version_mismatch_not_malformed():
+    """接到舊韌體時，`$TOF`/`$MIC` 不是「畸形」而是「版本不符」。
+    混在一起的話錯誤率會衝到 ~100%，蓋掉真正的原因（C04 要顯示版本不符）。"""
+    p = ProtocolParser()
+    p.feed("$STATUS,res=8")
+    p.feed("$TOF,A,64," + ",".join(["17"] * 64))
+    p.feed("$MIC,322.1,498")
+    assert p.stats.malformed == 0
+    assert p.stats.malformed_rate == 0.0
+    assert p.stats.dropped_version_mismatch == 2
+
+
 def test_parser_recovers_when_correct_firmware_reappears():
     """裝置重開機／換韌體會重發 `$STATUS`，主機要能自己恢復。"""
     p = ProtocolParser()

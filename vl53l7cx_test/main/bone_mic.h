@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Sets up I2S PDM RX on the bone-conduction MEMS mic (CLK=GPIO9, DATA=GPIO8).
@@ -23,3 +24,20 @@ void bone_mic_start_monitor(void);
  * on its next loop iteration. A new request overwrites any not yet
  * started. Must be called after bone_mic_start_monitor(). */
 void bone_mic_request_recording(uint32_t seconds);
+
+/* A13: turns $F (Mel) streaming on/off; $M keeps streaming regardless.
+ * Defaults to enabled. Callable from any task (e.g. the uart_cmd.c handler
+ * for MEL:<0|1>) -- a lone bool flag, no locking needed for this kind of
+ * single-writer-many-reader on/off switch. */
+void bone_mic_set_mel_enabled(bool on);
+
+/* Current $F streaming state, for whoever builds the $STATUS line to
+ * report it (CONTRACTS.md §1.1: "MEL 改變輸出組態後要重發 $STATUS"). */
+bool bone_mic_mel_enabled(void);
+
+/* Count of mic frames that failed to be captured since the last call to
+ * this function, then resets the counter to 0 -- call this exactly once
+ * per $STATUS emission for its drop_M field (CONTRACTS.md §1.3: drop_*
+ * counts since the last $STATUS). Atomic read-and-reset (FreeRTOS
+ * critical section), safe to call from a different task than mic_task. */
+uint32_t bone_mic_drop_count_and_reset(void);
