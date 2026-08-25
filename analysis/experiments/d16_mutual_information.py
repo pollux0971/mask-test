@@ -165,6 +165,15 @@ def format_report(table, is_synthetic=True):
         f"I(L)={gain['i_l']:.3f} bit, I(R)={gain['i_r']:.3f} bit, "
         f"I(Combined)={gain['i_combined']:.3f} bit -> 增益 {gain['gain']:+.3f} bit"
     )
+    if gain["gain"] < 0:
+        lines.append("")
+        lines.append(
+            "> ⚠️ **負增益不能直接讀成「雙矩陣無互補性」。** 逐主成分 MI 加總"
+            "隱含「各主成分對標籤的資訊互不重疊」的假設，PCA 只保證不相關、"
+            "不保證統計獨立。負值可能是方法產物（見模組 docstring）。請以"
+            " `D13` 的 Silhouette 互補性判定與 `D19` 的消融實驗交叉驗證，"
+            "不要單憑此值下結論。"
+        )
     lines.append("")
 
     ratio = tof_vs_mel_ratio(table)

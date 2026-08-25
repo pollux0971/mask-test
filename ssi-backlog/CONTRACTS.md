@@ -19,6 +19,7 @@
 | 日期 | 章節 | 變更 | 影響的 story | 已通知 |
 |---|---|---|---|---|
 | 2026-08-26 | 1. 序列埠協定 v2 | `A15`：`$H` 新增 `bw_bytes_since_last:u32`（第 7 個資料欄），韌體端在 `uart_out.c` 累計、`tof_print_heartbeat()` 每次回報自上次 `$H` 以來送出的位元組數。**⚠️ 破壞性變更且尚未修好**：`host/capture/protocol.py` 的 `_parse_heartbeat()` 目前硬性要求 `len(parts) == 7`（對應舊格式），本變更讓每行 `$H` 變成 8 段，在該函式更新（放寬成 `>= 7` 或改成 key=value）之前，**每一行 `$H` 都無法解析**，不只是新欄位讀不到。`B03`/`dropwatch.py` 的掉幀判定不受影響（純靠 `seq` 缺口，不吃 `$H`），但 heap／溫度／新頻寬欄位在此之前對主機端全部不可見 | `A15`, `B01`, `B03`, `C04` | ⬜ 待通知（見完成回報） |
+| 2026-08-26 | 2. HDF5 Session Schema | §2.2 補充：`n_frames` 明訂為 **ToF 幀數**（`tof_A.shape[0]`，即 `T`），因為 ToF 與麥克風長度不同而原欄位名沒指明（`B08` 實作時才發現）；`session_path` 明訂為「相對於某個 `root`」，且增量與重建必須用同一個 `root` | `B08`, `B19`, `D12` | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | 明訂無效 zone 在 `tof_A`/`tof_B` 數值陣列填 **`NaN`**（不是 `-1` 也不是 `0`）。原 §2 只說「不要塞 -1」，沒講具體填什麼，`B07` 實作時必須自己決定。選 `NaN` 的理由：算術會正確傳染錯誤逼讀取端注意到，而 `-1`/`0` 會被當成合理的近距離值悄悄算進統計 | `B07`, `B17`, `D01`, `D10`, `D13` | 是 |
 | 2026-08-26 | 1. 序列埠協定 v2 | `$H` 尾端新增 `bw_bytes_since_last:u32`（自上次 `$H` 以來送出的 bytes，供 `A14` 的「總頻寬 < 70%」驗收與 `C04` 狀態列使用）。**同時新增 §1.1「前向相容規定」**：所有 `$` 資料行的解析一律用「至少 N 段」而非 `len(parts) != N`，多餘尾端欄位忽略不判畸形。起因：`host/capture/protocol.py:259` 的 `_parse_heartbeat()` 寫死 `!= 7`，韌體加一欄後**整條 `$H` 事件消失**（連 `heap`/`drop_*` 一起丟掉）且無任何錯誤訊息 | `A06`, `A15`, `B01`, `B19`, `C04` | 是 |
 | 2026-08-26 | 1. 序列埠協定 v2 | §1.1.2 補充解析規定：選用欄位缺漏時主機端一律回 `None` **不可填預設值**（「沒送」與「送了是 512」是兩件事，填預設會讓舊韌體看起來像新韌體，而 §1.1.2 的唯一目的就是分辨版本）；選用欄位格式壞掉只讓該欄位為 `None`，**不可讓整行 `$STATUS` 解析失敗**（那行扛著版本協商）；「未知欄位忽略」指不因此報錯而非丟棄，建議保留原文 dict 供日後新欄位的下游使用 | `B01`, `B02`, `B19`, `C04` | 是 |
@@ -34,6 +35,7 @@
 | 2026-08-26 | 2. HDF5 Session Schema | 凍結 schema；新增 `ssi-backlog/tools/schema_example.py` 產生結構正確的空 HDF5 檔供 D 軌開發 | B, D, B07, B17, D01, D10 | 是 |
 | 2026-08-26 | 3. 特徵向量規格 | 凍結規格（3.1–3.4）；`reference_mel.py` 路徑由草案的 `analysis/` 移至 `ssi-backlog/tools/`（調度決議，理由：跨軌唯讀契約產物，不是 D 軌分析程式碼）；新增可執行的 `ssi-backlog/tools/reference_mel.py` | A, B, D, T03, T06 | 是 |
 | 2026-08-26 | 3. 特徵向量規格 | B14 補上 3.1 遺漏的 `STFT center=False` 決定（T03 當時已在 `reference_mel.py` 實作但正文沒寫進去）；並新增 `tools/compare_mel.py`（B14 產出，B 軌維護，`tools/OWNER.md` 已加註） | A11, A12, D, T03 | 是 |
+| 2026-08-26 | 4. HTTP / SSE 介面 | B09：補上 §4.1.1 `session/start`\|`end`\|`current`\|`prefill` 的請求/回應形狀；新增 `GET /session/prefill`（原表沒有預填的端點）。目標配戴幾何（`target_distance_mm`/`target_angle_deg`）在 `config/session_targets.json`（新增，`E01` 量測前一律 `null`）未設定時，`target_check` 回 `"not_configured"` 且 `warnings` 為空——不捏造沒有依據的偏離警告 | B18, B19, C11, D09, D12, E01 | 是 |
 
 ---
 
@@ -80,7 +82,18 @@ END_WAV_B64
 >
 > 用「至少 N 段」仍然抓得到**截斷**（傳輸損壞最常見的形態），
 > 只是不再把「比我新的韌體」誤判成壞掉的韌體。
-> `$T` 因為行內自帶 `dim` 而天生自描述，`$M` / `$F` / `$H` 則需要這條規定。
+> `$T` 雖然行內自帶 `dim`，值的個數檢查（`2 × dim`）一樣要放寬——
+> A 軌哪天在 `$T` 尾端加欄位，ToF 資料會整批消失。`$M` / `$F` / `$H` 同理。
+
+**唯一的例外：協定 v1 的 `$TOF`。** 那裡**必須保持等號檢查**，理由有二：
+1. v1 是**已凍結的歷史格式**，不會再長新欄位——多出來的段只可能是傳輸損壞。
+2. 更關鍵：v1 `$TOF` 的**值數本身兼任方言判別**
+   （`zones` 個 = 只有距離、`2 × zones` 個 = 距離＋signal）。
+   放寬成「至少」的話，一條**被截斷的「距離＋signal」行會被誤讀成一條完整的
+   「只有距離」行**——那是**靜默地接受壞資料**，比誤判成畸形嚴重得多。
+
+通則的目的是「不要把比我新的韌體誤判成壞掉的韌體」。
+沒有未來版本的格式，就沒有套用它的理由。
 
 **無效值語意**：ToF 的 `d`（距離）與 `s`（signal）欄位在該 zone
 `target_status ∉ {5, 9}` 時，兩者**一律**回 `-1`；主機看到 `-1` 要把
@@ -331,6 +344,16 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
 
 ### 2.2 manifest.csv
 
+> **`n_frames` = ToF 幀數（`tof_A.shape[0]`，即 schema 裡的 `T`）。**
+> ToF 與麥克風是不同長度（`T` vs `M`），欄位名沒有指明是哪一個。
+> 取 ToF 的理由：ToF 是驅動 trial 切分、`valid_zone_ratio` 與 `quality`
+> 判定的主模態。**不要假設成 `M`。**
+>
+> **`session_path` 一律存「相對於某個 `root` 的路徑」**，
+> 增量更新（`add_session()`）與完整重建（`rebuild_manifest()`）
+> **必須用同一個 `root`**——否則兩條路徑產生的 manifest 不一致，
+> 而 `D12` 是靠 manifest 分組的，不一致會安靜地污染實驗分組。
+
 ```
 session_path, trial_idx, label, wear_id, mode, quality,
 n_frames, valid_zone_ratio, drop_count, session_date
@@ -424,10 +447,68 @@ log         log10(max(power, 1e-10))
 | POST | `/session/start` | `B09` | 開始 session |
 | POST | `/session/end` | `B09` | 結束 session |
 | GET | `/session/current` | `B09` | 當前 session（未開始回 204） |
+| GET | `/session/prefill` | `B09` | 上次設定（`wear_id` 已 +1），供表單預填 |
 | POST | `/trial/hold/start` \| `/stop` | `B12` | Hold-to-Record |
 | POST | `/trial/abort` \| `/redo` | `B11` | 放棄 / 重錄 |
 | POST | `/recognize` | `D09` | 辨識，回 TriResult |
 | GET | `/templates` | `D09` | 已載入的樣板組 |
+
+#### 4.1.1 Session metadata（`B09`）
+
+邏輯層是 `host/storage/session_registry.py` 的 `SessionRegistry`；下面是
+HTTP wiring（`B19`）要對應的形狀，例外型別已經對好該轉成哪個狀態碼。
+
+**`POST /session/start`** — body 是 metadata JSON：
+
+```json
+{"subject": "s01", "wear_id": 3, "mode": "quiz",
+ "distance_mm": 30.0, "angle_deg": 0.0, "ambient": "quiet room", "notes": ""}
+```
+
+必填：`subject` / `mode` / `distance_mm` / `angle_deg` / `ambient`。
+`wear_id` **不是必填**——沒給就自動用「上次 +1」；同次戴上繼續錄時，
+前端明確傳入跟上次相同的值即可覆寫自動遞增（不是「不能改」，是「預設 +1，
+可覆寫」）。`distance_mm`/`angle_deg` 為 `0` 是合法值，不可用 `if not value`
+判斷缺欄位（`SessionRegistry` 用 `in (None, "")` 判斷，只有真的沒給或空字串才算缺）。
+
+成功（200）：
+
+```json
+{"session_id": "2026-09-01_S01", "subject": "s01", "wear_id": 4, "mode": "quiz",
+ "distance_mm": 30.0, "angle_deg": 0.0, "ambient": "quiet room", "notes": "",
+ "started_at": "2026-09-01T10:00:00",
+ "warnings": ["距離 47 mm 偏離目標 17 mm"],
+ "target_check": "warning", "note": ""}
+```
+
+`target_check` ∈ `{"not_configured", "ok", "warning"}`——**`config/session_targets.json`
+的目標配戴幾何在 `E01` 上機量測前全是 `null`，此時一律回 `"not_configured"`、
+`warnings` 是空陣列，不捏造警告**（沒有目標值就沒有依據判斷偏離，假的「距離
+正常」比沒有檢查更危險）。`note` 在完全未設定、或只設定了距離/角度其中一個
+軸時，說明原因；都設定齊全時是空字串。
+
+錯誤對應：`MissingFieldsError` → **400**，body 帶缺的欄位名（例如
+`{"error": "缺少必填欄位: distance_mm"}`）；`SessionAlreadyActiveError` → **409**。
+
+**`POST /session/end`** — 無 body。成功回目前這個 session 的完整資訊（同
+`/session/start` 的成功回應形狀）。沒有進行中的 session 時是
+`NoActiveSessionError`，狀態碼由 `B19` 決定（story 沒有規定這條的驗收條件，
+不像 `start` 的 409 那樣是硬性要求）。
+
+**`GET /session/current`** — 有進行中的 session 回 200 + 同上形狀；
+沒有則回 **204**（無 body）。
+
+**`GET /session/prefill`** — 一律 200，回：
+
+```json
+{"subject": "s01", "wear_id": 4, "mode": "quiz",
+ "distance_mm": 30.0, "angle_deg": 0.0, "ambient": "quiet room", "notes": "",
+ "session_id": "2026-09-01_S01", "started_at": "...", "warnings": [...],
+ "target_check": "warning", "note": ""}
+```
+
+（`wear_id` 已經 +1；其餘欄位原封不動來自 `config/last_session.json`。）
+沒有歷史紀錄（第一次用）就回 `{}`。
 
 ### 4.2 SSE 事件型別
 
@@ -438,13 +519,52 @@ log         log10(max(power, 1e-10))
 {"type":"quality", "t":.., "metrics":{"drop_rate":{"value":..,"level":"green","hint":".."}, ...}}
 {"type":"trial",   "state":"PROMPT|COUNTDOWN|CAPTURE|SAVE|REST", "label":"..", "idx":..}
 {"type":"session", "state":"started|baseline|ended", "progress":{..}}
+{"type":"status",  "protocol_version":2, "degraded":false, "recording_allowed":true,
+                   "warning":null, "dim":16, "fw":"..", "sr":.., "mel":.., "mel_win":..,
+                   "mel_hop":.., "mic_hop":.., "stats":{..}}
+{"type":"heartbeat","drop_A":.., "drop_B":.., "drop_M":.., "heap":.., "temp_c":..}
 {"type":"link",    "state":"up|down"}
 {"type":"record",  "state":"recording|receiving|done|error", ...}
 {"type":"flash",   "state":"editing|building|flashing|done|error", ...}
+{"type":"mfcc",    "state":"computing|done|error", "file":"..", ...}
 ```
 
 **所有事件都可能帶 `"replay": true`**（`B17`）。前端必須顯眼標示，
 否則會拿回放資料當即時資料——這在 Demo 時會出大問題。
+
+**缺欄位就是缺欄位**（§1.1.2 的延伸）：韌體沒送的欄位在 SSE 事件裡
+**不出現**，不補 `0`／`512`／`null` 之類的預設值。協定 v1 的 `tof`／`mic`
+事件因此**沒有** `seq` 與 `t_us`，並額外帶 `"proto":1, "has_timestamp":false`
+讓前端能明確標示降級資料，不會跟 v2 的即時資料混在一起。
+
+#### `status`（`B02` / `B19`）
+
+直接轉發 `host/capture/protocol.py` 的 `ProtocolParser.state()`，不重新組裝。
+`recording_allowed` 為 `false` 時前端**必須**停用錄音鈕（v1 沒有 `t_us`，
+錄下來的 session 無法做時間對齊也無法驗證）；`warning` 非 `null` 時必須顯示。
+
+橋接端**連上序列埠後會立刻送一次 `PING`**：板子開機通常遠早於 bridge 啟動，
+開機那行 `$STATUS` 早就過去了，不主動問就永遠協商不到版本、也拿不到 §1.1.2 的
+音框參數。§1.1 規定「每次收到 `PING` 都要重發 `$STATUS`」正是為了這個情境。
+
+#### `quality`（`B19`，1 Hz）
+
+六個指標：`drop_rate`、`valid_zones`、`symmetry`、`clock_resid`（秒）、
+`noise_floor`（16-bit PCM 振幅）、`bandwidth`（鏈路使用率 0–1）。
+每個是 `{"value":.., "level":.., "hint":".."}`，`hint` **只在非綠燈時出現**。
+
+`level` 有四種：`green`／`yellow`／`red`／**`unknown`**。
+`unknown` 代表「還沒有資料」或「這個指標沒有設定門檻」——**刻意不是綠燈**，
+沒人設定過的指標不等於通過。
+
+門檻與 hint 文字都放 `config/quality_thresholds.json`，
+bridge 每秒比一次 mtime，**改完存檔即時生效，不需重啟**。
+
+事件可能額外帶 **`"alarms":[..]`**：主機端由 `seq` 缺口算出的掉幀數
+**超過**裝置端 `$H` 回報的 `drop_*` 時觸發。主機只能靠「兩個收到的幀之間的缺口」
+推算，所以正常情況下**永遠落後**裝置端（差額 = `$H` 當下的連續掉幀長度）。
+差額為正代表幀在兩個計數器之間遺失——**那是傳輸層故障的訊號，不是誤差**，
+因此獨立成警報而非放寬容忍度。前端應顯著標示，不要當成掉幀率的一部分。
 
 ### 4.3 TriResult（`D07` / `D09`）
 

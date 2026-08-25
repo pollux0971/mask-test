@@ -376,6 +376,18 @@ def serial_reader(port, baud, allow_v1=False):
             protocol_state["parser"] = ProtocolParser(allow_v1=allow_v1)
             print(f"[bridge] serial open: {port} @ {baud}")
             broadcaster.publish({"type": "link", "state": "up"})
+            # Ask the device to identify itself right away. The board boots
+            # long before the bridge starts, so its power-on $STATUS is
+            # almost always already gone by the time we open the port --
+            # without this, version negotiation never confirms and the
+            # frame parameters from CONTRACTS #1.1.2 stay unknown for the
+            # whole session. #1.1 has the device re-send $STATUS on every
+            # PING for exactly this case.
+            try:
+                with serial_write_lock:
+                    ser.write(b"PING\n")
+            except Exception as exc:
+                print(f"[bridge] initial PING failed: {exc}")
             try:
                 while not flashing.is_set():
                     raw = ser.readline()

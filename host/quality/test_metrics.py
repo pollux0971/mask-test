@@ -241,6 +241,33 @@ def test_drop_rate_comes_from_the_tracker(thresholds):
     assert m["hint"] == "r-drop"
 
 
+def test_snapshot_picks_up_a_threshold_edit_without_a_restart(tmp_path):
+    """B19 acceptance: editing the JSON takes effect immediately.
+
+    snapshot() re-reads the file itself, which is what makes this work in
+    the bridge -- nothing has to notice the edit and poke the aggregator.
+    """
+    path = write_thresholds(tmp_path / "th.json", {
+        "drop_rate": {"direction": "lower_better", "green": 0.5, "yellow": 0.9,
+                      "yellow_hint": "y", "red_hint": "r"},
+    })
+    tracker = DropTracker()
+    tracker.observe("tof_A", 0)
+    tracker.observe("tof_A", 2)  # 1 of 3 lost -> 0.333
+    agg = QualityAggregator(ThresholdTable(path), drop_tracker=tracker,
+                            clock=FakeClock())
+    assert agg.snapshot()["metrics"]["drop_rate"]["level"] == "green"
+
+    time.sleep(0.01)
+    write_thresholds(path, {
+        "drop_rate": {"direction": "lower_better", "green": 0.01, "yellow": 0.05,
+                      "yellow_hint": "y", "red_hint": "r"},
+    })
+    entry = agg.snapshot()["metrics"]["drop_rate"]
+    assert entry["level"] == "red"
+    assert entry["hint"] == "r"
+
+
 # -- the transport alarm (B03's conclusion) -----------------------------
 
 

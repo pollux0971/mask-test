@@ -1,7 +1,7 @@
 """B09 — Session metadata 的純邏輯層。
 
-HTTP wiring（路由、狀態碼）是 `B19` 的事（見 `esp-mask-test-ad` 的交接安排，
-`bridge_server.py` 這輪劃給它）。這裡只管三件事：
+HTTP wiring（路由、狀態碼）是 `B19` 的事（`bridge_server.py` 這輪劃給它）。
+這裡只管三件事：
 
 1. session 生命週期（`start` / `end` / `current`），用專屬例外型別
    （`MissingFieldsError` / `SessionAlreadyActiveError` / `NoActiveSessionError`）
@@ -11,10 +11,11 @@ HTTP wiring（路由、狀態碼）是 `B19` 的事（見 `esp-mask-test-ad` 的
    完全依賴這個欄位正確區分「同次戴」與「跨次戴」。
 3. 上一次的設定持久化到 `config/last_session.json` 供前端表單預填。
 
-**target_distance_mm / target_angle_deg 沒有在任何 story 或 CONTRACTS.md
-裡定義具體數值**（只有 story 裡一句示意用的「距離 25 mm 偏離目標 17 mm」）。
-這裡做成建構子的可覆寫參數，不寫死也不猜一個「正式」數字——已經在
-CONTRACTS.md 記一筆請 T 軌/A 軌之後補上真正的量測值。
+**目標配戴幾何（`target_distance_mm` / `target_angle_deg`）還沒量測**，
+由 `config/session_targets.json` 提供，`E01` 上機量測前一律是 `null`。
+**沒有目標值就不能捏造警告**——`target_check` 明確回報 `not_configured`，
+`warnings` 保持空陣列，不吐一句看起來煞有介事、其實沒有依據的偏離量。
+一個假的「距離正常」比沒有檢查更危險：它會讓人在錯的配戴位置錄完整批資料。
 """
 from __future__ import annotations
 
@@ -27,10 +28,9 @@ from typing import Optional
 REQUIRED_FIELDS = ("subject", "mode", "distance_mm", "angle_deg", "ambient")
 # wear_id 不在這裡：它會自動遞增，沒填不算「漏填必填欄位」。
 
-DEFAULT_TARGET_DISTANCE_MM = 30.0
-DEFAULT_TARGET_ANGLE_DEG = 0.0
-DEFAULT_DISTANCE_TOLERANCE_MM = 5.0
-DEFAULT_ANGLE_TOLERANCE_DEG = 10.0
+DEFAULT_SESSION_TARGETS_PATH = Path(__file__).resolve().parents[2] / "config" / "session_targets.json"
+
+NOT_CONFIGURED_NOTE = "目標幾何未設定（config/session_targets.json），待 E01 量測"
 
 
 class MissingFieldsError(ValueError):
@@ -65,14 +65,32 @@ class SessionInfo:
     notes: str
     started_at: str
     warnings: list = field(default_factory=list)
+    target_check: str = "not_configured"  # "not_configured" | "ok" | "warning"
+    note: str = ""
 
     def to_dict(self) -> dict:
         return {
             "session_id": self.session_id, "subject": self.subject, "wear_id": self.wear_id,
             "mode": self.mode, "distance_mm": self.distance_mm, "angle_deg": self.angle_deg,
             "ambient": self.ambient, "notes": self.notes, "started_at": self.started_at,
-            "warnings": list(self.warnings),
+            "warnings": list(self.warnings), "target_check": self.target_check, "note": self.note,
         }
+
+
+def load_session_targets(path=DEFAULT_SESSION_TARGETS_PATH) -> dict:
+    """讀 `config/session_targets.json`。檔案不存在或壞掉都當成「全部未設定」
+    ——這是保守的一邊：寧可少一個警告，也不要因為讀檔失敗擋掉 session start。"""
+    path = Path(path)
+    try:
+        data = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        data = {}
+    return {
+        "target_distance_mm": data.get("target_distance_mm"),
+        "target_angle_deg": data.get("target_angle_deg"),
+        "tolerance_distance_mm": data.get("tolerance_distance_mm"),
+        "tolerance_angle_deg": data.get("tolerance_angle_deg"),
+    }
 
 
 def _check_required_fields(metadata: dict) -> None:
@@ -81,31 +99,59 @@ def _check_required_fields(metadata: dict) -> None:
         raise MissingFieldsError(missing)
 
 
-def _compute_warnings(metadata, target_distance_mm, target_angle_deg,
-                       distance_tolerance_mm, angle_tolerance_deg) -> list:
+def _check_one_axis(value, target, tolerance, label, unit) -> Optional[str]:
+    """`target`/`tolerance` 任一是 `None` 就不檢查、不捏造警告，回 `None`。"""
+    if target is None or tolerance is None:
+        return None
+    deviation = value - target
+    if abs(deviation) > tolerance:
+        return f"{label} {value:g}{unit} 偏離目標 {abs(deviation):g}{unit}"
+    return None
+
+
+def _evaluate_targets(metadata: dict, targets: dict):
+    """回傳 `(warnings, target_check, note)`。
+
+    `target_check`：兩個維度都沒設定目標值 → `"not_configured"`；
+    至少一個維度有設定 → 依那些維度是否超出容許誤差判 `"ok"`/`"warning"`
+    （沒設定的維度不影響判定，也不出現在 `warnings` 裡）。
+    """
+    distance_configured = targets["target_distance_mm"] is not None and targets["tolerance_distance_mm"] is not None
+    angle_configured = targets["target_angle_deg"] is not None and targets["tolerance_angle_deg"] is not None
+
+    if not distance_configured and not angle_configured:
+        return [], "not_configured", NOT_CONFIGURED_NOTE
+
     warnings = []
-    d_dev = metadata["distance_mm"] - target_distance_mm
-    if abs(d_dev) > distance_tolerance_mm:
-        warnings.append(f"距離 {metadata['distance_mm']:g} mm 偏離目標 {abs(d_dev):g} mm")
-    a_dev = metadata["angle_deg"] - target_angle_deg
-    if abs(a_dev) > angle_tolerance_deg:
-        warnings.append(f"角度 {metadata['angle_deg']:g}° 偏離目標 {abs(a_dev):g}°")
-    return warnings
+    d_warning = _check_one_axis(
+        metadata["distance_mm"], targets["target_distance_mm"], targets["tolerance_distance_mm"],
+        "距離", " mm",
+    )
+    if d_warning:
+        warnings.append(d_warning)
+    a_warning = _check_one_axis(
+        metadata["angle_deg"], targets["target_angle_deg"], targets["tolerance_angle_deg"],
+        "角度", "°",
+    )
+    if a_warning:
+        warnings.append(a_warning)
+
+    note = ""
+    if not distance_configured:
+        note = "距離目標未設定，只檢查了角度"
+    elif not angle_configured:
+        note = "角度目標未設定，只檢查了距離"
+
+    return warnings, ("warning" if warnings else "ok"), note
 
 
 class SessionRegistry:
     """一個 bridge_server 行程對應一個實例（in-process 狀態，不假設多行程共用）。"""
 
-    def __init__(self, last_session_path,
-                 target_distance_mm: float = DEFAULT_TARGET_DISTANCE_MM,
-                 target_angle_deg: float = DEFAULT_TARGET_ANGLE_DEG,
-                 distance_tolerance_mm: float = DEFAULT_DISTANCE_TOLERANCE_MM,
-                 angle_tolerance_deg: float = DEFAULT_ANGLE_TOLERANCE_DEG):
+    def __init__(self, last_session_path, session_targets: Optional[dict] = None,
+                 session_targets_path=DEFAULT_SESSION_TARGETS_PATH):
         self._last_session_path = Path(last_session_path)
-        self._target_distance_mm = target_distance_mm
-        self._target_angle_deg = target_angle_deg
-        self._distance_tolerance_mm = distance_tolerance_mm
-        self._angle_tolerance_deg = angle_tolerance_deg
+        self._session_targets = session_targets if session_targets is not None else load_session_targets(session_targets_path)
         self._current: Optional[SessionInfo] = None
         self._sessions_today: dict = {}
 
@@ -135,16 +181,15 @@ class SessionRegistry:
             last = self._read_last_session()
             wear_id = (last.get("wear_id", 0) + 1) if last else 1
 
+        warnings, target_check, note = _evaluate_targets(metadata, self._session_targets)
+
         info = SessionInfo(
             session_id=self._next_session_id(now),
             subject=metadata["subject"], wear_id=wear_id, mode=metadata["mode"],
             distance_mm=metadata["distance_mm"], angle_deg=metadata["angle_deg"],
             ambient=metadata["ambient"], notes=metadata.get("notes", ""),
             started_at=now.isoformat(),
-            warnings=_compute_warnings(
-                metadata, self._target_distance_mm, self._target_angle_deg,
-                self._distance_tolerance_mm, self._angle_tolerance_deg,
-            ),
+            warnings=warnings, target_check=target_check, note=note,
         )
         self._current = info
         self._write_last_session(info)

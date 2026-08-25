@@ -49,7 +49,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
 from host.capture.protocol import ProtocolParser
@@ -363,7 +363,6 @@ class SessionClockSync:
 
     start: PingBurst
     end: Optional[PingBurst] = None
-    _: dict = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def device_span_us(self) -> Optional[int]:

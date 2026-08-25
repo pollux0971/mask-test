@@ -7,10 +7,16 @@
 //
 // Wire notes (see monitor.js's original C05 comment / T04/C03/C05 reports
 // for how these were confirmed against live traffic, not assumed):
-// - `$T` values are [d0..d(dim-1), s0..s(dim-1)], 2*dim entries; `dim` is
-//   zone count (16|64), grid side is round(sqrt(dim)).
-// - Invalid zones report -1 for BOTH d and s together (CONTRACTS.md 1.1) --
-//   one shared invalid check covers both channels.
+// - CONTRACTS.md ch.4 (SSE) is still unfrozen and the live shape changed
+//   again mid-C07 (B19 landed the v2 parser): a "tof" event is now
+//   {dim, dist:[...], signal:[...], valid:[...], seq, t_us} -- separate
+//   arrays plus an explicit per-zone valid[], not the old concatenated
+//   `values`. This reads that shape; if ch.4 freezes differently, whoever
+//   changes it needs to update this file too. `dim` is zone count (16|64),
+//   grid side is round(sqrt(dim)).
+// - Invalid zones report -1 for BOTH d and s together (CONTRACTS.md 1.1)
+//   and now also valid[i]===false; one shared invalid check covers both
+//   channels either way.
 // - zone layout (row-major) is still an unverified assumption per D11; the
 //   warning badge covers both channels since it's the same physical data,
 //   and it's rendered unconditionally (not tied to a specific channel's
@@ -64,14 +70,14 @@ function buildGrid(el, side) {
   return cells;
 }
 
-// `values` is whichever channel's slice (d or s) plus the *other* channel's
-// slice at the same index, so a zone invalid in one is invalid in both
-// (CONTRACTS.md 1.1) without each caller re-deriving that.
-function renderChannel(cells, values, invalidValues, colorFn) {
+// `validArr` is the frame's shared valid[] (one zone is invalid for both
+// channels at once, CONTRACTS.md 1.1) -- falls back to "v < 0" if it's
+// ever missing, since that sentinel still holds even when valid[] doesn't.
+function renderChannel(cells, values, validArr, colorFn) {
   if (!cells || cells.length !== values.length) return;
   for (let i = 0; i < values.length; i++) {
     const v = values[i];
-    const invalid = v == null || v < 0 || (invalidValues[i] != null && invalidValues[i] < 0);
+    const invalid = v == null || v < 0 || (validArr && validArr[i] === false);
     const c = cells[i];
     if (invalid) {
       c.className = "cell invalid";
@@ -155,8 +161,8 @@ registerMode("monitor", (() => {
       const frame = latestFrame[sensor];
       if (!frame) continue;
       ensureGrids(sensor, frame.dim);
-      renderChannel(cells[`${sensor}-dist`], frame.dValues, frame.sValues, distColor);
-      renderChannel(cells[`${sensor}-sig`], frame.sValues, frame.dValues, signalColor);
+      renderChannel(cells[`${sensor}-dist`], frame.dValues, frame.valid, distColor);
+      renderChannel(cells[`${sensor}-sig`], frame.sValues, frame.valid, signalColor);
       const hz = (rateCounters[sensor].length / 2).toFixed(1) + " Hz"; // 2s sliding window, unchanged from C05
       rateEls[sensor].forEach((el) => { el.textContent = hz; });
     }
@@ -212,18 +218,17 @@ registerMode("monitor", (() => {
     onData(evt) {
       if (evt.type !== "tof") return;
       const sensor = evt.sensor === "B" ? "B" : "A";
-      const dim = evt.dim;
-      const values = evt.values;
-      if (!Array.isArray(values) || values.length !== 2 * dim) {
+      const { dim, dist, signal, valid } = evt;
+      if (!Array.isArray(dist) || !Array.isArray(signal) || dist.length !== dim || signal.length !== dim) {
         if (!warnedBadLength) {
           console.warn(
-            `[monitor] tof event length mismatch: dim=${dim} expected ${2 * dim} values, got ${values && values.length}`
+            `[monitor] tof event shape mismatch: dim=${dim}, dist.length=${dist && dist.length}, signal.length=${signal && signal.length}`
           );
           warnedBadLength = true;
         }
         return;
       }
-      latestFrame[sensor] = { dim, dValues: values.slice(0, dim), sValues: values.slice(dim) };
+      latestFrame[sensor] = { dim, dValues: dist, sValues: signal, valid: Array.isArray(valid) ? valid : null };
 
       const now = performance.now();
       const arr = rateCounters[sensor];

@@ -23,6 +23,15 @@ There is no $H and no $F in v1, and PING/SENS/MEL are ignored rather than
 answered (see resend_status). Anything else would be a format no firmware
 has ever spoken.
 
+$H's bw_bytes_since_last (A15) is counted here in _write, so it covers
+*every* byte the mock puts on the wire. The real firmware currently only
+accounts for $T/$STATUS/$H -- $M, $F and the recording dump are not wired
+into its counter yet -- so on real hardware that field is a LOWER BOUND,
+not the total. Expect the mock to report a higher (and more accurate)
+utilisation than a board running the same configuration; that gap is the
+firmware's missing call sites, not a bug in either side. Do not spend an
+afternoon debugging why the two disagree.
+
 Usage:
     python3 mock_device.py --fps 30 --dim 4 --scenario round --drop-rate 0.02
     # -> prints "[mock_device] pty ready: /dev/pts/N", then:
@@ -210,6 +219,11 @@ class MockDevice:
         self.faults = DropClockFaults(args, self.rng)
         self.fw_sha = args.fw_sha or "".join(self.rng.choice("0123456789abcdef") for _ in range(7))
 
+        # A15 bw_bytes_since_last: bytes written since the last $H went out.
+        # Reset inside emit_heartbeat, so the counter always describes exactly
+        # the interval between two consecutive $H lines.
+        self.bw_bytes = 0
+
         self.sensor_enabled = {"A": True, "B": True}
         self.mel_enabled = False  # accepted, no-op: $F is out of T04 scope
 
@@ -227,11 +241,16 @@ class MockDevice:
     # -- line formatting -----------------------------------------------
 
     def _write(self, line):
+        payload = (line + "\n").encode("ascii")
         try:
-            os.write(self.master_fd, (line + "\n").encode("ascii"))
+            os.write(self.master_fd, payload)
         except OSError as exc:
             print(f"[mock_device] write failed, treating as disconnect: {exc}", file=sys.stderr)
             self._running = False
+            return
+        # A15's bw_bytes_since_last: every byte that actually made it onto the
+        # wire, counted at the single choke point all output goes through.
+        self.bw_bytes += len(payload)
 
     def emit_status(self):
         if self.args.proto == "v2":
@@ -309,7 +328,14 @@ class MockDevice:
         temp_c = int(round(38 + 6 * math.sin(t / 97.0) + self.rng.gauss(0, 0.5)))
         temp_c = max(-40, min(125, temp_c))
         if self.args.proto == "v2":
-            self._write(f"$H,{t_us},{self.drop['A']},{self.drop['B']},{self.drop['M']},{heap},{temp_c}")
+            # Snapshot and reset before writing: the $H line itself belongs to
+            # the *next* interval, exactly like the firmware's counter.
+            bw = self.bw_bytes
+            self.bw_bytes = 0
+            self._write(
+                f"$H,{t_us},{self.drop['A']},{self.drop['B']},{self.drop['M']}"
+                f",{heap},{temp_c},{bw}"
+            )
         # v1 firmware never sent $H; skip it in v1 mode to match the legacy stream exactly.
 
     # -- host -> device commands -----------------------------------------

@@ -861,3 +861,12 @@ def test_v1_tof_keeps_exact_count_check_on_purpose():
     assert parse_line_v1("$TOF,A,4," + ",".join(["1"] * 24)) is None   # 截斷的 32
     assert parse_line_v1("$TOF,A,4," + ",".join(["1"] * 16)) is not None
     assert parse_line_v1("$TOF,A,4," + ",".join(["1"] * 32)) is not None
+
+
+def test_mock_device_heartbeat_with_bw_field_shape():
+    """`mock_device.py` 加上 `bw_bytes_since_last` 之後實際送出的樣子。
+    抄自實跑輸出（8×8 @30fps ≈ 28.5 KB/s ≈ 46080 B/s 的 62%）。"""
+    e = parse_line("$H,1000546,0,0,0,151142,38,28388")
+    assert e["bw_bytes_since_last"] == 28388
+    assert e["heap"] == 151142 and e["temp_c"] == 38
+    assert e["extra"] == []
