@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -28,3 +29,11 @@ uint32_t tof_get_drop_error(size_t idx);
  * TIMING CONSTRAINT (CONTRACTS.md #1.3 "PING 回應延遲"): t_us MUST be
  * sampled AFTER uart_out_lock() returns, not on entry. */
 void tof_print_heartbeat(void);
+
+/* A16: $A (ambient) stream on/off, default disabled (CONTRACTS.md #1.1.3 /
+ * #1.2 AMB:<0|1>). Applies immediately (no pending-queue like SENS's actual
+ * ranging on/off) -- there is no hardware to reconfigure, this only gates
+ * whether the ToF loop also prints an ambient line from data it already
+ * reads every frame for $T. Callable from any task. */
+void tof_set_ambient_enabled(bool on);
+bool tof_ambient_enabled(void);

@@ -155,19 +155,30 @@ class DropTracker:
             armed, st.status_armed = st.status_armed, False
 
             if prev is None:
-                # First frame on this stream. If a $STATUS told us we were
-                # watching from the session's start, seq 0 is the first
-                # frame the device ever scheduled, so a first seq of k means
-                # k frames were already lost before we saw anything. Without
-                # that assurance we may have attached mid-session, and
-                # anything before now is simply not ours to count.
-                missing = seq if (armed and seq < self.gap_limit) else 0
-                st.stats.missing += missing
+                # First frame ever on this stream: baseline only, never any
+                # missing. Whatever the device sent before the host attached
+                # is not the host's to count.
+                #
+                # An earlier version charged `seq` here when a $STATUS had
+                # just arrived, reasoning that $STATUS meant "session start"
+                # so a first seq of k implied k lost frames. That is wrong,
+                # and B20 caught it: $STATUS is re-sent on every PING, the
+                # bridge now PINGs the moment it opens the port, and a
+                # mid-session attach at a low seq is indistinguishable from
+                # a boot at the same seq. The rule therefore invented a
+                # burst of drops on almost every startup -- and reported
+                # them as a transport fault, because the device rightly
+                # denied causing them.
+                #
+                # Genuine pre-roll loss is still counted, but only where it
+                # can actually be established: after a reboot this stream
+                # watched happen (see _restart), where seq really did
+                # restart at 0.
                 st.stats.received += 1
                 st.stats.last_seq = seq
                 st.consecutive_anomalies = 0
-                self._push(st, now, missing, 1)
-                return missing
+                self._push(st, now, 0, 1)
+                return 0
 
             if armed and seq < prev:
                 # $STATUS, then seq restarts: the device rebooted. New

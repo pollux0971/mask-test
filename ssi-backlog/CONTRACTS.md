@@ -19,6 +19,7 @@
 | 日期 | 章節 | 變更 | 影響的 story | 已通知 |
 |---|---|---|---|---|
 | 2026-08-26 | 1. 序列埠協定 v2 | `A15`：`$H` 新增 `bw_bytes_since_last:u32`（第 7 個資料欄），韌體端在 `uart_out.c` 累計、`tof_print_heartbeat()` 每次回報自上次 `$H` 以來送出的位元組數。**⚠️ 破壞性變更且尚未修好**：`host/capture/protocol.py` 的 `_parse_heartbeat()` 目前硬性要求 `len(parts) == 7`（對應舊格式），本變更讓每行 `$H` 變成 8 段，在該函式更新（放寬成 `>= 7` 或改成 key=value）之前，**每一行 `$H` 都無法解析**，不只是新欄位讀不到。`B03`/`dropwatch.py` 的掉幀判定不受影響（純靠 `seq` 缺口，不吃 `$H`），但 heap／溫度／新頻寬欄位在此之前對主機端全部不可見 | `A15`, `B01`, `B03`, `C04` | ⬜ 待通知（見完成回報） |
+| 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件補上 `IDLE` 狀態與 `seed` 欄位；明訂 `abort`（跳過此詞）與 `redo`（保留同詞重試）語意不同，兩者都不寫入 HDF5 與 manifest；明訂 `quality` 值域凍結為 `{ok, low, rejected}`（棄用＝`rejected`，不新增第四個值）與 `B11` 的暫定門檻 0.7／0.3，並標註該門檻無實測依據、待 `E01`/`E03` 校準 | `B11`, `B12`, `B19`, `C12`, `C14`, `D12` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.3 `TriResult` 的 `theta_reject` 拆成 `theta_reject_tof` / `theta_reject_mel` 兩個獨立欄位。原因：兩模態的原始距離尺度與 `_reject` 樣板距離分布都不同，共用一個閾值必有一邊校準不準，而且失準會安靜地表現為「全部拒識」或「完全不拒識」（`D07` 實作時發現） | `D06`, `D07`, `D09`, `C17`, `C18` | 是 |
 | 2026-08-26 | 1 + 2 | 新增 §1.1.3 `$A` ambient 幀（第五條獨立串流）與 §1.2 的 `AMB:<0|1>` 指令，HDF5 對應 `tof_ambient_A/B (Ta,16)` + `tof_ambient_t_us (Ta,)`。原因：`D10` 明訂 `ambient_per_spad` 是 crosstalk 最靈敏的指標，但該欄位從韌體到 schema **整條管線都不存在**。設計成獨立行 + 預設關閉 + 1 Hz，而非塞進 `$T`：ambient 變化慢，塞進 `$T` 每幀會讓 8×8 多約 190 bytes/行，而 §1.4 顯示 8×8 開 Mel 已達 70%。韌體實作見新增的 `A16` | `A16`, `B01`, `B07`, `D10`, `E02` | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | `mel` 的時間軸由 `(M, 40)` 改為 **`(F, 40)`**，並新增成對的 `mel_t_us (F,) int64`。原因：`A14` 之後 `$F` 62.5 Hz、`$M` 31.25 Hz，兩者幀數不相等（§1.1.1），原 schema 是 §1.1.1 凍結**之前**的假設。`B11` 實作時撞到 `session_writer.py` 的「mel 幀數必須等於 mic_t_us 長度」檢查才發現。**寫入端必須移除該檢查**，且不可用內插把 mic 湊到 mel 網格（那是捏造未量測的數值） | `B07`, `B11`, `B17`, `D02`, `D03` | 是 |
@@ -40,6 +41,7 @@
 | 2026-08-26 | 3. 特徵向量規格 | 凍結規格（3.1–3.4）；`reference_mel.py` 路徑由草案的 `analysis/` 移至 `ssi-backlog/tools/`（調度決議，理由：跨軌唯讀契約產物，不是 D 軌分析程式碼）；新增可執行的 `ssi-backlog/tools/reference_mel.py` | A, B, D, T03, T06 | 是 |
 | 2026-08-26 | 3. 特徵向量規格 | B14 補上 3.1 遺漏的 `STFT center=False` 決定（T03 當時已在 `reference_mel.py` 實作但正文沒寫進去）；並新增 `tools/compare_mel.py`（B14 產出，B 軌維護，`tools/OWNER.md` 已加註） | A11, A12, D, T03 | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | B09：補上 §4.1.1 `session/start`\|`end`\|`current`\|`prefill` 的請求/回應形狀；新增 `GET /session/prefill`（原表沒有預填的端點）。目標配戴幾何（`target_distance_mm`/`target_angle_deg`）在 `config/session_targets.json`（新增，`E01` 量測前一律 `null`）未設定時，`target_check` 回 `"not_configured"` 且 `warnings` 為空——不捏造沒有依據的偏離警告 | B18, B19, C11, D09, D12, E01 | 是 |
+| 2026-08-26 | 2. HDF5 Session Schema | `host/storage/session_writer.py` 同步到最新 schema（B05/B11 追加的欄位落地）：①`REQUIRED_META_KEYS` 補時鐘漂移七欄位，`session_end_*` 三欄位改由新方法 `SessionWriter.finalize_session_end()` 於 session 結束時補寫，不列入建構必填；②`write_trial()` 移除「`mel` 幀數必須等於 `mic_t_us` 長度」的錯誤檢查，改收 `mel_t_us` 參數、與 `mel` 成對驗證；③新增 `tof_ambient_A`/`tof_ambient_B`/`tof_ambient_t_us` 三選填參數，全有或全無，各自時間軸，無效填 NaN；④新增 `/meta` 的 `clock_cross_check_ppm_diff`/`clock_cross_check_ok`（本輪新增的欄位名，見上方 §2 說明），實作 B05 交叉檢查建議，門檻沿用 `host/clock/align.py` 的 `SLOPE_TOLERANCE_PPM`（±200ppm） | B05, B07, B11, B19, D, T02 | 是 |
 
 ---
 
@@ -335,6 +337,7 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
     clock_drift_us, clock_drift_ppm, clock_sync_span_us, clock_sync_confirmed,
     session_start_device_us, session_start_host_us, session_start_rtt_min_us,
     session_end_device_us,   session_end_host_us,   session_end_rtt_min_us,
+    clock_cross_check_ppm_diff, clock_cross_check_ok,
     baseline_mu_A (32,), baseline_sigma_A (32,),
     baseline_mu_B (32,), baseline_sigma_B (32,),
     noise_floor_mu, noise_floor_sigma
@@ -383,6 +386,24 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
 >
 > `mel` 與 `mel_t_us` **成對出現，缺一不可**：只有陣列沒有時間軸，
 > 下游就只能猜取樣率，而那正是 §1.1.2 加自我描述欄位要解決的問題。
+
+> **`session_end_*` 三個欄位，`SessionWriter` 建構時沒有、`close()` 前才補寫。**
+> `session_end_device_us`/`session_end_host_us`/`session_end_rtt_min_us`
+> 要等 session 真正結束才量得到，不能列進建構時必填欄位（`REQUIRED_META_KEYS`）
+> ——那樣的話連第一個 trial 都寫不成。`host/storage/session_writer.py` 用
+> `SessionWriter.finalize_session_end(...)` 補寫；沒呼叫也不報錯，只是
+> `/meta` 少這三個欄位，不影響已寫入的 trial。
+
+> **`clock_cross_check_ppm_diff` / `clock_cross_check_ok`：`B04`（回歸法
+> slope）與 `B05`（兩點法 drift）的交叉驗證結果，`SessionWriter` 在寫
+> `/meta` 時自動算好寫入，呼叫端不用自己比對。**
+> `clock_cross_check_ppm_diff = |((clock_slope − 1) × 1e6) − clock_drift_ppm|`，
+> 門檻沿用 `B04` 驗收條件的 ±200ppm（`host/clock/align.py` 的
+> `SLOPE_TOLERANCE_PPM`，同一個「多準才算準」的定義只寫一處）。超過門檻
+> `clock_cross_check_ok = False`，但**不會**擋 session 寫入或改動任何
+> trial 的 `quality`——兩個獨立方法對不上是「這個 session 的時鐘可疑，
+> 下游該知道」的訊號，不是「這筆資料一定是錯的」，是否要因此下修
+> quality 由讀取端（`D` 軌／`B19` 儀表板）決定。
 
 ### 2.1 兩個不可妥協的設計決定
 
@@ -569,7 +590,7 @@ HTTP wiring（`B19`）要對應的形狀，例外型別已經對好該轉成哪�
 {"type":"mic",     "seq":.., "t_us":.., "rms":.., "peak":..}
 {"type":"mel",     "seq":.., "t_us":.., "bands":[..]}
 {"type":"quality", "t":.., "metrics":{"drop_rate":{"value":..,"level":"green","hint":".."}, ...}}
-{"type":"trial",   "state":"PROMPT|COUNTDOWN|CAPTURE|SAVE|REST", "label":"..", "idx":..}
+{"type":"trial",   "state":"PROMPT|COUNTDOWN|CAPTURE|SAVE|REST|IDLE", "label":"..", "idx":.., "seed":..}
 {"type":"session", "state":"started|baseline|ended", "progress":{..}}
 {"type":"status",  "protocol_version":2, "degraded":false, "recording_allowed":true,
                    "warning":null, "dim":16, "fw":"..", "sr":.., "mel":.., "mel_win":..,
@@ -617,6 +638,23 @@ bridge 每秒比一次 mtime，**改完存檔即時生效，不需重啟**。
 推算，所以正常情況下**永遠落後**裝置端（差額 = `$H` 當下的連續掉幀長度）。
 差額為正代表幀在兩個計數器之間遺失——**那是傳輸層故障的訊號，不是誤差**，
 因此獨立成警報而非放寬容忍度。前端應顯著標示，不要當成掉幀率的一部分。
+
+> **`IDLE` 是合法狀態，必須廣播。** 它出現在 `REST` 結束、以及 `abort`／`redo` 之後，
+> 意思是「可以開始下一個 trial 了」。前端沒有它就只能靠逾時猜，而猜錯的代價是
+> 使用者對著一個不會反應的畫面等——`E05` 要錄 4 小時，這種摩擦會累積成真實成本。
+>
+> **`abort` 與 `redo` 的語意不同**（`B11` 實作時定義，兩個端點存在的意義本來就該不一樣）：
+> - **`abort`**：**跳過**這個詞，往下一個詞走。用於「這個詞今天念不好，先跳過」。
+> - **`redo`**：**保留同一個詞**再試一次。用於「剛才咳嗽／手滑了」。
+>
+> 兩者都**不寫入 HDF5 也不進 manifest**——不是寫一筆再標記，是從來沒存在過。
+> 事後要棄用**已存檔**的 trial 是另一回事，用 `quality="rejected"`（見下）。
+>
+> **`quality` 的值域凍結為 `{ok, low, rejected}`**，不要發明第四個值。
+> 「棄用」對應 `rejected`。目前的判定門檻（`B11` 的暫定值）：
+> `valid_zone_ratio >= 0.7 且 drop_count == 0` → `ok`；`>= 0.3` → `low`；其餘 `rejected`。
+> ⚠️ **這組門檻沒有實測依據**，`E01`／`E03` 之後要回頭校準——
+> 它直接決定 `D12` 的 CV 分組裡有多少資料被排除。
 
 ### 4.3 TriResult（`D07` / `D09`）
 

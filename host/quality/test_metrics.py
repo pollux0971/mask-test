@@ -298,6 +298,32 @@ def test_host_behind_device_is_not_an_alarm(thresholds):
     assert "alarms" not in agg.snapshot()
 
 
+def test_device_drops_after_the_heartbeat_are_not_an_alarm(thresholds):
+    """B20 regression: the two counters must be compared at the same instant.
+
+    A device that legitimately drops frames does so continuously, but only
+    reports the total once a second. Comparing the tracker's live count
+    against the last $H therefore charges the host with up to a second of
+    the device's own drops -- which reads as a transport fault on a
+    perfectly healthy link, and did: the 5%-injected-drop sweep raised an
+    alarm with delta=1.
+    """
+    tracker = DropTracker()
+    for seq in range(10):
+        tracker.observe("tof_A", seq)
+    agg = QualityAggregator(thresholds, drop_tracker=tracker, clock=FakeClock())
+    agg.observe_heartbeat({"type": "heartbeat", "drop_A": 0, "drop_B": 0, "drop_M": 0})
+
+    # The device now drops 20 frames; the host sees the gap immediately, but
+    # the next $H reporting them has not arrived yet.
+    tracker.observe("tof_A", 30)
+    assert "alarms" not in agg.snapshot()
+
+    # Once it does arrive, the two agree again.
+    agg.observe_heartbeat({"type": "heartbeat", "drop_A": 20, "drop_B": 0, "drop_M": 0})
+    assert "alarms" not in agg.snapshot()
+
+
 def test_no_alarm_before_any_heartbeat(thresholds):
     tracker = DropTracker()
     tracker.observe("tof_A", 0)

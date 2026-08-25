@@ -173,6 +173,7 @@ class QualityAggregator:
         self._rms = deque()          # (t, rms)
         self._bytes = deque()        # (t, n bytes)
         self._device_drops: dict[str, int] | None = None
+        self._host_drops_at_heartbeat: dict[str, int] = {}
 
     # -- observations ---------------------------------------------------
 
@@ -219,15 +220,32 @@ class QualityAggregator:
         self._note_clock(event, self._clock() if now is None else now)
 
     def observe_heartbeat(self, event: dict, now: float | None = None) -> None:
-        """Record the device's own drop counters for the cross-check."""
+        """Record the device's drop counters, paired with the host's own.
+
+        Both sides are sampled *here*, at the moment the $H is processed,
+        because comparing two cumulative counters read at different times is
+        meaningless. The reader delivers lines in order, so every frame the
+        device counted into this $H has already been observed by the tracker
+        -- and, crucially, none that came after it has.
+
+        Comparing the tracker's live total against the last $H instead
+        charges the host with every device-side drop of the past second (the
+        heartbeat interval), which reads as a transport fault on any link
+        that is legitimately dropping frames. B20 caught that: with 5%
+        injected drops the alarm fired with delta=1 on a perfectly healthy
+        transport.
+        """
         drops = {}
         for stream, key in (("tof_A", "drop_A"), ("tof_B", "drop_B"), ("mic", "drop_M")):
             value = event.get(key)
             if value is not None:
                 drops[stream] = value
         if drops:
+            host = ({s: self.drop_tracker.stats(s).missing for s in drops}
+                    if self.drop_tracker else {})
             with self._lock:
                 self._device_drops = drops
+                self._host_drops_at_heartbeat = host
         self._note_clock(event, self._clock() if now is None else now)
 
     def _note_clock(self, event: dict, now: float) -> None:
@@ -303,17 +321,21 @@ class QualityAggregator:
         if self.drop_tracker is None or self._device_drops is None:
             return []
         alarms = []
-        for stream, cmp in self.drop_tracker.cross_check(self._device_drops).items():
-            if cmp["delta"] > 0:
+        for stream, device in self._device_drops.items():
+            host = self._host_drops_at_heartbeat.get(stream)
+            if host is None:
+                continue
+            delta = host - device
+            if delta > 0:
                 alarms.append({
                     "metric": "drop_rate",
                     "stream": stream,
-                    "host": cmp["host"],
-                    "device": cmp["device"],
-                    "delta": cmp["delta"],
+                    "host": host,
+                    "device": device,
+                    "delta": delta,
                     "message": (
-                        f"{stream}：主機算出 {cmp['host']} 次掉幀，裝置只認 "
-                        f"{cmp['device']} 次。差額為正代表幀在傳輸途中遺失"
+                        f"{stream}：主機算出 {host} 次掉幀，裝置只認 "
+                        f"{device} 次。差額為正代表幀在傳輸途中遺失"
                         f"（UART overrun 或 bridge 跟不上），不是計數誤差。"
                     ),
                 })

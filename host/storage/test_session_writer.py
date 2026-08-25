@@ -10,6 +10,7 @@ from host.storage.session_writer import (
 
 
 def _sample_meta(**overrides):
+    clock_slope = overrides.get("clock_slope", 1.0000234)
     meta = {
         "schema_version": 1,
         "subject": "s01",
@@ -23,9 +24,18 @@ def _sample_meta(**overrides):
         "fw_sha": "a1b2c3d",
         "proto_version": 2,
         "tof_dim": 16,
-        "clock_slope": 1.0000234,
+        "clock_slope": clock_slope,
         "clock_offset": 1756000000.0,
         "clock_residual_p95": 0.0031,
+        # B05 兩點法；預設跟 clock_slope 換算後一致，讓 cross-check 預設過關
+        # （不是「剛好湊出來」——真實系統裡兩個方法本來就該對得上）。
+        "clock_drift_ppm": (clock_slope - 1.0) * 1e6,
+        "clock_drift_us": 700.0,
+        "clock_sync_span_us": 30_000_000,
+        "clock_sync_confirmed": True,
+        "session_start_device_us": 0,
+        "session_start_host_us": 1_756_000_000_000_000,
+        "session_start_rtt_min_us": 800,
         "baseline_mu_A": np.zeros(32, dtype=np.float32),
         "baseline_sigma_A": np.ones(32, dtype=np.float32),
         "baseline_mu_B": np.zeros(32, dtype=np.float32),
@@ -53,7 +63,10 @@ def _sample_trial_kwargs(T=60, M=80, include_mel=True, include_audio=True, rng=N
         quality="ok",
     )
     if include_mel:
-        kwargs["mel"] = rng.normal(size=(M, 40)).astype(np.float32)
+        # F（mel 幀數）刻意跟 M 不同，證明 mel 用自己的時間軸，不是巧合對齊。
+        F = M + 7
+        kwargs["mel"] = rng.normal(size=(F, 40)).astype(np.float32)
+        kwargs["mel_t_us"] = np.arange(F, dtype=np.int64) * 8_000
     if include_audio:
         kwargs["audio"] = rng.integers(-32768, 32767, size=16000, dtype=np.int16)
         kwargs["audio_t0_us"] = 0
@@ -80,7 +93,8 @@ def test_write_single_trial_with_all_optional_fields(tmp_path):
         assert trial["tof_valid_A"].dtype == np.bool_
         assert trial["mic_rms"].shape == (80,)
         assert trial["mic_t_us"].dtype == np.int64
-        assert trial["mel"].shape == (80, 40)
+        assert trial["mel"].shape == (87, 40)  # F = M+7，刻意跟 mic 的 M 不同
+        assert trial["mel_t_us"].shape == (87,)
         assert trial["audio"].shape == (16000,)
         assert trial.attrs["audio_t0_us"] == 0
         assert trial.attrs["label"] == "五"
@@ -181,13 +195,154 @@ def test_audio_without_t0_rejected(tmp_path):
             w.write_trial(0, **kwargs)
 
 
-def test_mel_frame_count_must_match_mic(tmp_path):
+def test_mel_and_mel_t_us_must_be_given_together(tmp_path):
+    """mel 有自己的時間軸（F），不再跟 mic_t_us 比長度；但 mel/mel_t_us
+    彼此缺一不可。"""
     path = tmp_path / "session.h5"
     with SessionWriter(path, _sample_meta()) as w:
         kwargs = _sample_trial_kwargs(T=10, M=12, include_mel=True)
-        kwargs["mel"] = kwargs["mel"][:5]  # 幀數對不上 mic_t_us
+        del kwargs["mel_t_us"]
+        with pytest.raises(ValueError, match="mel_t_us"):
+            w.write_trial(0, **kwargs)
+
+
+def test_mel_length_must_match_its_own_mel_t_us_not_mic(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=10, M=12, include_mel=True)
+        kwargs["mel"] = kwargs["mel"][:5]  # 現在只跟 mel_t_us 比，這樣會對不上
         with pytest.raises(ValueError):
             w.write_trial(0, **kwargs)
+
+
+def test_mel_frame_count_is_allowed_to_differ_from_mic(tmp_path):
+    """反向驗證：mel 幀數（F）跟 mic 幀數（M）不同是正常情況，不該被拒絕
+    ——這正是這輪把 mel 從 (M,40) 改成 (F,40) 的原因。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=10, M=12, include_mel=True))  # 不應該 raise
+
+    with h5py.File(path, "r") as f:
+        assert f["trial_000"]["mel"].shape[0] != f["trial_000"]["mic_rms"].shape[0]
+
+
+# ---------------------------------------------------------------------------
+# tof_ambient_A/B/t_us：全有或全無，各自時間軸
+
+
+def test_ambient_trio_partial_is_rejected(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=10, M=12, include_mel=False, include_audio=False)
+        kwargs["tof_ambient_A"] = np.zeros((5, 16), dtype=np.float32)
+        # 沒給 tof_ambient_B / tof_ambient_t_us
+        with pytest.raises(ValueError, match="tof_ambient"):
+            w.write_trial(0, **kwargs)
+
+
+def test_ambient_trio_written_with_its_own_time_axis(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=10, M=12, include_mel=False, include_audio=False)
+        kwargs["tof_ambient_A"] = np.full((3, 16), 100.0, dtype=np.float32)
+        kwargs["tof_ambient_B"] = np.full((3, 16), 110.0, dtype=np.float32)
+        kwargs["tof_ambient_t_us"] = np.array([0, 1_000_000, 2_000_000], dtype=np.int64)
+        w.write_trial(0, **kwargs)
+
+    with h5py.File(path, "r") as f:
+        trial = f["trial_000"]
+        assert trial["tof_ambient_A"].shape == (3, 16)
+        assert trial["tof_ambient_B"].shape == (3, 16)
+        assert trial["tof_ambient_t_us"].shape == (3,)
+        # 跟 tof_t_us（T=10）長度不同也完全合法
+        assert trial["tof_ambient_t_us"].shape[0] != trial["tof_t_us"].shape[0]
+
+
+def test_ambient_invalid_zone_becomes_nan(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=10, M=12, include_mel=False, include_audio=False)
+        a = [[100.0] * 16, [100.0] * 16]
+        a[1][4] = None
+        kwargs["tof_ambient_A"] = a
+        kwargs["tof_ambient_B"] = np.full((2, 16), 100.0, dtype=np.float32)
+        kwargs["tof_ambient_t_us"] = np.array([0, 1_000_000], dtype=np.int64)
+        w.write_trial(0, **kwargs)
+
+    with h5py.File(path, "r") as f:
+        assert np.isnan(f["trial_000"]["tof_ambient_A"][1, 4])
+
+
+def test_ambient_shape_mismatch_rejected(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=10, M=12, include_mel=False, include_audio=False)
+        kwargs["tof_ambient_A"] = np.zeros((3, 16), dtype=np.float32)
+        kwargs["tof_ambient_B"] = np.zeros((3, 16), dtype=np.float32)
+        kwargs["tof_ambient_t_us"] = np.array([0, 1], dtype=np.int64)  # 長度對不上 (2 vs 3)
+        with pytest.raises(ValueError):
+            w.write_trial(0, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# finalize_session_end：收尾三欄位
+
+
+def test_finalize_session_end_writes_three_attrs(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+        w.finalize_session_end(
+            session_end_device_us=30_000_000, session_end_host_us=1_756_000_030_000_000,
+            session_end_rtt_min_us=750,
+        )
+
+    with h5py.File(path, "r") as f:
+        meta = f["meta"]
+        assert meta.attrs["session_end_device_us"] == 30_000_000
+        assert meta.attrs["session_end_host_us"] == 1_756_000_030_000_000
+        assert meta.attrs["session_end_rtt_min_us"] == 750
+
+
+def test_session_end_attrs_absent_if_finalize_never_called(tmp_path):
+    """沒呼叫 finalize_session_end() 也不該報錯——已寫的 trial 一樣完整，
+    只是 /meta 少這三個收尾欄位（story 說明裡的「不是這裡的責任」）。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        assert "session_end_device_us" not in f["meta"].attrs
+
+
+# ---------------------------------------------------------------------------
+# clock_cross_check：B04 回歸法 vs B05 兩點法互相印證
+
+
+def test_clock_cross_check_ok_when_methods_agree(tmp_path):
+    path = tmp_path / "session.h5"
+    # _sample_meta() 預設就讓 clock_drift_ppm 跟 clock_slope 換算後一致
+    with SessionWriter(path, _sample_meta()) as w:
+        pass
+
+    with h5py.File(path, "r") as f:
+        assert f["meta"].attrs["clock_cross_check_ok"] == True  # noqa: E712 (h5py bool attr)
+        assert f["meta"].attrs["clock_cross_check_ppm_diff"] < 1.0
+
+
+def test_clock_cross_check_flags_disagreement_between_methods(tmp_path):
+    """驗收條件（B05 交叉檢查）：兩個獨立方法的時鐘估計差太多要標出來，
+    不能默默放過。"""
+    path = tmp_path / "session.h5"
+    meta = _sample_meta(clock_slope=1.0000234)  # ~23.4 ppm
+    meta["clock_drift_ppm"] = 5000.0  # 跟回歸法差了快 5000 ppm，明顯不一致
+
+    with SessionWriter(path, meta) as w:
+        pass
+
+    with h5py.File(path, "r") as f:
+        assert f["meta"].attrs["clock_cross_check_ok"] == False  # noqa: E712
+        assert f["meta"].attrs["clock_cross_check_ppm_diff"] > 1000.0
 
 
 # ---------------------------------------------------------------------------
@@ -283,8 +438,16 @@ def _assert_matches_t02_schema(path):
             assert trial["mic_t_us"].dtype == np.int64
             if "mel" in trial:
                 assert trial["mel"].shape[1] == 40
+                assert "mel_t_us" in trial
+                assert trial["mel_t_us"].shape == (trial["mel"].shape[0],)
+            if "tof_ambient_A" in trial:
+                assert "tof_ambient_B" in trial and "tof_ambient_t_us" in trial
+                assert trial["tof_ambient_A"].shape[1] == 16
             if "audio" in trial:
                 assert "audio_t0_us" in trial.attrs
+
+        assert "clock_cross_check_ok" in meta.attrs
+        assert "clock_cross_check_ppm_diff" in meta.attrs
 
 
 def test_output_passes_t02_schema_validation(tmp_path):
@@ -307,10 +470,19 @@ def test_required_meta_keys_matches_contracts_field_list():
         "distance_mm", "angle_deg", "ambient", "notes",
         "fw_sha", "proto_version", "tof_dim",
         "clock_slope", "clock_offset", "clock_residual_p95",
+        "clock_drift_us", "clock_drift_ppm", "clock_sync_span_us", "clock_sync_confirmed",
+        "session_start_device_us", "session_start_host_us", "session_start_rtt_min_us",
         "baseline_mu_A", "baseline_sigma_A", "baseline_mu_B", "baseline_sigma_B",
         "noise_floor_mu", "noise_floor_sigma",
     }
     assert set(REQUIRED_META_KEYS) == expected
+
+
+def test_session_end_meta_keys_matches_contracts_field_list():
+    from host.storage.session_writer import SESSION_END_META_KEYS
+    assert set(SESSION_END_META_KEYS) == {
+        "session_end_device_us", "session_end_host_us", "session_end_rtt_min_us",
+    }
 
 
 def test_required_trial_attrs_matches_contracts_field_list():

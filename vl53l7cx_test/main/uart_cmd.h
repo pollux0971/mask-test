@@ -10,6 +10,7 @@
  * output. Commands understood (CONTRACTS.md #1.2):
  *   REC:<seconds>\n     -- trigger bone_mic_request_recording(seconds)
  *   SENS:<A|B>=<0|1>\n  -- enable/disable one ToF sensor (see below)
+ *   AMB:<0|1>\n         -- $A (ambient) stream on/off, see vl53l7cx_test.h
  *   PING\n              -- emit one $H immediately, then re-send $STATUS
  */
 void uart_cmd_start(void);

@@ -23,6 +23,7 @@
 //   visibility) so it's on screen no matter which view is selected.
 
 import { registerMode } from "../shell.js";
+import { dataStore } from "../bus.js";
 
 const DIST_MIN = 0, DIST_MAX = 1200; // mm, clamps the distance color scale
 const DIST_NEAR = [23, 73, 90];      // rgb, close object
@@ -53,6 +54,73 @@ function signalColor(s) {
   const g = Math.round(SIG_LOW[1] + (SIG_HIGH[1] - SIG_LOW[1]) * t);
   const b = Math.round(SIG_LOW[2] + (SIG_HIGH[2] - SIG_LOW[2]) * t);
   return { rgb: `rgb(${r},${g},${b})`, luminance: (0.299 * r + 0.587 * g + 0.114 * b) / 255 };
+}
+
+// --- C06: Δ / z-score diverging scale -------------------------------------
+//
+// Both "delta" and "zscore" display modes share this color function -- the
+// story requires Δ's color to be scaled by ±3σ too (not raw mm), so a zone
+// with tiny baseline noise shows strong color for a small mm change while a
+// noisy zone doesn't light up for nothing. Only the *displayed number*
+// differs between the two modes (raw mm vs. the z-score itself).
+const ZSCORE_CLAMP = 3;
+const ZSCORE_DEADZONE = 0.5; // C06.md: "中間 ±0.5σ 用接近背景的深灰"
+const Z_NEG = [64, 140, 226];   // blue: closer than baseline
+const Z_POS = [226, 87, 76];    // red (reuses --warn's rgb): farther than baseline
+const Z_NEUTRAL = [43, 50, 45]; // near --surface-2, reads as "background, nothing happening"
+
+function lerpColor(a, b, t) {
+  const r = Math.round(a[0] + (b[0] - a[0]) * t);
+  const g = Math.round(a[1] + (b[1] - a[1]) * t);
+  const bl = Math.round(a[2] + (b[2] - a[2]) * t);
+  return { rgb: `rgb(${r},${g},${bl})`, luminance: (0.299 * r + 0.587 * g + 0.114 * bl) / 255 };
+}
+
+function zscoreColor(z) {
+  const clamped = Math.max(-ZSCORE_CLAMP, Math.min(ZSCORE_CLAMP, z));
+  const target = clamped < 0 ? Z_NEG : Z_POS;
+  const abs = Math.abs(clamped);
+  if (abs <= ZSCORE_DEADZONE) {
+    return lerpColor(Z_NEUTRAL, target, (abs / ZSCORE_DEADZONE) * 0.3);
+  }
+  const t = 0.3 + 0.7 * ((abs - ZSCORE_DEADZONE) / (ZSCORE_CLAMP - ZSCORE_DEADZONE));
+  return lerpColor(Z_NEUTRAL, target, t);
+}
+
+function fmtDelta(mm) {
+  return (mm >= 0 ? "+" : "") + mm.toFixed(1);
+}
+
+// unstable/suspectZeroVariance/noSignal mirror B10's own flags (B10.md:
+// sigma > 2mm = unstable, ~0 = suspect, no valid samples = no signal) so a
+// zone flagged by a real B10 baseline and a zone flagged by this client
+// capture mean the same thing on screen.
+function computeZoneStats(frames, dim) {
+  const mu = new Array(dim).fill(NaN);
+  const sigma = new Array(dim).fill(NaN);
+  const unstable = [], suspectZeroVariance = [], noSignal = [];
+  for (let z = 0; z < dim; z++) {
+    const samples = [];
+    for (const f of frames) {
+      const validZone = f.valid ? f.valid[z] !== false : true;
+      const v = f.dist[z];
+      if (validZone && v != null && v >= 0) samples.push(v);
+    }
+    if (samples.length === 0) {
+      noSignal.push(z);
+      continue;
+    }
+    const m = samples.reduce((a, b) => a + b, 0) / samples.length;
+    const variance = samples.length > 1
+      ? samples.reduce((a, b) => a + (b - m) * (b - m), 0) / (samples.length - 1)
+      : 0;
+    const s = Math.sqrt(variance);
+    mu[z] = m;
+    sigma[z] = s;
+    if (s > 2.0) unstable.push(z);
+    else if (s < 0.05) suspectZeroVariance.push(z);
+  }
+  return { mu, sigma, unstable, suspectZeroVariance, noSignal };
 }
 
 function buildGrid(el, side) {
@@ -91,6 +159,94 @@ function renderChannel(cells, values, validArr, colorFn) {
       c.style.background = rgb;
       c.style.color = luminance > 0.55 ? "#10140f" : "#f3f6f2";
     }
+  }
+}
+
+// Distance-panel renderer for C06's absolute/delta/zscore modes (the
+// signal panels keep using renderChannel/signalColor unchanged -- this
+// story only applies to distance, see C06.md's own framing around the
+// 0-1200mm scale hiding a ~17mm signal).
+//
+// Priority when a zone carries a B10-style baseline-quality flag: no_signal
+// (no valid samples during capture -- NaN is NOT the same as "no change",
+// per esp-mask-test-ad's explicit warning) beats suspect_zero_variance
+// (baseline σ≈0, dividing by it would fabricate a huge/undefined z-score)
+// beats unstable (σ>2mm, baseline itself was noisy). Only a zone with none
+// of those three gets the plain |z|>2 "significant" outline -- a big
+// z-score computed from an untrustworthy baseline isn't meaningful, so it
+// doesn't get the same "trust me" treatment as one from a good baseline.
+function renderDistanceChannel(cells, dValues, validArr, sensor, displayMode, baseline) {
+  if (!cells || cells.length !== dValues.length) return;
+  const dim = dValues.length;
+  const hasBaseline = !!(baseline && baseline.dim === dim);
+  const useBaseline = hasBaseline && displayMode !== "absolute";
+  const mu = useBaseline ? (sensor === "A" ? baseline.muA : baseline.muB) : null;
+  const sigma = useBaseline ? (sensor === "A" ? baseline.sigmaA : baseline.sigmaB) : null;
+  const flags = useBaseline ? (sensor === "A" ? baseline.flagsA : baseline.flagsB) : null;
+
+  for (let i = 0; i < dim; i++) {
+    const v = dValues[i];
+    const c = cells[i];
+    const invalid = v == null || v < 0 || (validArr && validArr[i] === false);
+    c.style.outline = "";
+
+    if (invalid) {
+      c.className = "cell invalid";
+      c.textContent = "·";
+      c.style.background = "var(--cell-invalid)";
+      c.style.color = "";
+      continue;
+    }
+
+    if (displayMode === "absolute") {
+      const { rgb, luminance } = distColor(v);
+      c.className = "cell";
+      c.textContent = v;
+      c.style.background = rgb;
+      c.style.color = luminance > 0.55 ? "#10140f" : "#f3f6f2";
+      continue;
+    }
+
+    if (!hasBaseline) {
+      // Panel-level "尚無 baseline" note (toggled by the caller) already
+      // says so; cells go blank rather than showing something that could
+      // be mistaken for real Δ/z-score data.
+      c.className = "cell invalid";
+      c.textContent = "";
+      c.style.background = "var(--cell-invalid)";
+      c.style.color = "";
+      continue;
+    }
+
+    if (flags.noSignal.includes(i)) {
+      c.className = "cell no-signal";
+      c.textContent = "N/A";
+      c.style.background = "";
+      c.style.color = "";
+      continue;
+    }
+
+    const delta = v - mu[i];
+
+    if (flags.suspectZeroVariance.includes(i)) {
+      const sign = delta === 0 ? 0 : (delta > 0 ? 1 : -1);
+      const { rgb, luminance } = zscoreColor(sign * ZSCORE_CLAMP);
+      c.className = "cell suspect-zero-var";
+      c.textContent = displayMode === "delta" ? fmtDelta(delta) : "σ≈0";
+      c.style.background = rgb;
+      c.style.color = luminance > 0.55 ? "#10140f" : "#f3f6f2";
+      continue;
+    }
+
+    const z = delta / sigma[i];
+    const { rgb, luminance } = zscoreColor(z);
+    let cls = "cell";
+    if (flags.unstable.includes(i)) cls += " unstable-baseline";
+    else if (Math.abs(z) > 2) cls += " significant";
+    c.className = cls;
+    c.textContent = displayMode === "delta" ? fmtDelta(delta) : z.toFixed(1);
+    c.style.background = rgb;
+    c.style.color = luminance > 0.55 ? "#10140f" : "#f3f6f2";
   }
 }
 
@@ -236,7 +392,11 @@ async function tryFetchServerPcaModel(source) {
 const SENSORS = ["A", "B"];
 const CHANNELS = ["dist", "sig"];
 const VIEW_MODES = ["distance", "signal", "both"];
+const DISPLAY_MODES = ["absolute", "delta", "zscore"];
+const DISPLAY_MODE_LABEL = { absolute: "絕對距離", delta: "Δ 距離", zscore: "z-score" };
 const PANEL_LABEL = { dist: "距離", sig: "訊號" };
+const BASELINE_CAPTURE_MS = 2000;      // C06.md: "按 B 現場擷取 2 秒"
+const BASELINE_STALE_MS = 10 * 60 * 1000; // C06.md: 超過 10 分鐘建議重新擷取
 
 function isTypingTarget(el) {
   if (!el) return false;
@@ -254,6 +414,63 @@ registerMode("monitor", (() => {
   let rafId = null;
   let viewMode = "distance";
   let gridsContainer = null;
+
+  // --- C06: Δ / z-score baseline state ---
+  let displayMode = "absolute";
+  let baseline = null; // { dim, muA, sigmaA, muB, sigmaB, flagsA, flagsB, capturedAt, source }
+  let baselineStatusEl = null;
+  const baselineNoteEls = { A: null, B: null };
+  let displayModeTagEls = [];
+
+  function updateDisplayModeTag() {
+    const text = `[${DISPLAY_MODE_LABEL[displayMode]}]`;
+    displayModeTagEls.forEach((el) => { el.textContent = text; });
+  }
+
+  function captureBaseline() {
+    const now = performance.now();
+    const recentA = dataStore.getRecent("tofA", BASELINE_CAPTURE_MS);
+    const recentB = dataStore.getRecent("tofB", BASELINE_CAPTURE_MS);
+    if (!recentA.length || !recentB.length) return; // nothing buffered yet -- can't capture from nothing
+    const dim = recentA[recentA.length - 1].dim;
+    const framesA = recentA.filter((f) => f.dim === dim);
+    const framesB = recentB.filter((f) => f.dim === dim);
+    if (!framesA.length || !framesB.length) return;
+    const statsA = computeZoneStats(framesA, dim);
+    const statsB = computeZoneStats(framesB, dim);
+    baseline = {
+      dim,
+      muA: statsA.mu, sigmaA: statsA.sigma,
+      muB: statsB.mu, sigmaB: statsB.sigma,
+      flagsA: { unstable: statsA.unstable, suspectZeroVariance: statsA.suspectZeroVariance, noSignal: statsA.noSignal },
+      flagsB: { unstable: statsB.unstable, suspectZeroVariance: statsB.suspectZeroVariance, noSignal: statsB.noSignal },
+      capturedAt: now,
+      source: "manual", // B10's own session baseline has no live delivery endpoint yet -- see completion report
+    };
+    updateBaselineStatus();
+  }
+
+  function updateBaselineStatus() {
+    for (const sensor of SENSORS) {
+      if (baselineNoteEls[sensor]) {
+        const show = displayMode !== "absolute" && !(baseline && baseline.dim === currentDim[sensor]);
+        baselineNoteEls[sensor].style.display = show ? "flex" : "none";
+      }
+    }
+    if (!baselineStatusEl) return;
+    if (!baseline) {
+      baselineStatusEl.textContent = "尚無 baseline —— 按 B 現場擷取 2 秒";
+      baselineStatusEl.className = "baseline-status mono";
+      return;
+    }
+    const elapsedMs = performance.now() - baseline.capturedAt;
+    const elapsedMin = elapsedMs / 60000;
+    const clock = new Date(Date.now() - elapsedMs).toLocaleTimeString("zh-Hant-TW", { hour12: false });
+    const stale = elapsedMs > BASELINE_STALE_MS;
+    baselineStatusEl.textContent =
+      `baseline：${clock} 擷取（${elapsedMin.toFixed(1)} 分鐘前）${stale ? " —— 已超過 10 分鐘，建議按 B 重新擷取" : ""}`;
+    baselineStatusEl.className = "baseline-status mono" + (stale ? " stale" : "");
+  }
 
   // --- C10: PCA trajectory state ---
   let pcaCanvas = null, pcaCtx = null, pcaBadgeEl = null, pcaVarianceEl = null;
@@ -398,6 +615,13 @@ registerMode("monitor", (() => {
     applyViewMode();
   }
 
+  function cycleDisplayMode() {
+    const idx = DISPLAY_MODES.indexOf(displayMode);
+    displayMode = DISPLAY_MODES[(idx + 1) % DISPLAY_MODES.length];
+    updateDisplayModeTag();
+    updateBaselineStatus(); // toggles the per-panel "尚無 baseline" note for the new mode
+  }
+
   function isMonitorModeActive() {
     const section = document.getElementById("mode-monitor");
     return !!section && section.classList.contains("active");
@@ -406,9 +630,16 @@ registerMode("monitor", (() => {
   function onKeydown(e) {
     if (isTypingTarget(e.target) || e.altKey || e.ctrlKey || e.metaKey) return;
     if (!isMonitorModeActive()) return;
-    if (e.key.toLowerCase() === "s") {
+    const key = e.key.toLowerCase();
+    if (key === "s") {
       e.preventDefault();
       cycleView();
+    } else if (key === "d") {
+      e.preventDefault();
+      cycleDisplayMode();
+    } else if (key === "b") {
+      e.preventDefault();
+      captureBaseline();
     }
   }
 
@@ -421,11 +652,12 @@ registerMode("monitor", (() => {
       const frame = latestFrame[sensor];
       if (!frame) continue;
       ensureGrids(sensor, frame.dim);
-      renderChannel(cells[`${sensor}-dist`], frame.dValues, frame.valid, distColor);
+      renderDistanceChannel(cells[`${sensor}-dist`], frame.dValues, frame.valid, sensor, displayMode, baseline);
       renderChannel(cells[`${sensor}-sig`], frame.sValues, frame.valid, signalColor);
       const hz = (rateCounters[sensor].length / 2).toFixed(1) + " Hz"; // 2s sliding window, unchanged from C05
       rateEls[sensor].forEach((el) => { el.textContent = hz; });
     }
+    updateBaselineStatus(); // elapsed-time text needs to tick even without a new capture
     drawTrail();
     rafId = requestAnimationFrame(paint);
   }
@@ -437,16 +669,18 @@ registerMode("monitor", (() => {
           <span class="assumed-badge" title="zone 的實體排列方式（row-major）是未驗證的假設，見 D11 -- 距離與訊號兩種畫面皆適用">
             ⚠ zone 佈局 row-major — ASSUMED, unverified（距離／訊號皆適用）
           </span>
-          <span class="view-hint mono">按 S 切換：距離 / 訊號 / 並排</span>
+          <span class="view-hint mono">按 S：距離／訊號／並排　按 D：絕對／Δ／z-score　按 B：擷取基線</span>
         </div>
+        <div class="baseline-status mono" data-baseline-status></div>
         <div class="tof-grids view-distance" data-grids>
           ${SENSORS.map((sensor) => CHANNELS.map((ch) => `
             <div class="sensor-panel" data-panel="${sensor}-${ch}">
               <div class="sensor-head">
-                <span class="sensor-name">Sensor ${sensor} · ${PANEL_LABEL[ch]}</span>
+                <span class="sensor-name">Sensor ${sensor} · ${PANEL_LABEL[ch]}${ch === "dist" ? ' <span class="display-mode-tag mono" data-display-mode-tag></span>' : ""}</span>
                 <span class="sensor-hz mono" data-rate="${sensor}">--</span>
               </div>
               <div class="grid" data-grid="${sensor}-${ch}"></div>
+              ${ch === "dist" ? `<div class="baseline-note" data-baseline-note="${sensor}">尚無 baseline —— 按 B 現場擷取 2 秒</div>` : ""}
             </div>
           `).join("")).join("")}
         </div>
@@ -473,6 +707,13 @@ registerMode("monitor", (() => {
       }
       applyViewMode();
       document.addEventListener("keydown", onKeydown);
+
+      baselineStatusEl = root.querySelector("[data-baseline-status]");
+      baselineNoteEls.A = root.querySelector('[data-baseline-note="A"]');
+      baselineNoteEls.B = root.querySelector('[data-baseline-note="B"]');
+      displayModeTagEls = Array.from(root.querySelectorAll("[data-display-mode-tag]"));
+      updateDisplayModeTag();
+      updateBaselineStatus();
 
       pcaCanvas = root.querySelector("[data-pca-canvas]");
       pcaCtx = pcaCanvas.getContext("2d");

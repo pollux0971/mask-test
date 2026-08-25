@@ -57,6 +57,7 @@
 #mode-monitor .tof-grids.view-both .sensor-panel { display: flex; }
 
 #mode-monitor .sensor-panel {
+  position: relative;
   flex-direction: column;
   gap: 8px;
   background: var(--surface);
@@ -92,6 +93,74 @@
   overflow: hidden;
 }
 #mode-monitor .cell.invalid { color: var(--text-dim); font-weight: 400; }
+
+/* --- C06: Δ / z-score baseline --- */
+.baseline-status {
+  font-size: 11px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+.baseline-status.stale { color: var(--warn); font-weight: 600; }
+
+.display-mode-tag {
+  color: var(--text-dim);
+  font-weight: 400;
+  font-size: 11px;
+}
+
+/* Shown instead of the grid's real cells when Δ/z-score is selected but no
+   baseline exists yet (or it doesn't match the current resolution) --
+   never render a full-looking grid that's actually got nothing behind it. */
+.baseline-note {
+  display: none;
+  position: absolute;
+  inset: 40px 14px 14px 14px; /* below the sensor-head row */
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  background: rgba(11, 14, 12, 0.85);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 12px;
+  pointer-events: none;
+}
+
+/* Zone had zero valid samples during baseline capture -- mu/sigma are NaN.
+   Rendered as a hatch, not as "no change" (a flat NaN-as-0 would look like
+   the steadiest zone on the grid, which is the opposite of the truth). */
+#mode-monitor .cell.no-signal {
+  background:
+    repeating-linear-gradient(45deg, rgba(226, 87, 76, 0.35) 0 4px, transparent 4px 9px),
+    var(--cell-invalid);
+  color: var(--warn);
+  font-weight: 600;
+  font-size: 10px;
+}
+
+/* Baseline σ≈0 for this zone -- likely unaimed rather than genuinely
+   rock-steady. Dashed outline so it reads as "uncertain", distinct from
+   the solid outline on a normal significant deviation. */
+#mode-monitor .cell.suspect-zero-var {
+  outline: 2px dashed var(--warn);
+  outline-offset: -2px;
+}
+
+/* Baseline σ>2mm for this zone (B10's own instability threshold) -- the
+   baseline itself was noisy, so treat any Δ/z-score from it with caution.
+   Dotted, not dashed, to stay visually distinct from suspect-zero-var. */
+#mode-monitor .cell.unstable-baseline {
+  outline: 2px dotted var(--text-dim);
+  outline-offset: -2px;
+}
+
+/* |z| > 2 on a zone with a trustworthy baseline (none of the three flags
+   above) -- C06.md's explicit "加外框標示" requirement. */
+#mode-monitor .cell.significant {
+  outline: 2px solid #f3f6f2;
+  outline-offset: -2px;
+}
 
 /* --- C10: PCA live trajectory --- */
 #mode-monitor .pca-panel {

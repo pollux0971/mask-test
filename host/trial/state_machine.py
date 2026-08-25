@@ -49,6 +49,12 @@ _TOF_VALID_CHANNELS = 16
 
 VALID_QUALITY_VALUES = ("ok", "low", "rejected")
 
+# B12: hold-to-record padding and duration guards.
+HOLD_PRE_ROLL_US = 300_000    # 回溯：反應時間 ~200ms + 緩衝，見 B12.md
+HOLD_POST_ROLL_US = 200_000
+HOLD_MIN_DURATION_S = 0.3     # 短於這個通常是誤觸
+HOLD_MAX_DURATION_S = 5.0     # 長於這個通常是忘記放開
+
 
 class TrialState(str, Enum):
     IDLE = "IDLE"
@@ -57,6 +63,9 @@ class TrialState(str, Enum):
     CAPTURE = "CAPTURE"
     SAVE = "SAVE"
     REST = "REST"
+    # B12: hold 放開但時長超出 [HOLD_MIN_DURATION_S, HOLD_MAX_DURATION_S]，
+    # 資料留在記憶體、尚未落盤，等 confirm_keep()/discard_pending() 決定。
+    CONFIRM = "CONFIRM"
 
 
 _DURATIONS = {
@@ -151,6 +160,7 @@ class TrialStateMachine:
         self._capture_start_t_us: Optional[int] = None
         self._capture_end_t_us: Optional[int] = None
         self._next_trial_idx = 0
+        self._hold_start_device_t_us: Optional[int] = None  # B12: hold-to-record
 
         # mic/mel 原生取樣率的緩衝，跟 Aligner 內部的環形緩衝分開一份。
         # 原因：Aligner.frames() 只能吐單一共同取樣率，會把 mic/mel 錯誤地
@@ -259,6 +269,81 @@ class TrialStateMachine:
         不寫入任何資料。"""
         return self._cancel(now, advance_word=False)
 
+    # -- B12: hold-to-record -----------------------------------------
+
+    def hold_start(self, now: Optional[float] = None, device_t_us: Optional[int] = None,
+                    label: Optional[str] = None) -> dict:
+        """`POST /trial/hold/start`。按下就是開始，**沒有 COUNTDOWN**——固定
+        時長模式的倒數是給「使用者要等外部節奏」的情境用的，hold-to-record
+        本來就是使用者自己決定何時開口，倒數只會讓體感變慢。跳過 PROMPT
+        也是同樣的理由：提示卡怎麼顯示是前端（C12）自己的事，不需要後端
+        計時器參與，前端想顯示多久都可以，使用者準備好就直接按。
+
+        `device_t_us` 應該是「按下當下最新收到的裝置 t_us」（呼叫端自己追蹤，
+        跟 `tick()` 的 `device_t_us` 是同一種東西）。實際回溯 300ms 的
+        pre-roll 是在 `hold_stop()` 才計算的，這裡只記錄起點。
+        """
+        if self.state != TrialState.IDLE:
+            raise RuntimeError(f"不能在狀態 {self.state.value} 開始 hold-to-record，必須先回到 IDLE")
+        if device_t_us is None:
+            raise ValueError("hold_start 需要 device_t_us（按下當下最新收到的裝置 t_us）")
+        now = self._clock() if now is None else now
+        self._current_label = label if label is not None else self._order[self._order_pos % len(self._order)]
+        self._hold_start_device_t_us = int(device_t_us)
+        return self._enter(TrialState.CAPTURE, now)
+
+    def hold_stop(self, now: Optional[float] = None, device_t_us: Optional[int] = None) -> dict:
+        """`POST /trial/hold/stop`。`device_t_us` 一樣是「放開當下最新收到
+        的裝置 t_us」，**不是精確的裝置時間戳**——放開按鍵是主機端事件，
+        沒有對應的裝置事件——這個近似會帶有序列傳輸延遲的偏差（量級跟
+        `B04` 的 `clock_residual_p95` 差不多）。呼叫端／下游不要把它當成
+        跟 ToF/mic 原生時間戳一樣精確。
+
+        時長在 `[0.3, 5.0]` 秒內直接落盤（跟固定視窗模式一樣同步寫檔）。
+        超出範圍**不自動存也不自動丟棄**——轉進 `CONFIRM` 狀態，資料留在
+        記憶體，由 `confirm_keep()`/`discard_pending()` 決定（B12.md
+        「超出範圍時警示並詢問是否保留」）。
+        """
+        if self.state != TrialState.CAPTURE or self._hold_start_device_t_us is None:
+            raise RuntimeError("沒有進行中的 hold-to-record 可以結束")
+        if device_t_us is None:
+            raise ValueError("hold_stop 需要 device_t_us（放開當下最新收到的裝置 t_us）")
+        now = self._clock() if now is None else now
+        device_t_us = int(device_t_us)
+
+        hold_duration_s = (device_t_us - self._hold_start_device_t_us) / 1e6
+        self._capture_start_t_us = self._hold_start_device_t_us - HOLD_PRE_ROLL_US
+        self._capture_end_t_us = device_t_us + HOLD_POST_ROLL_US
+        self._hold_start_device_t_us = None
+
+        if HOLD_MIN_DURATION_S <= hold_duration_s <= HOLD_MAX_DURATION_S:
+            self.state = TrialState.SAVE
+            save_event = self._do_save(now)
+            save_event["hold_duration_s"] = hold_duration_s
+            return [save_event, self._enter(TrialState.REST, now)]
+
+        reason = "too_short" if hold_duration_s < HOLD_MIN_DURATION_S else "too_long"
+        event = self._enter(TrialState.CONFIRM, now)
+        event["warning"] = reason
+        event["hold_duration_s"] = hold_duration_s
+        return event
+
+    def confirm_keep(self, now: Optional[float] = None) -> dict:
+        """使用者在 `CONFIRM` 狀態選擇「還是要留」——把 `hold_stop()` 已經
+        算好、暫存在記憶體的視窗正式落盤。"""
+        if self.state != TrialState.CONFIRM:
+            raise RuntimeError(f"狀態 {self.state.value} 沒有待確認的 trial")
+        now = self._clock() if now is None else now
+        self.state = TrialState.SAVE
+        return [self._do_save(now), self._enter(TrialState.REST, now)]
+
+    def discard_pending(self, now: Optional[float] = None) -> dict:
+        """使用者在 `CONFIRM` 狀態選擇「不要」——完全不落盤，**跳過**這個詞
+        （語意比照 `abort()`：這次的嘗試不算數，換下一個）。"""
+        if self.state != TrialState.CONFIRM:
+            raise RuntimeError(f"狀態 {self.state.value} 沒有待確認的 trial 可以丟棄")
+        return self._cancel_confirm(now)
+
     def mark_current_trial_saved_quality(self, h5_path, trial_idx: int, quality: str) -> None:
         """事後把**已經落盤**的 trial 標成別的 quality（例如使用者事後回看
         覺得這筆不能用）。這不是狀態機本身的一部分——狀態機只管「錄的當下」
@@ -286,8 +371,11 @@ class TrialStateMachine:
         return payload
 
     def _cancel(self, now: Optional[float], advance_word: bool) -> dict:
-        if self.state == TrialState.IDLE:
-            raise RuntimeError("沒有進行中的 trial 可以取消")
+        if self.state in (TrialState.IDLE, TrialState.CONFIRM):
+            raise RuntimeError(
+                f"狀態 {self.state.value} 不能用 abort/redo 取消"
+                + ("；用 discard_pending() 代替" if self.state == TrialState.CONFIRM else "")
+            )
         now = self._clock() if now is None else now
         aborted_label = self._current_label
         idx = self._next_trial_idx

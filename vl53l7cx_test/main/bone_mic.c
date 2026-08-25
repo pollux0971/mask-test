@@ -377,17 +377,26 @@ static void mic_task(void *arg)
          * emitted under the same lock so they can't be interleaved with
          * output from another task. */
         uart_out_lock();
+        int bytes_sent = 0;
         if (have_m) {
-            printf("$M,%" PRIu32 ",%" PRId64 ",%d,%d\n", m_seq, t_start, m_rms, m_peak);
+            bytes_sent += printf("$M,%" PRIu32 ",%" PRId64 ",%d,%d\n", m_seq, t_start, m_rms, m_peak);
             m_seq++;
         }
         if (have_mel) {
-            printf("$F,%" PRIu32 ",%" PRId64, f_seq, t_start);
+            bytes_sent += printf("$F,%" PRIu32 ",%" PRId64, f_seq, t_start);
             for (int m = 0; m < MEL_N_FILTERS; m++) {
-                printf(",%d", mel_out[m]);
+                bytes_sent += printf(",%d", mel_out[m]);
             }
-            printf("\n");
+            bytes_sent += printf("\n");
             f_seq++;
+        }
+        if (bytes_sent > 0) {
+            /* A16: opt into A15's bandwidth accounting (uart_out.h) --
+             * $M/$F were the largest gap in bw_bytes_since_last (still only
+             * counting $T/$STATUS/$H before this), and A16's own "<2%
+             * bandwidth increase" acceptance check needs an accurate total
+             * to compare against, not a lower bound that omits Mel. */
+            uart_out_add_bytes((size_t)bytes_sent);
         }
         uart_out_unlock();
 

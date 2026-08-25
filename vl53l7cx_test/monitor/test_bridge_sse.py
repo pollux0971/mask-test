@@ -205,13 +205,11 @@ def test_quality_event_has_every_metric(v2_events):
 def test_quality_measures_an_uninjected_link_plausibly(v2_events):
     """No fault injection: every metric that has data should read sensibly.
 
-    Note what is NOT asserted: that drop_rate is exactly zero. It is not.
-    Even over a local pty at ~18% of link capacity, a few lines per thousand
-    are lost between the mock's write and the bridge's readline(), and the
-    metric correctly reports them -- see the next test.
+    Since B20 the drop rate here is exactly zero; the next test asserts that
+    specifically.
     """
     metrics = _of_type(v2_events, "quality")[-1]["metrics"]
-    assert 0.0 <= metrics["drop_rate"]["value"] < 0.05
+    assert metrics["drop_rate"]["value"] == 0.0
     assert metrics["valid_zones"]["value"] > 0.9
     assert 0.0 < metrics["bandwidth"]["value"] < 1.0
     assert metrics["symmetry"]["value"] < 0.15        # same synthetic scene both sides
@@ -219,29 +217,22 @@ def test_quality_measures_an_uninjected_link_plausibly(v2_events):
     assert metrics["noise_floor"]["value"] is not None
 
 
-def test_transport_loss_over_the_pty_raises_the_alarm_not_a_shrug(v2_events):
-    """The `delta > 0` alarm, firing for real on an uninjected link.
+def test_no_transport_loss_on_an_uninjected_link(v2_events):
+    """B20 acceptance: `delta` is 0 -- the bridge loses nothing of its own.
 
-    The mock injected nothing, so its own drop_* counters read zero, yet the
-    host reliably sees a handful of seq gaps. That is precisely the condition
-    B03 identified: frames the device believes it sent never arrived, so the
-    loss happened in the transport and neither counter is wrong.
-
-    This is a weak assertion on purpose -- the exact count varies with
-    scheduling, and on a fast enough machine there may be no loss at all.
-    What is pinned down is the *shape*: when the host runs ahead, it is
-    reported as an alarm naming the stream, and never folded silently into
-    the drop-rate figure.
+    This assertion started life as its opposite. B19 reported ~0.7% loss
+    here and raised a transport alarm, which is what opened B20. Two host
+    -side counting bugs turned out to be responsible, not the transport:
+    the tracker charged the attach `seq` as pre-roll loss, and the alarm
+    compared the host's live total against a heartbeat sampled up to a
+    second earlier. With both fixed, a bare readline() loop and the full
+    bridge agree -- nothing is lost between 18% and 92% of link capacity.
     """
     last = _of_type(v2_events, "quality")[-1]
-    for alarm in last.get("alarms", []):
-        assert alarm["metric"] == "drop_rate"
-        assert alarm["stream"] in ("tof_A", "tof_B", "mic", "mel")
-        assert alarm["delta"] == alarm["host"] - alarm["device"] > 0
-        assert "傳輸" in alarm["message"]
-        # An alarm must escalate the metric it belongs to; a red light
-        # nobody can see is not a red light.
-        assert last["metrics"]["drop_rate"]["level"] == "red"
+    assert last.get("alarms", []) == [], (
+        f"bridge lost frames the device says it sent: {last.get('alarms')}"
+    )
+    assert last["metrics"]["drop_rate"]["value"] == 0.0
 
 
 def test_no_threshold_load_error(v2_events):

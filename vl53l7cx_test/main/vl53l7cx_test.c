@@ -98,6 +98,26 @@ static bool     s_have_last_ready_t_us[NUM_SENSORS];
  * strict 1 Hz cadence (e.g. a PING landing between ticks). */
 static uint32_t s_bw_bytes_last_h;
 
+/* A16: $A (ambient) stream state. Default disabled (CONTRACTS.md #1.1.3).
+ * A single bool flag applied immediately -- no locking, same reasoning as
+ * bone_mic.c's s_mel_enabled: a torn read just delays one frame's decision
+ * by a beat, never a crash. `s_amb_seq`/`s_last_amb_us` are per-sensor,
+ * mirroring $T's independent-stream-per-sensor pattern (CONTRACTS.md
+ * #1.1.3 "seq 不與 $T 共用"). */
+static volatile bool s_amb_enabled = false;
+static uint32_t s_amb_seq[NUM_SENSORS];
+static int64_t s_last_amb_us[NUM_SENSORS];
+
+void tof_set_ambient_enabled(bool on)
+{
+    s_amb_enabled = on;
+}
+
+bool tof_ambient_enabled(void)
+{
+    return s_amb_enabled;
+}
+
 static bool init_bus_and_sensor(size_t idx)
 {
     const sensor_pins_t *cfg = &pins[idx];
@@ -189,6 +209,30 @@ static void print_tof_line(char sensor_letter, uint32_t seq, int64_t t_us,
     for (int i = 0; i < dim; i++) {
         bool valid = (res->target_status[i] == 5 || res->target_status[i] == 9);
         len += printf(",%d", valid ? (int)((res->signal_per_spad[i] + 50) / 100) : -1);
+    }
+    len += printf("\n");
+    uart_out_add_bytes((size_t)len);   /* A15: bandwidth accounting, see uart_out.h */
+    uart_out_unlock();
+}
+
+/* Wire format frozen in CONTRACTS.md #1.1.3:
+ *   $A,<A|B>,<seq:u32>,<t_us:i64>,<dim>,<a0>..<aN>
+ * Same valid/invalid + rounding convention as $T's signal field: -1 for a
+ * zone whose target_status isn't {5,9}, otherwise ambient_per_spad/100
+ * rounded (not truncated). Called from the same ranging-data read that
+ * feeds $T -- no extra I2C transaction, this is a different view of data
+ * already in `res`. */
+static void print_ambient_line(char sensor_letter, uint32_t seq, int64_t t_us,
+                                const VL53L7CX_ResultsData *res)
+{
+    const int dim = TOF_GRID_DIM * TOF_GRID_DIM;
+    int len = 0;
+
+    uart_out_lock();
+    len += printf("$A,%c,%" PRIu32 ",%" PRId64 ",%d", sensor_letter, seq, t_us, dim);
+    for (int i = 0; i < dim; i++) {
+        bool valid = (res->target_status[i] == 5 || res->target_status[i] == 9);
+        len += printf(",%d", valid ? (int)((res->ambient_per_spad[i] + 50) / 100) : -1);
     }
     len += printf("\n");
     uart_out_add_bytes((size_t)len);   /* A15: bandwidth accounting, see uart_out.h */
@@ -379,6 +423,17 @@ void app_main(void)
                     } else {
                         print_tof_line(pins[i].letter, s_seq[i], t_us, &s_results[i]);
                         s_seq[i]++;
+
+                        /* A16: throttled to ~1 Hz by comparing t_us against
+                         * the last emission, not by counting frames -- the
+                         * ranging frequency differs by resolution (30 Hz
+                         * 4x4, 10 Hz 8x8) and a frame-count divisor would
+                         * drift depending which mode is flashed. */
+                        if (s_amb_enabled && (t_us - s_last_amb_us[i] >= 1000000)) {
+                            print_ambient_line(pins[i].letter, s_amb_seq[i], t_us, &s_results[i]);
+                            s_amb_seq[i]++;
+                            s_last_amb_us[i] = t_us;
+                        }
                     }
                 } else {
                     s_drop_error[i]++;   /* A05: I2C read failure */

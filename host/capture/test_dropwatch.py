@@ -186,11 +186,24 @@ def test_reboot_counts_frames_lost_before_the_first_one_seen():
     assert t.stats("tof_A").missing == 3
 
 
-def test_status_at_session_start_counts_the_pre_roll():
-    """Attached from boot: a first seq of 3 means 3 frames already lost."""
+def test_first_frame_is_only_a_baseline_never_a_loss():
+    """A $STATUS just before the first frame must not invent pre-roll drops.
+
+    B20's regression: $STATUS is re-sent on every PING and the bridge PINGs
+    as soon as it opens the port, so this ordering happens on essentially
+    every startup. Charging the attach seq as missing raised a spurious
+    transport-fault alarm each time, because the device correctly denied
+    causing those drops.
+
+    A mid-session attach at seq 3 and a boot at seq 3 look identical on the
+    wire, so the only safe reading is the conservative one: count nothing
+    before the first frame we actually saw. That keeps host <= device, which
+    is the invariant the cross-check depends on.
+    """
     t = DropTracker()
     t.on_status()
-    assert t.observe("mic", 3) == 3
+    assert t.observe("mic", 3) == 0
+    assert t.stats("mic").missing == 0
 
 
 def test_status_mid_session_does_not_charge_a_large_first_seq():
@@ -199,6 +212,14 @@ def test_status_mid_session_does_not_charge_a_large_first_seq():
     t.on_status()
     assert t.observe("mic", 50_000) == 0
     assert t.stats("mic").missing == 0
+
+
+def test_reboot_still_counts_its_pre_roll():
+    """The one case where pre-roll IS knowable: a reboot we watched happen."""
+    t = DropTracker()
+    t.observe("tof_A", 500)      # established mid-session baseline
+    t.on_status()
+    assert t.observe("tof_A", 3) == 3   # seq restarted; 0,1,2 really were lost
 
 
 def test_arming_is_consumed_by_the_next_frame():
