@@ -1,13 +1,28 @@
-"""B11 -- Trial 狀態機（純邏輯層；HTTP wiring 是 B19 的事，見檔案底部的
+"""B11/B12 -- Trial 狀態機（純邏輯層；HTTP wiring 是 B19 的事，見檔案底部的
 「介面形狀」摘要，那份會 SendMessage 給調度員轉給 ed）。
 
+固定時長模式（B11，例如給 B13 auto-VAD 用）：
 ```
 IDLE --start_trial()--> PROMPT(1.5s) --> COUNTDOWN(0.5s) --> CAPTURE(2.0s)
     --> SAVE --> REST(1.5s) --> IDLE
 ```
 
+Hold-to-record 模式（B12，使用者按住開始、放開結束，取代固定 2.0s）：
+```
+IDLE --hold_start()--> CAPTURE --hold_stop()--+-- [0.3s,5s] 內 --> SAVE --> REST(1.5s) --> IDLE
+                                               +-- 超出範圍 --> CONFIRM --confirm_keep()--> SAVE --> REST --> IDLE
+                                                                        --discard_pending()--> IDLE
+```
+`hold_start()` 跳過 PROMPT/COUNTDOWN：使用者按下就是開始，不需要外部倒數
+——提示卡怎麼顯示、顯示多久是前端（C12）自己的事，不需要後端計時器參與。
+兩種模式共用同一個 `TrialState.CAPTURE` 值，`tick()` 靠是否曾呼叫過
+`hold_start()`（`_hold_start_device_t_us` 是否已設）分辨這次的 CAPTURE
+該不該被固定計時器結束——**兩種觸發方式不會、也不應該同時作用在同一次
+trial 上**，這是本模組對呼叫端的假設，不是它自己會檢查的東西。
+
 **怎麼觸發下一個 trial 不是這裡的事**（B12 hold-to-record / B13 auto-VAD），
-這裡只管「一旦開始了，時序結構要一致」。`start_trial()` 由外部呼叫觸發。
+這裡只管「一旦開始了，時序結構要一致」。`start_trial()`/`hold_start()`
+由外部呼叫觸發。
 
 **兩個時鐘，各管各的**：
   * `clock`（注入，預設 `time.monotonic`）驅動 PROMPT/COUNTDOWN/CAPTURE/REST
@@ -233,7 +248,12 @@ class TrialStateMachine:
         沒辦法正確定義這個 trial 要落盤的資料範圍。
         """
         now = self._clock() if now is None else now
-        if self.state in (TrialState.IDLE, TrialState.SAVE):
+        if self.state in (TrialState.IDLE, TrialState.SAVE, TrialState.CONFIRM):
+            return []
+        if self.state == TrialState.CAPTURE and self._hold_start_device_t_us is not None:
+            # B12: 這是 hold-to-record 觸發的 CAPTURE（見 hold_start()），
+            # 固定時長模式的計時器不適用——時長由使用者放開按鍵決定，
+            # 只有 hold_stop() 能結束它，tick() 在這裡永遠是 no-op。
             return []
         elapsed = now - self._state_entered_at
         if elapsed < _DURATIONS[self.state]:
@@ -376,12 +396,20 @@ class TrialStateMachine:
                 f"狀態 {self.state.value} 不能用 abort/redo 取消"
                 + ("；用 discard_pending() 代替" if self.state == TrialState.CONFIRM else "")
             )
+        return self._cancel_to_idle(now, advance_word)
+
+    def _cancel_confirm(self, now: Optional[float]) -> dict:
+        # discard_pending() 已經在呼叫前確認過 state == CONFIRM 了。
+        return self._cancel_to_idle(now, advance_word=True)
+
+    def _cancel_to_idle(self, now: Optional[float], advance_word: bool) -> dict:
         now = self._clock() if now is None else now
         aborted_label = self._current_label
         idx = self._next_trial_idx
 
         self._capture_start_t_us = None
         self._capture_end_t_us = None
+        self._hold_start_device_t_us = None
         self._current_label = None
         if advance_word:
             self._order_pos += 1

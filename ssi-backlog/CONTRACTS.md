@@ -19,8 +19,10 @@
 | 日期 | 章節 | 變更 | 影響的 story | 已通知 |
 |---|---|---|---|---|
 | 2026-08-26 | 1. 序列埠協定 v2 | `A15`：`$H` 新增 `bw_bytes_since_last:u32`（第 7 個資料欄），韌體端在 `uart_out.c` 累計、`tof_print_heartbeat()` 每次回報自上次 `$H` 以來送出的位元組數。**⚠️ 破壞性變更且尚未修好**：`host/capture/protocol.py` 的 `_parse_heartbeat()` 目前硬性要求 `len(parts) == 7`（對應舊格式），本變更讓每行 `$H` 變成 8 段，在該函式更新（放寬成 `>= 7` 或改成 key=value）之前，**每一行 `$H` 都無法解析**，不只是新欄位讀不到。`B03`/`dropwatch.py` 的掉幀判定不受影響（純靠 `seq` 缺口，不吃 `$H`），但 heap／溫度／新頻寬欄位在此之前對主機端全部不可見 | `A15`, `B01`, `B03`, `C04` | ⬜ 待通知（見完成回報） |
+| 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件補上 `CONFIRM` 狀態（`B12` Hold-to-Record 專用：按住時間超出 0.3–5 s 範圍時，資料算好但**不落盤**，等使用者決定保留或跳過）。與 `B11` 「放棄的 trial 完全不落盤」一致 | `B12`, `B19`, `C12`, `C14` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件補上 `IDLE` 狀態與 `seed` 欄位；明訂 `abort`（跳過此詞）與 `redo`（保留同詞重試）語意不同，兩者都不寫入 HDF5 與 manifest；明訂 `quality` 值域凍結為 `{ok, low, rejected}`（棄用＝`rejected`，不新增第四個值）與 `B11` 的暫定門檻 0.7／0.3，並標註該門檻無實測依據、待 `E01`/`E03` 校準 | `B11`, `B12`, `B19`, `C12`, `C14`, `D12` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.3 `TriResult` 的 `theta_reject` 拆成 `theta_reject_tof` / `theta_reject_mel` 兩個獨立欄位。原因：兩模態的原始距離尺度與 `_reject` 樣板距離分布都不同，共用一個閾值必有一邊校準不準，而且失準會安靜地表現為「全部拒識」或「完全不拒識」（`D07` 實作時發現） | `D06`, `D07`, `D09`, `C17`, `C18` | 是 |
+| 2026-08-26 | 1. 序列埠協定 v2 | §1.1.2 `$STATUS` 補 `amb=<0|1>` 欄位，與既有的 `mel=` 對稱。原因：`A16` 加了 `AMB:<0|1>` 開關，但主機端沒有任何方式查詢它目前的狀態——`B18` 的控制端點與 `C04` 狀態列都需要。缺欄位時主機端一律回 `None`（§1.1.2） | `A16`, `B01`, `B18`, `C04` | 是 |
 | 2026-08-26 | 1 + 2 | 新增 §1.1.3 `$A` ambient 幀（第五條獨立串流）與 §1.2 的 `AMB:<0|1>` 指令，HDF5 對應 `tof_ambient_A/B (Ta,16)` + `tof_ambient_t_us (Ta,)`。原因：`D10` 明訂 `ambient_per_spad` 是 crosstalk 最靈敏的指標，但該欄位從韌體到 schema **整條管線都不存在**。設計成獨立行 + 預設關閉 + 1 Hz，而非塞進 `$T`：ambient 變化慢，塞進 `$T` 每幀會讓 8×8 多約 190 bytes/行，而 §1.4 顯示 8×8 開 Mel 已達 70%。韌體實作見新增的 `A16` | `A16`, `B01`, `B07`, `D10`, `E02` | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | `mel` 的時間軸由 `(M, 40)` 改為 **`(F, 40)`**，並新增成對的 `mel_t_us (F,) int64`。原因：`A14` 之後 `$F` 62.5 Hz、`$M` 31.25 Hz，兩者幀數不相等（§1.1.1），原 schema 是 §1.1.1 凍結**之前**的假設。`B11` 實作時撞到 `session_writer.py` 的「mel 幀數必須等於 mic_t_us 長度」檢查才發現。**寫入端必須移除該檢查**，且不可用內插把 mic 湊到 mel 網格（那是捏造未量測的數值） | `B07`, `B11`, `B17`, `D02`, `D03` | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | `/meta` 新增時鐘漂移欄位：`clock_drift_us` / `clock_drift_ppm` / `clock_sync_span_us` / `clock_sync_confirmed`，以及 session 首尾各三個校時欄位（`device_us` / `host_us` / `rtt_min_us`，重算漂移所需的最小集合）。原因：`B05` 的驗收要求「漂移量寫進 metadata」，但 §2 凍結時沒有任何漂移欄位。註：兩點法漂移（`B05`）與回歸法 slope（`B04`）互為獨立檢查，`B07` 寫入時應比對，差太多要標 quality | `B04`, `B05`, `B07`, `D12` | 是 |
@@ -150,13 +152,14 @@ $A,<A|B>,<seq:u32>,<t_us:i64>,<dim>,<a0>..<aN>
 #### 1.1.2 `$STATUS` 的音框參數欄位（韌體自我描述）
 
 ```
-$STATUS,res=<dim>,proto=2,fw=<sha>,sr=16000,mel=<0|1>,mel_win=<n>,mel_hop=<n>,mic_hop=<n>
+$STATUS,res=<dim>,proto=2,fw=<sha>,sr=16000,mel=<0|1>,amb=<0|1>,mel_win=<n>,mel_hop=<n>,mic_hop=<n>
 ```
 
 | 欄位 | 型別 | 說明 |
 |---|---|---|
 | `sr` | u32 | 音訊取樣率 Hz，目前 `16000` |
 | `mel` | u8 | `$F` 串流開關目前狀態（`MEL:<0\|1>`，見 1.2） |
+| `amb` | u8 | `$A` 串流開關目前狀態（`AMB:<0\|1>`，見 1.1.3／1.2） |
 | `mel_win` | u16 | FFT 窗長 samples，目前 `512` |
 | `mel_hop` | u16 | Mel 幀間距 samples，`A14` 前 `512`、之後 `256` |
 | `mic_hop` | u16 | `$M` 幀間距 samples，目前 `512` |
@@ -590,7 +593,7 @@ HTTP wiring（`B19`）要對應的形狀，例外型別已經對好該轉成哪�
 {"type":"mic",     "seq":.., "t_us":.., "rms":.., "peak":..}
 {"type":"mel",     "seq":.., "t_us":.., "bands":[..]}
 {"type":"quality", "t":.., "metrics":{"drop_rate":{"value":..,"level":"green","hint":".."}, ...}}
-{"type":"trial",   "state":"PROMPT|COUNTDOWN|CAPTURE|SAVE|REST|IDLE", "label":"..", "idx":.., "seed":..}
+{"type":"trial",   "state":"PROMPT|COUNTDOWN|CAPTURE|CONFIRM|SAVE|REST|IDLE", "label":"..", "idx":.., "seed":..}
 {"type":"session", "state":"started|baseline|ended", "progress":{..}}
 {"type":"status",  "protocol_version":2, "degraded":false, "recording_allowed":true,
                    "warning":null, "dim":16, "fw":"..", "sr":.., "mel":.., "mel_win":..,
@@ -642,6 +645,12 @@ bridge 每秒比一次 mtime，**改完存檔即時生效，不需重啟**。
 > **`IDLE` 是合法狀態，必須廣播。** 它出現在 `REST` 結束、以及 `abort`／`redo` 之後，
 > 意思是「可以開始下一個 trial 了」。前端沒有它就只能靠逾時猜，而猜錯的代價是
 > 使用者對著一個不會反應的畫面等——`E05` 要錄 4 小時，這種摩擦會累積成真實成本。
+>
+> **`CONFIRM` 是 Hold-to-Record（`B12`）專用的狀態**：按住時間短於 0.3 s
+> 或超過 5 s 時進入。此時資料**已算好但尚未落盤**，等
+> `confirm_keep()`（還是要存）或 `discard_pending()`（跳過此詞）決定。
+> 這與 `B11` 「放棄的 trial 完全不落盤，不要寫了再刪」一致——
+> **不是「先存再標記警告」，是「先不存，決定要留才存」。**
 >
 > **`abort` 與 `redo` 的語意不同**（`B11` 實作時定義，兩個端點存在的意義本來就該不一樣）：
 > - **`abort`**：**跳過**這個詞，往下一個詞走。用於「這個詞今天念不好，先跳過」。

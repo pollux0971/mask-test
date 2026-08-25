@@ -413,3 +413,205 @@ def test_mel_omitted_when_no_mel_events_in_window(tmp_path):
     with h5py.File(h5_path, "r") as f:
         assert "mel" not in f["trial_000"]
         assert "mel_t_us" not in f["trial_000"]
+
+
+# ---------------------------------------------------------------------------
+# B12 -- hold-to-record
+
+
+def test_hold_one_second_covers_about_1_5s_with_padding(tmp_path):
+    """驗收條件：按住 1 秒放開，存下的資料涵蓋約 1.5 秒（含前後 padding）。"""
+    from host.trial.state_machine import HOLD_POST_ROLL_US, HOLD_PRE_ROLL_US
+
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
+
+    hold_start_t_us = 10_000_000
+    hold_stop_t_us = hold_start_t_us + 1_000_000  # 按住剛好 1 秒
+    window_start = hold_start_t_us - HOLD_PRE_ROLL_US
+    window_end = hold_stop_t_us + HOLD_POST_ROLL_US
+    _feed_tof(aligner, "A", window_start - 100_000, window_end + 100_000)
+    _feed_tof(aligner, "B", window_start - 100_000, window_end + 100_000)
+    _feed_mic(sm, window_start - 100_000, window_end + 100_000)
+
+    ev = sm.hold_start(device_t_us=hold_start_t_us)
+    assert ev["state"] == "CAPTURE"
+    assert sm.state == TrialState.CAPTURE
+
+    events = sm.hold_stop(device_t_us=hold_stop_t_us)
+    save_event = events[0]
+    assert save_event["state"] == "SAVE"
+    assert save_event["hold_duration_s"] == pytest.approx(1.0, abs=0.01)
+    assert sm.state == TrialState.REST
+
+    writer.__exit__(None, None, None)
+    with h5py.File(h5_path, "r") as f:
+        tof_t_us = f["trial_000"]["tof_t_us"][:]
+    covered_s = (int(tof_t_us[-1]) - int(tof_t_us[0])) / 1e6
+    assert covered_s == pytest.approx(1.5, abs=0.1), f"涵蓋 {covered_s}s，應該約 1.5s"
+
+
+def test_hold_pre_roll_comes_from_real_ring_buffer_data_not_zero_padding(tmp_path):
+    """驗收條件：回溯的 300ms 確實來自環形緩衝，不是補零。用非零、可辨識
+    的距離值餵進 pre-roll 那段，確認寫進 HDF5 的資料真的是那個值，不是
+    0（或 NaN，代表『沒收到當成沒資料』，那也不對——這裡是真的有資料）。
+    """
+    from host.trial.state_machine import HOLD_PRE_ROLL_US
+
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
+
+    hold_start_t_us = 10_000_000
+    hold_stop_t_us = hold_start_t_us + 1_000_000
+    pre_roll_start = hold_start_t_us - HOLD_PRE_ROLL_US
+
+    # pre-roll 這段（按鍵按下之前）餵一個獨特的距離值，之後那段餵另一個，
+    # 這樣才能確認寫進去的第一批幀真的來自「按下之前」就存在的資料。
+    _feed_tof(aligner, "A", pre_roll_start - 50_000, hold_start_t_us, dim=16)
+    for t in range(hold_start_t_us, hold_stop_t_us + 300_000, int(1e6 / 30)):
+        aligner.push_tof("A", t, distance=[777.0] * 16, signal=[10.0] * 16, valid=[True] * 16)
+    aligner.push_tof("B", pre_roll_start - 50_000, distance=[100.0] * 16, signal=[10.0] * 16, valid=[True] * 16)
+    _feed_mic(sm, pre_roll_start - 50_000, hold_stop_t_us + 300_000)
+
+    sm.hold_start(device_t_us=hold_start_t_us)
+    sm.hold_stop(device_t_us=hold_stop_t_us)
+    writer.__exit__(None, None, None)
+
+    with h5py.File(h5_path, "r") as f:
+        tof_A = f["trial_000"]["tof_A"][:]
+    # 第一幀落在 pre-roll 視窗內，應該拿到 _feed_tof 餵的 100.0mm（來自
+    # 「按下之前」就已經在環形緩衝裡的資料），不是 0 也不是 NaN。
+    first_distance = tof_A[0, 0]
+    assert not np.isnan(first_distance), "pre-roll 第一幀不該是 NaN（代表沒資料）"
+    assert first_distance == pytest.approx(100.0), (
+        f"pre-roll 第一幀距離是 {first_distance}，應該是環形緩衝裡按下之前的真實值 100.0，"
+        "不是補零或拿到按下之後的值"
+    )
+
+
+def test_hold_shorter_than_min_goes_to_confirm_not_saved(tmp_path):
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
+
+    hold_start_t_us = 10_000_000
+    hold_stop_t_us = hold_start_t_us + 100_000  # 只按 0.1 秒，< 0.3s 門檻
+    _feed_tof(aligner, "A", hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+    _feed_tof(aligner, "B", hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+    _feed_mic(sm, hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+
+    sm.hold_start(device_t_us=hold_start_t_us)
+    event = sm.hold_stop(device_t_us=hold_stop_t_us)
+
+    assert event["state"] == "CONFIRM"
+    assert event["warning"] == "too_short"
+    assert sm.state == TrialState.CONFIRM
+
+    writer.__exit__(None, None, None)
+    with h5py.File(h5_path, "r") as f:
+        assert [k for k in f.keys() if k.startswith("trial_")] == [], "超出範圍前不應該落盤"
+
+
+def test_hold_longer_than_max_goes_to_confirm_not_saved(tmp_path):
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
+
+    hold_start_t_us = 10_000_000
+    hold_stop_t_us = hold_start_t_us + 6_000_000  # 按了 6 秒，> 5s 門檻
+    _feed_tof(aligner, "A", hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+    _feed_tof(aligner, "B", hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+    _feed_mic(sm, hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+
+    sm.hold_start(device_t_us=hold_start_t_us)
+    event = sm.hold_stop(device_t_us=hold_stop_t_us)
+
+    assert event["state"] == "CONFIRM"
+    assert event["warning"] == "too_long"
+
+
+def test_confirm_keep_saves_the_pending_capture(tmp_path):
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
+
+    hold_start_t_us = 10_000_000
+    hold_stop_t_us = hold_start_t_us + 100_000
+    _feed_tof(aligner, "A", hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+    _feed_tof(aligner, "B", hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+    _feed_mic(sm, hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+
+    sm.hold_start(device_t_us=hold_start_t_us)
+    sm.hold_stop(device_t_us=hold_stop_t_us)
+    assert sm.state == TrialState.CONFIRM
+
+    events = sm.confirm_keep()
+    assert events[0]["state"] == "SAVE"
+    assert sm.state == TrialState.REST
+
+    writer.__exit__(None, None, None)
+    with h5py.File(h5_path, "r") as f:
+        assert "trial_000" in f
+    df = read_manifest(manifest_path)
+    assert len(df) == 1
+
+
+def test_discard_pending_writes_nothing_and_skips_word(tmp_path):
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock, words=("五", "四"))
+    first_word = sm.order[0]
+    second_word = sm.order[1]
+
+    hold_start_t_us = 10_000_000
+    hold_stop_t_us = hold_start_t_us + 100_000
+    _feed_tof(aligner, "A", hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+    _feed_tof(aligner, "B", hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+    _feed_mic(sm, hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+
+    ev = sm.hold_start(device_t_us=hold_start_t_us)
+    assert ev["label"] == first_word
+    sm.hold_stop(device_t_us=hold_stop_t_us)  # too short -> CONFIRM
+
+    sm.discard_pending()
+    assert sm.state == TrialState.IDLE
+
+    writer.__exit__(None, None, None)
+    with h5py.File(h5_path, "r") as f:
+        assert [k for k in f.keys() if k.startswith("trial_")] == []
+    df = read_manifest(manifest_path)
+    assert len(df) == 0
+
+    ev2 = sm.hold_start(device_t_us=hold_start_t_us + 10_000_000)
+    assert ev2["label"] == second_word, "discard_pending 應該跳過這個詞，換下一個"
+
+
+def test_hold_stop_requires_prior_hold_start(tmp_path):
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path)
+    with pytest.raises(RuntimeError):
+        sm.hold_stop(device_t_us=1_000_000)
+
+
+def test_hold_start_requires_device_t_us(tmp_path):
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path)
+    with pytest.raises(ValueError):
+        sm.hold_start()
+
+
+def test_tick_never_auto_exits_a_hold_to_record_capture(tmp_path):
+    """固定時長模式的 CAPTURE_S=2.0s 計時器不該影響 hold-to-record：按住
+    超過 2 秒（原本固定模式早就結束了）還是要停在 CAPTURE，直到 hold_stop()。
+    """
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
+
+    sm.hold_start(device_t_us=10_000_000)
+    clock.advance(CAPTURE_S + 1.0)  # 遠超過固定模式的 2.0 秒
+    events = sm.tick(device_t_us=10_000_000 + int((CAPTURE_S + 1.0) * 1e6))
+    assert events == [], "hold-to-record 的 CAPTURE 不該被 tick() 的固定計時器結束"
+    assert sm.state == TrialState.CAPTURE
+
+
+def test_abort_still_works_mid_hold(tmp_path):
+    """按著按鍵中途想整個放棄（不是放開結束）也該可以用 abort()。"""
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path)
+    sm.hold_start(device_t_us=10_000_000)
+    event = sm.abort()
+    assert event["state"] == "IDLE"
+    assert sm.state == TrialState.IDLE

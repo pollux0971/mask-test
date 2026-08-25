@@ -254,9 +254,14 @@ void tof_print_status(void)
     bone_mic_frame_params(&sr, &mel_win, &mel_hop, &mic_hop);
 
     uart_out_lock();
-    int len = printf("$STATUS,res=%d,proto=%d,fw=%s,sr=%" PRIu32 ",mel=%d,mel_win=%u,mel_hop=%u,mic_hop=%u\n",
+    /* CONTRACTS.md #1.1.2 (amb= added on A16 review): field order is
+     * res,proto,fw,sr,mel,amb,mel_win,mel_hop,mic_hop -- parsing is
+     * key=value and order-independent, so this only matters for matching
+     * the contract's documented example byte-for-byte. */
+    int len = printf("$STATUS,res=%d,proto=%d,fw=%s,sr=%" PRIu32 ",mel=%d,amb=%d,mel_win=%u,mel_hop=%u,mic_hop=%u\n",
                       TOF_GRID_DIM, TOF_PROTO_VERSION, FW_GIT_SHA,
-                      sr, bone_mic_mel_enabled() ? 1 : 0, mel_win, mel_hop, mic_hop);
+                      sr, bone_mic_mel_enabled() ? 1 : 0, s_amb_enabled ? 1 : 0,
+                      mel_win, mel_hop, mic_hop);
     uart_out_add_bytes((size_t)len);   /* A15: bandwidth accounting, see uart_out.h */
     uart_out_unlock();
 }

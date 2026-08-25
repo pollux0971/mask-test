@@ -52,13 +52,26 @@ import numpy as np
 
 # 說話模式 → (進入 σ 倍數, 離開 σ 倍數)。
 #
-# `normal` 的 3σ / 1.5σ 是 story 明訂的。`whisper` 的進入 2σ 也是 story
-# 明訂；**離開的 1.0σ 是我依「離開 = 進入的一半」這個比例推的**——story
-# 只給了 whisper 的進入值。比例保持一致才不會讓 whisper 的遲滯區間相對
-# 變窄（那會讓它更容易把一個詞切碎，正好與放寬 whisper 門檻的初衷相反）。
+# `normal` 的 3σ / 1.5σ 與 `whisper` 的進入 2σ 都是 story 明訂的。
+# **`whisper` 的離開維持 1.5σ，與 `normal` 相同**——story 沒有規定它，
+# 而這是量出來的，不是猜的。
+#
+# 兩個閾值的職責不一樣：
+#   * **進入**決定靈敏度——「多小聲的詞我們還要算數」。那是關於**說話者**
+#     的，所以 whisper 要放寬。
+#   * **離開**決定「安靜要多安靜才算結束」。那是關於**底噪**的，跟人講話
+#     多大聲無關，所以**不該**跟著說話模式縮放。
+#
+# 我一開始按「離開 = 進入的一半」的比例訂成 1.0σ，實測邊界誤差飆到
+# 240 ms：底噪有 15.9% 的幀會高於 1.0σ，200 ms 掛延遲被隨機尖峰反覆重置，
+# 段落一路延長。同一批合成資料掃過去（40 筆，峰值 3.5–6σ，平滑 3 幀）：
+#
+#     whisper exit=1.00σ → 最大誤差 240.0 ms，平均 27.2 ms
+#     whisper exit=1.25σ → 最大誤差 240.0 ms，平均 23.6 ms
+#     whisper exit=1.50σ → 最大誤差  80.0 ms，平均 17.6 ms   ← 選這個
 SPEAKING_MODES = {
     "normal": (3.0, 1.5),
-    "whisper": (2.0, 1.0),
+    "whisper": (2.0, 1.5),
     "silent": None,          # 不用音訊 VAD
 }
 DEFAULT_SPEAKING_MODE = "normal"
@@ -73,6 +86,28 @@ MIN_SEGMENT_MS = 50.0
 # sigma 的下限守衛，同 §3.2 對 ToF z-score 的做法。麥克風壞掉或整段完全
 # 沒有變異時 sigma 會是 0，除下去會變成 inf/NaN，讓整個判斷靜默壞掉。
 SIGMA_FLOOR = 1e-3
+
+# 判斷閾值之前先做幾幀的置中移動平均。**這不是美化，是讓 story 指定的
+# 閾值真的能用。** 純底噪高於離開閾值的機率是：
+#
+#     normal  (1.5σ)  6.7% 每幀 → 200 ms 掛延遲(6.25 幀)全部低於只有 64.9%
+#     whisper (1.0σ) 15.9% 每幀 → 全部低於只有 34.0%
+#
+# 也就是說掛延遲有 35%／66% 的機率被底噪的隨機尖峰重置，段落就一路延長
+# 下去——實測邊界誤差衝到 1168 ms。平滑 3 幀讓雜訊的 sigma 降為 1/√3，
+# 等效門檻變成 2.60σ／1.73σ：
+#
+#     normal  單幀 0.47% → 掛延遲全部低於 97.1%
+#     whisper 單幀 4.16% → 掛延遲全部低於 76.7%
+#
+# 用**置中**視窗（不是因果視窗）才不會引入群延遲把邊界整個往後推。
+# 3 幀 @31.25 Hz 是 96 ms 視窗、±32 ms 半寬，還在 100 ms 邊界預算內。
+SMOOTH_FRAMES = 3
+
+# 起點回退的上限。回退是為了接住上升沿的腳，但在低訊噪比時底噪本身就常常
+# 高於離開閾值，不設上限會一路退穿整段靜音（實測退了將近一秒）。語音的
+# 起音爬升在 30–60 ms 量級，96 ms 綽綽有餘。
+MAX_ONSET_BACKOFF_MS = 96.0
 
 
 @dataclass(frozen=True)
@@ -205,6 +240,8 @@ def detect_voice_activity(
     speaking_mode: str = DEFAULT_SPEAKING_MODE,
     hangover_ms: float = HANGOVER_MS,
     min_segment_ms: float = MIN_SEGMENT_MS,
+    smooth_frames: int = SMOOTH_FRAMES,
+    max_onset_backoff_ms: float = MAX_ONSET_BACKOFF_MS,
 ) -> VadResult:
     """在一串 `$M` 的 `(rms, t_us)` 上做雙閾值遲滯端點偵測。
 
@@ -249,12 +286,18 @@ def detect_voice_activity(
     sigma = max(float(noise_floor_sigma), SIGMA_FLOOR)
     mu = float(noise_floor_mu)
     enter_thr, exit_thr = thresholds_for(mu, sigma, speaking_mode)
+    # 閾值判斷用平滑後的值（見 SMOOTH_FRAMES）；回報的 peak_z / mean_z 用
+    # 原始值——峰值就是峰值，平滑過的「峰值」會低估這一幀有多大聲。
+    half_window = max(0, int(smooth_frames)) // 2
+    decision = _smooth(values, smooth_frames)
     z = (values - mu) / sigma
 
     segments, discarded = _scan_hysteresis(
-        values, times, z, enter_thr, exit_thr,
+        decision, values, times, z, enter_thr, exit_thr,
         hangover_us=int(hangover_ms * 1000),
         min_segment_us=int(min_segment_ms * 1000),
+        max_backoff_us=int(max_onset_backoff_ms * 1000),
+        half_window=half_window,
     )
 
     return VadResult(
@@ -271,7 +314,22 @@ def detect_voice_activity(
     )
 
 
-def _scan_hysteresis(values, times, z, enter_thr, exit_thr, hangover_us, min_segment_us):
+def _smooth(values, n_frames):
+    """置中移動平均。`n_frames <= 1` 直接原樣回傳。
+
+    邊緣用 `edge` 模式補值，不用補零——補零會在第一／最後幾幀製造一個
+    往下的假斜坡，剛好落在我們最在意的邊界上。
+    """
+    if n_frames is None or n_frames <= 1:
+        return values
+    half = int(n_frames) // 2
+    padded = np.pad(values, half, mode="edge")
+    kernel = np.ones(2 * half + 1) / (2 * half + 1)
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def _scan_hysteresis(decision, values, times, z, enter_thr, exit_thr,
+                     hangover_us, min_segment_us, max_backoff_us, half_window):
     """雙閾值遲滯掃描。回傳 `(segments, discarded_short_count)`。
 
     狀態機只有兩個狀態，但「離開」是延遲確認的：先記下第一次低於離開閾值
@@ -279,28 +337,32 @@ def _scan_hysteresis(values, times, z, enter_thr, exit_thr, hangover_us, min_seg
     """
     segments = []
     discarded = 0
-
     in_voice = False
     start_idx = 0
     pending_exit_idx = None      # 第一次低於離開閾值的索引
 
     def close(end_idx):
         nonlocal discarded
-        seg = _make_segment(values, times, z, start_idx, end_idx, enter_thr)
+        # 兩段式：平滑後的訊號負責**判斷**（狀態機才不會被底噪尖峰打斷），
+        # 原始訊號負責**定位**（回報的邊界才不會被平滑的 ±半視窗糊掉）。
+        lo, hi = _refine(values, enter_thr, exit_thr, start_idx, end_idx, half_window)
+        seg = _make_segment(values, times, z, lo, hi, enter_thr)
         if seg.duration_us < min_segment_us:
             discarded += 1
         else:
             segments.append(seg)
 
-    for i, value in enumerate(values):
+    for i, value in enumerate(decision):
         if not in_voice:
             if value > enter_thr:
                 in_voice = True
                 # 起點退到同一個上升沿的腳：往回走到最後一個仍在離開閾值
                 # 以上的幀。子音起始爬得快但峰值不高，只取越過進入閾值的
-                # 那一幀會把起音切掉。
+                # 那一幀會把起音切掉。上限見 MAX_ONSET_BACKOFF_MS。
                 start_idx = i
-                while start_idx > 0 and values[start_idx - 1] > exit_thr:
+                while (start_idx > 0
+                       and decision[start_idx - 1] > exit_thr
+                       and times[i] - times[start_idx - 1] <= max_backoff_us):
                     start_idx -= 1
                 pending_exit_idx = None
             continue
@@ -326,9 +388,37 @@ def _scan_hysteresis(values, times, z, enter_thr, exit_thr, hangover_us, min_seg
     if in_voice:
         # 資料在還沒確認結束時就沒了。結束點取第一次低於離開閾值處（若有），
         # 否則取最後一幀——不外推，時間戳只能來自真的收到的幀。
-        close(pending_exit_idx - 1 if pending_exit_idx is not None else len(values) - 1)
+        close(pending_exit_idx - 1 if pending_exit_idx is not None else len(decision) - 1)
 
     return segments, discarded
+
+
+def _refine(values, enter_thr, exit_thr, start_idx, end_idx, half_window):
+    """把平滑訊號定出的段落，貼回原始訊號上真正的活動範圍。
+
+    定義：**段落 = 主體（高於進入閾值）+ 與主體相連、高於離開閾值的裙邊。**
+
+    「與主體相連」是關鍵。詞尾之後的底噪偶爾會連續兩三幀超過離開閾值
+    （1.5σ 每幀有 6.7% 機率），若只看「掛延遲內最後一幀高於離開閾值」，
+    段落就會被那撮雜訊往後拖——實測有一筆因此多了 112 ms。只要中間隔著
+    一幀低於離開閾值，那撮雜訊就不屬於這個詞。
+
+    找不到主體（整段都只在裙邊高度）時原樣回傳，不強行猜。
+    """
+    body = [j for j in range(start_idx, end_idx + 1) if values[j] > enter_thr]
+    if not body:
+        return start_idx, end_idx
+
+    lo, hi = body[0], body[-1]
+    # 往回補起音的腳，上限是狀態機給的起點再往前半個平滑視窗。
+    lo_limit = max(0, start_idx - half_window)
+    while lo > lo_limit and values[lo - 1] > exit_thr:
+        lo -= 1
+    # 往後補收音的尾，上限是狀態機給的終點（掛延遲已經確認過了，不外推）。
+    hi_limit = min(len(values) - 1, end_idx)
+    while hi < hi_limit and values[hi + 1] > exit_thr:
+        hi += 1
+    return lo, max(hi, lo)
 
 
 def _make_segment(values, times, z, start_idx, end_idx, enter_thr) -> VadSegment:

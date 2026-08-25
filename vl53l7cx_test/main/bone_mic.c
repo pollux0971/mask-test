@@ -151,7 +151,8 @@ void bone_mic_record_and_dump(uint32_t seconds)
      * to transfer it), this tells the bridge to show that instead of
      * treating the gap as a dead link. */
     uart_out_lock();
-    printf("$REC,start,%u\n", (unsigned)seconds);
+    int rec_len = printf("$REC,start,%u\n", (unsigned)seconds);
+    uart_out_add_bytes((size_t)rec_len);   /* A16: bandwidth accounting, see uart_out.h */
     uart_out_unlock();
 
     /* Captured and base64-encoded one small chunk at a time instead of into
@@ -174,8 +175,9 @@ void bone_mic_record_and_dump(uint32_t seconds)
     }
 
     uart_out_lock();
-    printf("BEGIN_WAV_B64 rate=%d bits=16 channels=1 bytes=%u\n",
-           MIC_SAMPLE_RATE_HZ, (unsigned)total_bytes);
+    int begin_len = printf("BEGIN_WAV_B64 rate=%d bits=16 channels=1 bytes=%u\n",
+                            MIC_SAMPLE_RATE_HZ, (unsigned)total_bytes);
+    uart_out_add_bytes((size_t)begin_len);   /* A16: bandwidth accounting, see uart_out.h */
     uart_out_unlock();
 
     dc_blocker_t filter = { 0 };
@@ -200,13 +202,19 @@ void bone_mic_record_and_dump(uint32_t seconds)
         uart_out_lock();
         fwrite(b64_chunk, 1, b64_len, stdout);
         fwrite("\n", 1, 1, stdout);
+        /* A16: bandwidth accounting (see uart_out.h). Byte count taken from
+         * b64_len directly rather than fwrite()'s return value -- with
+         * size=1 the two agree on success, but computing it from what we
+         * asked to write avoids relying on that coincidence. */
+        uart_out_add_bytes(b64_len + 1);
         uart_out_unlock();
 
         remaining -= filled;
     }
 
     uart_out_lock();
-    printf("END_WAV_B64\n");
+    int end_len = printf("END_WAV_B64\n");
+    uart_out_add_bytes((size_t)end_len);   /* A16: bandwidth accounting, see uart_out.h */
     fflush(stdout);
     uart_out_unlock();
 

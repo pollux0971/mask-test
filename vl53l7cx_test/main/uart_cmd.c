@@ -177,6 +177,51 @@ static void amb_request(bool enable)
     }
 }
 
+/* Parses exactly "MEL:<0|1>" (CONTRACTS.md #1.2), same strict style as
+ * parse_sens()/parse_amb() above. This was A13's job to wire up and never
+ * got done -- bone_mic_set_mel_enabled() existed but nothing called it,
+ * so $F could never actually be turned off from the host. Filling that
+ * gap here now that it's been found (A16 review). */
+static bool parse_mel(const char *line, bool *out_enable)
+{
+    static const char prefix[] = "MEL:";
+    const size_t prefix_len = sizeof(prefix) - 1;
+
+    if (strncmp(line, prefix, prefix_len) != 0) {
+        return false;
+    }
+    const char *p = line + prefix_len;
+
+    if (p[0] == '0') {
+        *out_enable = false;
+    } else if (p[0] == '1') {
+        *out_enable = true;
+    } else {
+        return false;
+    }
+    if (p[1] != '\0') {
+        return false;
+    }
+
+    return true;
+}
+
+static void mel_request(bool enable)
+{
+    bool changed = (bone_mic_mel_enabled() != enable);
+    bone_mic_set_mel_enabled(enable);
+
+    ESP_LOGI(TAG, "MEL:%d (%s)", enable ? 1 : 0,
+             changed ? "queued" : "already in that state");
+
+    if (changed) {
+        /* CONTRACTS.md #1.1 "版本協商": re-send $STATUS after any
+         * SENS/MEL/AMB/switch config change -- same trigger as
+         * sensor_request()/amb_request() above. */
+        tof_print_status();
+    }
+}
+
 static void uart_cmd_task(void *arg)
 {
     char line[64];
@@ -214,6 +259,8 @@ static void uart_cmd_task(void *arg)
             sensor_request(idx, enable);
         } else if (parse_amb(cmd, &enable)) {
             amb_request(enable);
+        } else if (parse_mel(cmd, &enable)) {
+            mel_request(enable);
         } else if (sscanf(cmd, "REC:%d", &seconds) == 1 && seconds > 0 && seconds <= 30) {
             ESP_LOGI(TAG, "recording request: %ds", seconds);
             bone_mic_request_recording((uint32_t)seconds);
