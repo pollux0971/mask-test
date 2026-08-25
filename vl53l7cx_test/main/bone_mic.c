@@ -22,7 +22,8 @@ static const char *TAG = "bone_mic";
 #define MIC_CLK_GPIO        GPIO_NUM_9
 #define MIC_DATA_GPIO       GPIO_NUM_8
 #define MIC_SAMPLE_RATE_HZ  16000
-#define MIC_FRAME_SAMPLES   512   /* 32ms of audio per read at 16kHz */
+#define MIC_FRAME_SAMPLES   512   /* 32ms FFT/Mel analysis window @16kHz, unchanged by A14 */
+#define MIC_HOP_SAMPLES     256   /* A14: 16ms hop (50% overlap) -> $F @62.5Hz, CONTRACTS.md §3.1 */
 
 static i2s_chan_handle_t s_rx_handle;
 static QueueHandle_t s_record_queue; /* depth 1, holds a pending recording length in seconds */
@@ -32,8 +33,11 @@ static QueueHandle_t s_record_queue; /* depth 1, holds a pending recording lengt
  * is a beat late, never a crash. */
 static volatile bool s_mel_enabled = true;
 
-/* A13: count of mic frames dropped (i2s_channel_read failure) since the
- * last bone_mic_drop_count_and_reset() call, for $H's drop_M. */
+/* A13/A14: count of mic frames dropped (i2s_channel_read failure) since
+ * boot, for $H's drop_M -- CONTRACTS.md §1.3 defines drop_* as cumulative
+ * since boot, never reset by $STATUS. The spinlock protects the ++ (a
+ * read-modify-write) against a concurrent reader/writer; a lone aligned
+ * uint32_t load in bone_mic_drop_count() doesn't need one. */
 static portMUX_TYPE s_drop_spinlock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_drop_count = 0;
 
@@ -47,13 +51,9 @@ bool bone_mic_mel_enabled(void)
     return s_mel_enabled;
 }
 
-uint32_t bone_mic_drop_count_and_reset(void)
+uint32_t bone_mic_drop_count(void)
 {
-    portENTER_CRITICAL(&s_drop_spinlock);
-    uint32_t count = s_drop_count;
-    s_drop_count = 0;
-    portEXIT_CRITICAL(&s_drop_spinlock);
-    return count;
+    return s_drop_count;
 }
 
 /* ESP32-S3's I2S PDM RX has no hardware high-pass filter
@@ -202,6 +202,13 @@ void bone_mic_record_and_dump(uint32_t seconds)
  * matches librosa.filters.get_window("hann", N, fftbins=True). */
 static float s_hann_window[MIC_FRAME_SAMPLES];
 
+/* A14: rolling 512-sample analysis window built from 50%-overlapping
+ * 256-sample hops -- [older 256 | newer 256]. Zero-initialized (static),
+ * so the very first couple of hops analyze a window that's part silence;
+ * that's an expected, brief startup transient, not a bug. `static`, not
+ * stack-local, same reasoning as the FFT/power buffers below. */
+static int16_t s_ring[MIC_FRAME_SAMPLES];
+
 /* FFT scratch (interleaved re/im) and the power spectrum derived from it.
  * `static`, not stack-local: fft_probe.c's spike already established that
  * a 4 KB FFT buffer doesn't belong on a task stack. Reused every frame. */
@@ -242,14 +249,15 @@ static void mic_compute_mel_frame(const int16_t *samples, int16_t out_m[MEL_N_FI
 
 static void mic_task(void *arg)
 {
-    int16_t *buf = malloc(MIC_FRAME_SAMPLES * sizeof(int16_t));
-    if (buf == NULL) {
-        ESP_LOGE(TAG, "out of memory for audio buffer");
-        vTaskDelete(NULL);
-        return;
-    }
     dc_blocker_t stream_filter = { 0 };
-    uint32_t seq = 0;
+    uint32_t m_seq = 0;
+    uint32_t f_seq = 0;
+    /* A14: $M stays at half $F's rate (CONTRACTS.md still wants ~31.25 Hz
+     * for $M) -- emit it on every other hop. $F and $M now keep separate
+     * seq counters (each just "how many of this line have been sent"),
+     * decoupled per the A14 design discussion: CONTRACTS.md §1.1 never
+     * required them to share one, and cross-modal alignment is t_us's job. */
+    bool emit_m_this_hop = true;
 
     for (int i = 0; i < MIC_FRAME_SAMPLES; i++) {
         s_hann_window[i] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * i / MIC_FRAME_SAMPLES);

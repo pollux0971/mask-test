@@ -5,3 +5,5 @@ librosa
 scipy
 pytest
 matplotlib
+scikit-learn
+joblib

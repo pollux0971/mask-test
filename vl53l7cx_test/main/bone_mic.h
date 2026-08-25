@@ -35,9 +35,8 @@ void bone_mic_set_mel_enabled(bool on);
  * report it (CONTRACTS.md §1.1: "MEL 改變輸出組態後要重發 $STATUS"). */
 bool bone_mic_mel_enabled(void);
 
-/* Count of mic frames that failed to be captured since the last call to
- * this function, then resets the counter to 0 -- call this exactly once
- * per $STATUS emission for its drop_M field (CONTRACTS.md §1.3: drop_*
- * counts since the last $STATUS). Atomic read-and-reset (FreeRTOS
- * critical section), safe to call from a different task than mic_task. */
-uint32_t bone_mic_drop_count_and_reset(void);
+/* Count of mic frames that have failed to be captured since boot -- never
+ * reset (CONTRACTS.md §1.3: drop_* is a since-boot cumulative counter, not
+ * reset on $STATUS, so repeated PING-triggered $STATUS reissues don't
+ * zero it out from under B05). Safe to call from any task. */
+uint32_t bone_mic_drop_count(void);
