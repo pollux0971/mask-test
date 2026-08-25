@@ -1,15 +1,22 @@
-"""B07 — HDF5 session writer（CONTRACTS.md 第 2 章，FROZEN 2026-08-26）。
+"""B07 — HDF5 session writer（CONTRACTS.md 第 2 章，FROZEN 2026-08-26；
+`mel`/`tof_ambient_*` 的時間軸與 `/meta` 校時欄位是後續調度決議追加的，
+見變更紀錄）。
 
 `SessionWriter` 只負責「把已經備妥的陣列，依 schema 正確地寫進 HDF5」
 這一件事——不做特徵抽取、不做時間對齊、不做 trial 切分：
 
 * 每個模態幾點取樣、取幾個點，是 `B06`（時間對齊器）跟上游 capture 決定的；
-  `tof_A`/`tof_B` 是 `(T, 32)`、`mic_*` 是 `(M,)`，**T 跟 M 本來就不同**
-  （ToF/Mic 是不同頻率的原始串流，schema 沒有把它們對成同一個時間軸——
-  那是 `analysis/` 的 D 軌拿到資料之後才做的事）。
-* `/meta` 的 `clock_slope`/`clock_offset`/`clock_residual_p95` 由呼叫端
-  自己跑 `host/clock/align.py` 的 `ClockAligner.freeze()` 算好，這裡只管
-  寫進 attrs。
+  `tof_A`/`tof_B` 是 `(T, 32)`、`mic_*` 是 `(M,)`、`mel`/`mel_t_us` 是
+  `(F,)`、`tof_ambient_*` 是 `(Ta,)`——**這四個時間軸長度互不相同**
+  （ToF/Mic/Mel/ambient 是頻率互不相同的獨立串流，§1.1.1），schema 沒有
+  把它們對成同一個時間軸——那是 `analysis/` 的 D 軌拿到資料之後才做的事。
+  **不可以用長度相等去驗證彼此，也不可以互相內插湊出「看起來對齊」的假資料。**
+* `/meta` 的 `clock_slope`/`clock_offset`/`clock_residual_p95`（`B04` 回歸法）
+  由呼叫端自己跑 `host/clock/align.py` 的 `ClockAligner.freeze()` 算好；
+  `clock_drift_us`/`clock_drift_ppm`/`clock_sync_span_us`/`clock_sync_confirmed`
+  （`B05` 兩點法）與 `session_start_*` 三個校時欄位在建構時就要有；
+  `session_end_*` 三個要等 session 真的結束才存在，用 `finalize_session_end()`
+  補寫，**不列進建構時必填**（見該方法的說明）。
 
 **增量寫入 = 每個 trial 結束就 flush，不是每個 sample 都 flush。**
 `write_trial()` 一次吃一個 trial 完整的陣列（呼叫端已經知道這個 trial
@@ -25,6 +32,8 @@ from __future__ import annotations
 import h5py
 import numpy as np
 
+from host.clock.align import SLOPE_TOLERANCE_PPM
+
 SCHEMA_VERSION = 1
 
 TOF_VALUES_DIM = 32   # [0:16] 距離 mm, [16:32] signal/100
@@ -33,14 +42,28 @@ MEL_BANDS = 40
 
 GZIP_LEVEL = 4
 
+# session 一開始就量得到、建構 SessionWriter 時必填。
 REQUIRED_META_KEYS = (
     "schema_version", "subject", "session_date", "wear_id", "mode",
     "distance_mm", "angle_deg", "ambient", "notes",
     "fw_sha", "proto_version", "tof_dim",
     "clock_slope", "clock_offset", "clock_residual_p95",
+    "clock_drift_us", "clock_drift_ppm", "clock_sync_span_us", "clock_sync_confirmed",
+    "session_start_device_us", "session_start_host_us", "session_start_rtt_min_us",
     "baseline_mu_A", "baseline_sigma_A", "baseline_mu_B", "baseline_sigma_B",
     "noise_floor_mu", "noise_floor_sigma",
 )
+
+# session 結束才量得到，`finalize_session_end()` 補寫，不在上面那份清單裡
+# ——列進建構時必填的話，`SessionWriter` 連第一個 trial 都還沒寫就開不起來。
+SESSION_END_META_KEYS = (
+    "session_end_device_us", "session_end_host_us", "session_end_rtt_min_us",
+)
+
+# clock_drift_ppm（B05 兩點法）與 clock_slope 換算成 ppm（B04 回歸法）
+# 應該互相印證；門檻沿用 B04 自己驗收條件用的 ±200ppm（host/clock/align.py），
+# 同一個「時鐘多準才算準」的定義只在一個地方寫，不另外發明一個數字。
+CLOCK_CROSS_CHECK_TOLERANCE_PPM = SLOPE_TOLERANCE_PPM
 
 REQUIRED_TRIAL_ATTRS = (
     "wear_id", "mode", "valid_zone_ratio", "drop_count",
@@ -80,22 +103,53 @@ class SessionWriter:
             self._file.close()
             self._file = None
 
+    def finalize_session_end(self, session_end_device_us, session_end_host_us,
+                              session_end_rtt_min_us) -> None:
+        """session 真正結束時呼叫，補寫 `/meta` 的三個收尾校時欄位。這三個
+        值在 session 開始時根本不存在（校時要等結束才做第二次量測），所以
+        不在建構時的 `REQUIRED_META_KEYS` 裡——不是可以晚點補的「選填」，
+        是「這個時間點必然還沒發生」。
+
+        沒呼叫這個就 `close()`（或 `with` 區塊正常/異常結束）完全沒問題，
+        已寫入的 trial 一樣完整可讀，只是 `/meta` 少這三個欄位；`B19`／
+        呼叫端要保證正常結束的 session 都會呼叫它，不是這裡的責任。
+        """
+        meta_group = self._file["meta"]
+        meta_group.attrs["session_end_device_us"] = np.int64(session_end_device_us)
+        meta_group.attrs["session_end_host_us"] = np.int64(session_end_host_us)
+        meta_group.attrs["session_end_rtt_min_us"] = np.int64(session_end_rtt_min_us)
+        self._file.flush()
+
     def _write_meta(self) -> None:
         meta_group = self._file.create_group("meta")
         for key in REQUIRED_META_KEYS:
             meta_group.attrs[key] = self._meta[key]
 
+        # B05（兩點法漂移）與 B04（回歸法 slope）是兩個獨立方法量同一件事
+        # ——對得上，兩邊才都可信；差太多代表其中一邊（或兩邊都）有問題，
+        # 不應該悄悄放過。門檻沿用 B04 驗收條件的 ±200ppm。
+        expected_ppm_from_slope = (self._meta["clock_slope"] - 1.0) * 1e6
+        ppm_diff = abs(expected_ppm_from_slope - self._meta["clock_drift_ppm"])
+        meta_group.attrs["clock_cross_check_ppm_diff"] = float(ppm_diff)
+        meta_group.attrs["clock_cross_check_ok"] = bool(ppm_diff <= CLOCK_CROSS_CHECK_TOLERANCE_PPM)
+
     def write_trial(
         self, idx: int, *, label: str,
         tof_A, tof_B, tof_t_us, tof_valid_A, tof_valid_B,
         mic_rms, mic_peak, mic_t_us,
-        mel=None, audio=None, audio_t0_us=None,
+        mel=None, mel_t_us=None,
+        tof_ambient_A=None, tof_ambient_B=None, tof_ambient_t_us=None,
+        audio=None, audio_t0_us=None,
         wear_id, mode, valid_zone_ratio: float, drop_count: int,
         vad_start_us: int, vad_end_us: int, lip_onset_us: int, voice_onset_us: int,
         quality: str,
     ) -> None:
         """寫一個完整的 trial，寫完立刻 flush。`idx` 重複寫會覆蓋掉舊的
         （用 `del` 先移除舊 group 再建新的，避免 h5py 對已存在 group 報錯）。
+
+        `mel`/`mel_t_us` 與 `tof_ambient_A`/`tof_ambient_B`/`tof_ambient_t_us`
+        都是各自獨立的時間軸（`F`、`Ta`），**不會**、也**不可以**拿去跟
+        `tof_t_us`/`mic_t_us` 比長度——那是兩種不同取樣率的獨立串流。
         """
         if quality not in VALID_QUALITY_VALUES:
             raise ValueError(f"quality 必須是 {VALID_QUALITY_VALUES} 之一，收到 {quality!r}")
@@ -112,15 +166,10 @@ class SessionWriter:
         _validate_tof_shapes(tof_A, tof_B, tof_t_us, tof_valid_A, tof_valid_B)
         _validate_mic_shapes(mic_rms, mic_peak, mic_t_us)
 
-        mel_arr = None
-        if mel is not None:
-            mel_arr = np.asarray(mel, dtype=np.float32)
-            if mel_arr.ndim != 2 or mel_arr.shape[1] != MEL_BANDS:
-                raise ValueError(f"mel 必須是 (M, {MEL_BANDS})，收到 {mel_arr.shape}")
-            if mel_arr.shape[0] != mic_t_us.shape[0]:
-                raise ValueError(
-                    f"mel 的幀數（{mel_arr.shape[0]}）必須跟 mic_t_us 的長度（{mic_t_us.shape[0]}）一致"
-                )
+        mel_arr, mel_t_us_arr = _validate_mel(mel, mel_t_us)
+        ambient_A_arr, ambient_B_arr, ambient_t_us_arr = _validate_ambient_trio(
+            tof_ambient_A, tof_ambient_B, tof_ambient_t_us,
+        )
 
         audio_arr = None
         if audio is not None:
@@ -145,6 +194,11 @@ class SessionWriter:
         _create_dataset(grp, "mic_t_us", mic_t_us)
         if mel_arr is not None:
             _create_dataset(grp, "mel", mel_arr)
+            _create_dataset(grp, "mel_t_us", mel_t_us_arr)
+        if ambient_A_arr is not None:
+            _create_dataset(grp, "tof_ambient_A", ambient_A_arr)
+            _create_dataset(grp, "tof_ambient_B", ambient_B_arr)
+            _create_dataset(grp, "tof_ambient_t_us", ambient_t_us_arr)
         if audio_arr is not None:
             _create_dataset(grp, "audio", audio_arr)
             grp.attrs["audio_t0_us"] = np.int64(audio_t0_us)
@@ -205,3 +259,44 @@ def _validate_mic_shapes(mic_rms, mic_peak, mic_t_us) -> None:
     for name, arr in (("mic_rms", mic_rms), ("mic_peak", mic_peak)):
         if arr.shape != (m,):
             raise ValueError(f"{name} 必須是 ({m},)（跟 mic_t_us 長度一致），收到 {arr.shape}")
+
+
+def _validate_mel(mel, mel_t_us):
+    """`mel`/`mel_t_us` 成對出現、缺一不可（CONTRACTS.md §2）；`mel` 自己的
+    幀數 `F` 只跟 `mel_t_us` 比，**不跟 `mic_t_us` 比**——兩者取樣率不同
+    （`$F` 62.5Hz、`$M` 31.25Hz），長度本來就不會一樣。"""
+    if (mel is None) != (mel_t_us is None):
+        raise ValueError("mel 和 mel_t_us 必須同時提供或同時省略")
+    if mel is None:
+        return None, None
+
+    mel_arr = np.asarray(mel, dtype=np.float32)
+    mel_t_us_arr = np.asarray(mel_t_us, dtype=np.int64)
+    if mel_arr.ndim != 2 or mel_arr.shape[1] != MEL_BANDS:
+        raise ValueError(f"mel 必須是 (F, {MEL_BANDS})，收到 {mel_arr.shape}")
+    if mel_t_us_arr.shape != (mel_arr.shape[0],):
+        raise ValueError(
+            f"mel_t_us 必須是 ({mel_arr.shape[0]},)（跟 mel 的幀數 F 一致），收到 {mel_t_us_arr.shape}"
+        )
+    return mel_arr, mel_t_us_arr
+
+
+def _validate_ambient_trio(tof_ambient_A, tof_ambient_B, tof_ambient_t_us):
+    """`tof_ambient_A`/`tof_ambient_B`/`tof_ambient_t_us` 三個全有或全無
+    （CONTRACTS.md §1.1.3/§2）：ambient 是獨立的第五條串流（`Ta` 自己的
+    時間軸，通常 1Hz），**不跟 `tof_t_us` 比長度**。無效 zone 跟
+    `tof_A`/`tof_B` 一樣填 `NaN`。"""
+    given = (tof_ambient_A is not None, tof_ambient_B is not None, tof_ambient_t_us is not None)
+    if len(set(given)) != 1:
+        raise ValueError("tof_ambient_A / tof_ambient_B / tof_ambient_t_us 必須同時提供或同時省略")
+    if tof_ambient_A is None:
+        return None, None, None
+
+    t_us_arr = np.asarray(tof_ambient_t_us, dtype=np.int64)
+    ta = t_us_arr.shape[0]
+    a_arr = _to_float32_nan_safe(tof_ambient_A)
+    b_arr = _to_float32_nan_safe(tof_ambient_B)
+    for name, arr in (("tof_ambient_A", a_arr), ("tof_ambient_B", b_arr)):
+        if arr.shape != (ta, TOF_VALID_DIM):
+            raise ValueError(f"{name} 必須是 ({ta}, {TOF_VALID_DIM})（跟 tof_ambient_t_us 長度一致），收到 {arr.shape}")
+    return a_arr, b_arr, t_us_arr

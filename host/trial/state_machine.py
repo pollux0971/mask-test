@@ -152,11 +152,12 @@ class TrialStateMachine:
         self._capture_end_t_us: Optional[int] = None
         self._next_trial_idx = 0
 
-        # mic 原生取樣率的緩衝，跟 Aligner 內部的環形緩衝分開一份。
-        # 原因見本檔案模組層級文件字串「已知限制」段落：Aligner.frames()
-        # 只能吐單一共同取樣率，會把 mic 錯誤地重取樣成 ToF 的 30Hz 網格，
-        # 違反 schema 對 mic_t_us 要保留原生取樣率（M）的要求。
+        # mic/mel 原生取樣率的緩衝，跟 Aligner 內部的環形緩衝分開一份。
+        # 原因：Aligner.frames() 只能吐單一共同取樣率，會把 mic/mel 錯誤地
+        # 重取樣成 ToF 的 30Hz 網格，違反 schema 對 mic_t_us（M）／mel_t_us
+        # （F）要保留各自原生取樣率的要求（CONTRACTS.md §1.1.1/§2）。
         self._mic_events: List[tuple] = []
+        self._mel_events: List[tuple] = []
 
     # -- 唯讀屬性 ---------------------------------------------------
 
@@ -186,11 +187,21 @@ class TrialStateMachine:
         while self._mic_events and self._mic_events[0][0] < cutoff:
             self._mic_events.pop(0)
 
+    def push_mel(self, t_us: int, log_mel) -> None:
+        t_us = int(t_us)
+        self._mel_events.append((t_us, list(log_mel)))
+        cutoff = t_us - int(self._mic_buffer_seconds * 1_000_000)
+        while self._mel_events and self._mel_events[0][0] < cutoff:
+            self._mel_events.pop(0)
+
     def push_event(self, event: dict) -> None:
         """方便直接餵 `ProtocolParser.feed()` 的輸出：轉發給 `Aligner`（ToF
-        用它的 `frames()` 取樣），mic 額外進自己的原生取樣率緩衝。"""
-        if event.get("type") == "mic":
+        用它的 `frames()` 取樣），mic/mel 額外各自進自己的原生取樣率緩衝。"""
+        etype = event.get("type")
+        if etype == "mic":
             self.push_mic(event["t_us"], event["rms"], event["peak"])
+        elif etype == "mel":
+            self.push_mel(event["t_us"], event["log_mel"])
         self._aligner.push_event(event)
 
     # -- trial 生命週期 -----------------------------------------------
@@ -322,6 +333,19 @@ class TrialStateMachine:
             mic_peak = np.zeros(1, dtype=np.int16)
             mic_t_us = np.array([self._capture_start_t_us], dtype=np.int64)
 
+        mel_window = [
+            e for e in self._mel_events
+            if self._capture_start_t_us <= e[0] <= self._capture_end_t_us
+        ]
+        if mel_window:
+            mel = np.array([e[1] for e in mel_window], dtype=np.float32)
+            mel_t_us = np.array([e[0] for e in mel_window], dtype=np.int64)
+        else:
+            # mel 是選填的（$F 可能被 MEL:0 關掉），沒收到就不傳——
+            # write_trial() 的 mel/mel_t_us 要嘛同時給、要嘛同時省略。
+            mel = None
+            mel_t_us = None
+
         idx = self._next_trial_idx
         quality = classify_quality(valid_zone_ratio, drop_count)
 
@@ -330,10 +354,11 @@ class TrialStateMachine:
             tof_A=tof_A, tof_B=tof_B, tof_t_us=tof_t_us,
             tof_valid_A=tof_valid_A, tof_valid_B=tof_valid_B,
             mic_rms=mic_rms, mic_peak=mic_peak, mic_t_us=mic_t_us,
-            # mel 刻意不傳：見本檔案模組文件字串「已知限制」，B07 的
-            # write_trial() 目前假設 mel 幀數必須等於 mic 幀數，這在 A14
-            # 之後的 62.5Hz/31.25Hz 不成立，等 CONTRACTS/B07 這塊確認前
-            # 先不寫 mel，audio 同理不在 B11 範圍內。
+            # mel/mel_t_us 各自獨立的時間軸（CONTRACTS.md §2，B07 已更新
+            # write_trial() 不再要求跟 mic_t_us 等長），沒有 mel 資料
+            # （$F 被 MEL:0 關掉，或這個 capture 視窗剛好沒收到）就是 None，
+            # quality 判定不看它是否存在（見 classify_quality 的文件字串）。
+            mel=mel, mel_t_us=mel_t_us,
             wear_id=self._wear_id, mode=self._mode,
             valid_zone_ratio=valid_zone_ratio, drop_count=drop_count,
             # B13（Auto-VAD）尚未實作，暫時用整個 capture 視窗邊界當佔位值——

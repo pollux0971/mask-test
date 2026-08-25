@@ -85,7 +85,12 @@ def parse_args():
     p.add_argument("--proto", choices=["v1", "v2"], default="v2",
                    help="wire format: v2 (default, CONTRACTS.md ch.1) or v1 (legacy $TOF/$MIC, for unmodified bridge_server.py / B02)")
     p.add_argument("--fps", type=float, default=30.0, help="ToF frames/sec per sensor (default 30)")
-    p.add_argument("--mic-fps", type=float, default=20.0, help="mic stat frames/sec (default 20)")
+    p.add_argument("--mic-fps", type=float, default=AUDIO_SR_HZ / MIC_HOP_SAMPLES,
+                   help="$M frames/sec (default 31.25 = sr/mic_hop). Derived from the "
+                        "very constants $STATUS advertises: streaming $M at some other "
+                        "rate while telling the host mic_hop=512 would make the mock lie "
+                        "about itself, and B06 would compute the wrong frame spacing. "
+                        "Override only to deliberately simulate a mismatched device.")
     p.add_argument("--heartbeat-interval", type=float, default=1.0, help="seconds between $H lines (default 1.0)")
     p.add_argument("--mel", choices=["0", "1"], default="0",
                    help="stream $F Mel frames at boot (default 0 = off, matching the "
@@ -131,6 +136,25 @@ def bump(tp, dur=0.4):
 PERIOD = 2.0  # seconds between synthetic "utterances"
 
 
+def period_rng(kind, seed, period_idx):
+    """Deterministic per-utterance RNG for the "random" scenario.
+
+    Seeded from a *stable* string: the caller's kind tag, the user's --seed,
+    and the period index. Two bugs are being avoided here at once.
+
+    First, random.Random() does not accept a tuple -- the previous
+    `random.Random((id(self), period_idx))` raised TypeError on every call,
+    so --scenario random crashed the device outright.
+
+    Second, and worse in the long run, `id(self)` is a memory address: it
+    differs between runs, so the same --seed produced a different stream
+    every time. A mock whose --seed does not reproduce its output is not a
+    fixture, it is a random number generator with extra steps -- and anyone
+    bisecting a host-side bug against it would be chasing noise.
+    """
+    return random.Random(f"{kind}|{seed}|{period_idx}")
+
+
 class Scenario:
     """Per-zone ToF distance model. idle/round/spread match the shapes
     sketched in T04.md; random re-rolls a round/spread/none mix each period
@@ -139,10 +163,11 @@ class Scenario:
 
     BASELINE_MM = 17.0
 
-    def __init__(self, name, dim, rng):
+    def __init__(self, name, dim, rng, seed=None):
         self.name = name
         self.center_w, self.edge_w = zone_weights(dim)
         self.rng = rng
+        self.seed = seed
 
     def delta(self, t, zone):
         tp = t % PERIOD
@@ -156,7 +181,7 @@ class Scenario:
             return 1.2 * b * ew
         if self.name == "random":
             period_idx = int(t // PERIOD)
-            prng = random.Random((id(self), period_idx))
+            prng = period_rng("tof", self.seed, period_idx)
             kind = prng.choice(["round", "spread", "none"])
             amp = prng.uniform(0.5, 3.0)
             if kind == "round":
@@ -204,16 +229,13 @@ class MelModel:
         "spread": [(2, 1.8, 0.95), (21, 4.5, 0.85), (30, 5.0, 0.35)],
     }
 
-    def __init__(self, rng):
+    def __init__(self, rng, seed=None):
         self.rng = rng
+        self.seed = seed
 
     def _shape(self, name, t):
         if name == "random":
-            # Seed with a str, not a tuple: random.Random() rejects tuples.
-            # (Scenario.delta has the same pattern with a tuple and raises --
-            #  see the completion report; not fixed here, it is not this
-            #  story's file section.)
-            prng = random.Random(f"mel-{int(t // PERIOD)}")
+            prng = period_rng("mel", self.seed, int(t // PERIOD))
             name = prng.choice(["round", "spread", "idle"])
         return self.FORMANTS.get(name, [])
 
@@ -288,7 +310,7 @@ class MockDevice:
         self.args = args
         self.rng = random.Random(args.seed)
         self.dim = args.dim * args.dim
-        self.scenario = Scenario(args.scenario, self.dim, self.rng)
+        self.scenario = Scenario(args.scenario, self.dim, self.rng, seed=args.seed)
         self.mic = MicModel(self.rng)
         self.faults = DropClockFaults(args, self.rng)
         self.fw_sha = args.fw_sha or "".join(self.rng.choice("0123456789abcdef") for _ in range(7))
@@ -302,7 +324,7 @@ class MockDevice:
         # Default off, matching the firmware's own default -- and $STATUS says
         # mel=0 at boot, which the host relies on. MEL:1 (or --mel 1) turns it on.
         self.mel_enabled = (args.mel == "1")
-        self.mel = MelModel(self.rng)
+        self.mel = MelModel(self.rng, seed=args.seed)
 
         # $F has its OWN seq (CONTRACTS.md #1.1.1: four independent streams).
         # It must not be shared with $M -- they run at different rates, so any
