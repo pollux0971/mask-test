@@ -1,0 +1,5 @@
+pyserial
+numpy
+h5py
+librosa
+scipy

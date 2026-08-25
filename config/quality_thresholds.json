@@ -1,0 +1,5 @@
+{
+  "_note": "佔位骨架。CONTRACTS.md 未給出具體門檻值，實際數字待負責 quality 事件（4.2 quality metrics）的 story 填入。",
+  "drop_rate": {"green": null, "yellow": null},
+  "valid_zone_ratio": {"green": null, "yellow": null}
+}

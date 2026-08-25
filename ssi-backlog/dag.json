@@ -1,0 +1,1632 @@
+{
+ "stories": {
+  "A01": {
+   "id": "A01",
+   "track": "A",
+   "file": "stories/A-firmware/A01.md",
+   "title": "$T 行：新標籤 + 序號 + 裝置時間戳",
+   "hours": 2.0,
+   "deps": [
+    "T01"
+   ],
+   "hardware": true,
+   "epic": "E1 訊號地基"
+  },
+  "A02": {
+   "id": "A02",
+   "track": "A",
+   "file": "stories/A-firmware/A02.md",
+   "title": "$T 行：加入 signal_per_spad",
+   "hours": 2.0,
+   "deps": [
+    "A01"
+   ],
+   "hardware": true,
+   "epic": "E1 訊號地基"
+  },
+  "A03": {
+   "id": "A03",
+   "track": "A",
+   "file": "stories/A-firmware/A03.md",
+   "title": "$M 行：新標籤 + 序號 + 時間戳",
+   "hours": 1.0,
+   "deps": [
+    "T01"
+   ],
+   "hardware": true,
+   "epic": "E1 訊號地基"
+  },
+  "A04": {
+   "id": "A04",
+   "track": "A",
+   "file": "stories/A-firmware/A04.md",
+   "title": "修正 ToF 輪詢週期",
+   "hours": 1.5,
+   "deps": [],
+   "hardware": true,
+   "epic": "E1 訊號地基"
+  },
+  "A05": {
+   "id": "A05",
+   "track": "A",
+   "file": "stories/A-firmware/A05.md",
+   "title": "掉幀計數器",
+   "hours": 1.0,
+   "deps": [
+    "A01",
+    "A04"
+   ],
+   "hardware": true,
+   "epic": "E1 訊號地基"
+  },
+  "A06": {
+   "id": "A06",
+   "track": "A",
+   "file": "stories/A-firmware/A06.md",
+   "title": "$H 心跳行",
+   "hours": 1.5,
+   "deps": [
+    "A05"
+   ],
+   "hardware": true,
+   "epic": "E1 訊號地基"
+  },
+  "A07": {
+   "id": "A07",
+   "track": "A",
+   "file": "stories/A-firmware/A07.md",
+   "title": "$STATUS 加入協定版本與韌體識別",
+   "hours": 1.0,
+   "deps": [
+    "T01"
+   ],
+   "hardware": true,
+   "epic": "E1 訊號地基"
+  },
+  "A08": {
+   "id": "A08",
+   "track": "A",
+   "file": "stories/A-firmware/A08.md",
+   "title": "SENS 指令：感測器獨立開關",
+   "hours": 2.0,
+   "deps": [
+    "T01"
+   ],
+   "hardware": true,
+   "epic": "E1 訊號地基"
+  },
+  "A09": {
+   "id": "A09",
+   "track": "A",
+   "file": "stories/A-firmware/A09.md",
+   "title": "PING 指令：主動校時取樣",
+   "hours": 0.5,
+   "deps": [
+    "A07"
+   ],
+   "hardware": true,
+   "epic": "E1 訊號地基"
+  },
+  "A10": {
+   "id": "A10",
+   "track": "A",
+   "file": "stories/A-firmware/A10.md",
+   "title": "esp-dsp 整合探針（FFT 正確性）",
+   "hours": 3.0,
+   "deps": [],
+   "hardware": true,
+   "epic": "E3 音訊特徵"
+  },
+  "A11": {
+   "id": "A11",
+   "track": "A",
+   "file": "stories/A-firmware/A11.md",
+   "title": "Mel 濾波器組靜態表",
+   "hours": 2.0,
+   "deps": [
+    "A10",
+    "T03"
+   ],
+   "hardware": true,
+   "epic": "E3 音訊特徵"
+  },
+  "A12": {
+   "id": "A12",
+   "track": "A",
+   "file": "stories/A-firmware/A12.md",
+   "title": "log-Mel 計算與 $F 輸出",
+   "hours": 4.0,
+   "deps": [
+    "A11",
+    "A03"
+   ],
+   "hardware": true,
+   "epic": "E3 音訊特徵"
+  },
+  "A13": {
+   "id": "A13",
+   "track": "A",
+   "file": "stories/A-firmware/A13.md",
+   "title": "MEL 指令：串流開關",
+   "hours": 0.5,
+   "deps": [
+    "A12"
+   ],
+   "hardware": true,
+   "epic": "E3 音訊特徵"
+  },
+  "A14": {
+   "id": "A14",
+   "track": "A",
+   "file": "stories/A-firmware/A14.md",
+   "title": "音框 hop 改為 256（50% 重疊）",
+   "hours": 2.0,
+   "deps": [
+    "A12"
+   ],
+   "hardware": true,
+   "epic": "E3 音訊特徵"
+  },
+  "A15": {
+   "id": "A15",
+   "track": "A",
+   "file": "stories/A-firmware/A15.md",
+   "title": "韌體效能回歸測試",
+   "hours": 2.0,
+   "deps": [
+    "A06",
+    "A12"
+   ],
+   "hardware": true,
+   "epic": "E1 訊號地基"
+  },
+  "B01": {
+   "id": "B01",
+   "track": "B",
+   "file": "stories/B-bridge/B01.md",
+   "title": "解析協定 v2 行格式",
+   "hours": 2.0,
+   "deps": [
+    "T01",
+    "T04"
+   ],
+   "hardware": false,
+   "epic": "E1 訊號地基"
+  },
+  "B02": {
+   "id": "B02",
+   "track": "B",
+   "file": "stories/B-bridge/B02.md",
+   "title": "v1 / v2 雙協定相容",
+   "hours": 1.0,
+   "deps": [
+    "B01",
+    "A07"
+   ],
+   "hardware": false,
+   "epic": "E1 訊號地基"
+  },
+  "B03": {
+   "id": "B03",
+   "track": "B",
+   "file": "stories/B-bridge/B03.md",
+   "title": "掉幀偵測（seq 跳號）",
+   "hours": 1.5,
+   "deps": [
+    "B01"
+   ],
+   "hardware": false,
+   "epic": "E1 訊號地基"
+  },
+  "B04": {
+   "id": "B04",
+   "track": "B",
+   "file": "stories/B-bridge/B04.md",
+   "title": "時鐘對齊模型",
+   "hours": 3.0,
+   "deps": [
+    "B01"
+   ],
+   "hardware": false,
+   "epic": "E1 訊號地基"
+  },
+  "B05": {
+   "id": "B05",
+   "track": "B",
+   "file": "stories/B-bridge/B05.md",
+   "title": "PING 主動校時",
+   "hours": 1.0,
+   "deps": [
+    "B04",
+    "A09"
+   ],
+   "hardware": true,
+   "epic": "E1 訊號地基"
+  },
+  "B06": {
+   "id": "B06",
+   "track": "B",
+   "file": "stories/B-bridge/B06.md",
+   "title": "多模態時間對齊器",
+   "hours": 3.0,
+   "deps": [
+    "B01",
+    "B04"
+   ],
+   "hardware": false,
+   "epic": "E1 訊號地基"
+  },
+  "B07": {
+   "id": "B07",
+   "track": "B",
+   "file": "stories/B-bridge/B07.md",
+   "title": "HDF5 session writer",
+   "hours": 3.0,
+   "deps": [
+    "T02",
+    "B06"
+   ],
+   "hardware": false,
+   "epic": "E2 資料集"
+  },
+  "B08": {
+   "id": "B08",
+   "track": "B",
+   "file": "stories/B-bridge/B08.md",
+   "title": "manifest.csv 產生與維護",
+   "hours": 1.5,
+   "deps": [
+    "B07"
+   ],
+   "hardware": false,
+   "epic": "E2 資料集"
+  },
+  "B09": {
+   "id": "B09",
+   "track": "B",
+   "file": "stories/B-bridge/B09.md",
+   "title": "Session metadata API",
+   "hours": 1.5,
+   "deps": [
+    "B07"
+   ],
+   "hardware": false,
+   "epic": "E2 資料集"
+  },
+  "B10": {
+   "id": "B10",
+   "track": "B",
+   "file": "stories/B-bridge/B10.md",
+   "title": "Session baseline 自動錄製",
+   "hours": 1.5,
+   "deps": [
+    "B09",
+    "B06"
+   ],
+   "hardware": false,
+   "epic": "E2 資料集"
+  },
+  "B11": {
+   "id": "B11",
+   "track": "B",
+   "file": "stories/B-bridge/B11.md",
+   "title": "Trial 狀態機（後端）",
+   "hours": 3.0,
+   "deps": [
+    "B06",
+    "B07"
+   ],
+   "hardware": false,
+   "epic": "E2 資料集"
+  },
+  "B12": {
+   "id": "B12",
+   "track": "B",
+   "file": "stories/B-bridge/B12.md",
+   "title": "Hold-to-Record 觸發",
+   "hours": 1.0,
+   "deps": [
+    "B11"
+   ],
+   "hardware": false,
+   "epic": "E2 資料集"
+  },
+  "B13": {
+   "id": "B13",
+   "track": "B",
+   "file": "stories/B-bridge/B13.md",
+   "title": "Auto-VAD 觸發",
+   "hours": 2.0,
+   "deps": [
+    "B11",
+    "B15"
+   ],
+   "hardware": false,
+   "epic": "E2 資料集"
+  },
+  "B14": {
+   "id": "B14",
+   "track": "B",
+   "file": "stories/B-bridge/B14.md",
+   "title": "WAV → MFCC 管線（低風險備援路線）",
+   "hours": 3.0,
+   "deps": [
+    "T03"
+   ],
+   "hardware": false,
+   "epic": "E3 音訊特徵"
+  },
+  "B15": {
+   "id": "B15",
+   "track": "B",
+   "file": "stories/B-bridge/B15.md",
+   "title": "音訊 VAD 端點偵測",
+   "hours": 2.0,
+   "deps": [
+    "B10"
+   ],
+   "hardware": false,
+   "epic": "E3 音訊特徵"
+  },
+  "B16": {
+   "id": "B16",
+   "track": "B",
+   "file": "stories/B-bridge/B16.md",
+   "title": "ToF VAD 與唇動先行量測",
+   "hours": 2.0,
+   "deps": [
+    "B15",
+    "B10"
+   ],
+   "hardware": false,
+   "epic": "E3 音訊特徵"
+  },
+  "B17": {
+   "id": "B17",
+   "track": "B",
+   "file": "stories/B-bridge/B17.md",
+   "title": "HDF5 session 回放模式",
+   "hours": 2.0,
+   "deps": [
+    "B07",
+    "T05"
+   ],
+   "hardware": false,
+   "epic": "E2 資料集"
+  },
+  "B18": {
+   "id": "B18",
+   "track": "B",
+   "file": "stories/B-bridge/B18.md",
+   "title": "SENS / MEL / 解析度控制端點",
+   "hours": 1.0,
+   "deps": [
+    "A08",
+    "A13"
+   ],
+   "hardware": true,
+   "epic": "E1 訊號地基"
+  },
+  "B19": {
+   "id": "B19",
+   "track": "B",
+   "file": "stories/B-bridge/B19.md",
+   "title": "SSE 事件擴充：品質與流程狀態",
+   "hours": 2.0,
+   "deps": [
+    "B03",
+    "B04",
+    "B11"
+   ],
+   "hardware": false,
+   "epic": "E4 儀表板"
+  },
+  "C01": {
+   "id": "C01",
+   "track": "C",
+   "file": "stories/C-frontend/C01.md",
+   "title": "前端外殼：側邊欄 + 主內容區骨架",
+   "hours": 3.0,
+   "deps": [
+    "T04",
+    "T06"
+   ],
+   "hardware": false,
+   "epic": "E4 儀表板"
+  },
+  "C02": {
+   "id": "C02",
+   "track": "C",
+   "file": "stories/C-frontend/C02.md",
+   "title": "側邊欄模式切換器",
+   "hours": 2.5,
+   "deps": [
+    "C01"
+   ],
+   "hardware": false,
+   "epic": "E4 儀表板"
+  },
+  "C03": {
+   "id": "C03",
+   "track": "C",
+   "file": "stories/C-frontend/C03.md",
+   "title": "模式路由與跨模式狀態保存",
+   "hours": 3.0,
+   "deps": [
+    "C02"
+   ],
+   "hardware": false,
+   "epic": "E4 儀表板"
+  },
+  "C04": {
+   "id": "C04",
+   "track": "C",
+   "file": "stories/C-frontend/C04.md",
+   "title": "全域狀態列",
+   "hours": 2.0,
+   "deps": [
+    "C02",
+    "B19"
+   ],
+   "hardware": false,
+   "epic": "E4 儀表板"
+  },
+  "C05": {
+   "id": "C05",
+   "track": "C",
+   "file": "stories/C-frontend/C05.md",
+   "title": "監測模式：熱力圖遷移",
+   "hours": 2.0,
+   "deps": [
+    "C03",
+    "T04"
+   ],
+   "hardware": false,
+   "epic": "E4 儀表板"
+  },
+  "C06": {
+   "id": "C06",
+   "track": "C",
+   "file": "stories/C-frontend/C06.md",
+   "title": "監測模式：Δ 基線熱力圖",
+   "hours": 2.5,
+   "deps": [
+    "C05",
+    "B10"
+   ],
+   "hardware": false,
+   "epic": "E4 儀表板"
+  },
+  "C07": {
+   "id": "C07",
+   "track": "C",
+   "file": "stories/C-frontend/C07.md",
+   "title": "監測模式：signal rate 熱力圖",
+   "hours": 1.5,
+   "deps": [
+    "C05",
+    "A02"
+   ],
+   "hardware": false,
+   "epic": "E4 儀表板"
+  },
+  "C08": {
+   "id": "C08",
+   "track": "C",
+   "file": "stories/C-frontend/C08.md",
+   "title": "監測模式：Mel 頻譜瀑布圖",
+   "hours": 3.0,
+   "deps": [
+    "C03",
+    "T05"
+   ],
+   "hardware": false,
+   "epic": "E4 儀表板"
+  },
+  "C09": {
+   "id": "C09",
+   "track": "C",
+   "file": "stories/C-frontend/C09.md",
+   "title": "監測模式：訊號品質儀表板",
+   "hours": 3.0,
+   "deps": [
+    "C03",
+    "B19"
+   ],
+   "hardware": false,
+   "epic": "E4 儀表板"
+  },
+  "C10": {
+   "id": "C10",
+   "track": "C",
+   "file": "stories/C-frontend/C10.md",
+   "title": "監測模式：PCA 即時軌跡",
+   "hours": 3.0,
+   "deps": [
+    "C03",
+    "D03"
+   ],
+   "hardware": false,
+   "epic": "E4 儀表板"
+  },
+  "C11": {
+   "id": "C11",
+   "track": "C",
+   "file": "stories/C-frontend/C11.md",
+   "title": "錄製模式：session 設定表單",
+   "hours": 2.0,
+   "deps": [
+    "C03",
+    "B09",
+    "B10"
+   ],
+   "hardware": false,
+   "epic": "E2 資料集"
+  },
+  "C12": {
+   "id": "C12",
+   "track": "C",
+   "file": "stories/C-frontend/C12.md",
+   "title": "錄製模式：trial 提示卡與倒數",
+   "hours": 2.5,
+   "deps": [
+    "C11",
+    "B11",
+    "B12"
+   ],
+   "hardware": false,
+   "epic": "E2 資料集"
+  },
+  "C13": {
+   "id": "C13",
+   "track": "C",
+   "file": "stories/C-frontend/C13.md",
+   "title": "錄製模式：進度與 trial 清單",
+   "hours": 2.0,
+   "deps": [
+    "C12"
+   ],
+   "hardware": false,
+   "epic": "E2 資料集"
+  },
+  "C14": {
+   "id": "C14",
+   "track": "C",
+   "file": "stories/C-frontend/C14.md",
+   "title": "錄製模式：重錄與棄用",
+   "hours": 1.5,
+   "deps": [
+    "C13"
+   ],
+   "hardware": false,
+   "epic": "E2 資料集"
+  },
+  "C15": {
+   "id": "C15",
+   "track": "C",
+   "file": "stories/C-frontend/C15.md",
+   "title": "測驗模式：8 選項題目版面",
+   "hours": 2.5,
+   "deps": [
+    "C03",
+    "B13"
+   ],
+   "hardware": false,
+   "epic": "E6 閉集合 Demo"
+  },
+  "C16": {
+   "id": "C16",
+   "track": "C",
+   "file": "stories/C-frontend/C16.md",
+   "title": "測驗模式：三軌評分長條圖",
+   "hours": 3.0,
+   "deps": [
+    "C15",
+    "D07"
+   ],
+   "hardware": false,
+   "epic": "E6 閉集合 Demo"
+  },
+  "C17": {
+   "id": "C17",
+   "track": "C",
+   "file": "stories/C-frontend/C17.md",
+   "title": "測驗模式：融合權重滑桿",
+   "hours": 2.0,
+   "deps": [
+    "C16"
+   ],
+   "hardware": false,
+   "epic": "E6 閉集合 Demo"
+  },
+  "C18": {
+   "id": "C18",
+   "track": "C",
+   "file": "stories/C-frontend/C18.md",
+   "title": "測驗模式：結果卡與信心度",
+   "hours": 2.0,
+   "deps": [
+    "C16"
+   ],
+   "hardware": false,
+   "epic": "E6 閉集合 Demo"
+  },
+  "C19": {
+   "id": "C19",
+   "track": "C",
+   "file": "stories/C-frontend/C19.md",
+   "title": "測驗模式：輸入訊號縮圖",
+   "hours": 2.0,
+   "deps": [
+    "C15",
+    "C08",
+    "C10"
+   ],
+   "hardware": false,
+   "epic": "E6 閉集合 Demo"
+  },
+  "C20": {
+   "id": "C20",
+   "track": "C",
+   "file": "stories/C-frontend/C20.md",
+   "title": "測驗模式：即時混淆矩陣",
+   "hours": 2.0,
+   "deps": [
+    "C15",
+    "D08"
+   ],
+   "hardware": false,
+   "epic": "E6 閉集合 Demo"
+  },
+  "C21": {
+   "id": "C21",
+   "track": "C",
+   "file": "stories/C-frontend/C21.md",
+   "title": "測驗模式：session 統計列",
+   "hours": 1.5,
+   "deps": [
+    "C20"
+   ],
+   "hardware": false,
+   "epic": "E6 閉集合 Demo"
+  },
+  "C22": {
+   "id": "C22",
+   "track": "C",
+   "file": "stories/C-frontend/C22.md",
+   "title": "驗證模式：實驗執行器",
+   "hours": 3.0,
+   "deps": [
+    "C03",
+    "B18",
+    "D15"
+   ],
+   "hardware": false,
+   "epic": "E5 物理驗證"
+  },
+  "C23": {
+   "id": "C23",
+   "track": "C",
+   "file": "stories/C-frontend/C23.md",
+   "title": "驗證模式：報告檢視器",
+   "hours": 2.0,
+   "deps": [
+    "C22",
+    "D15"
+   ],
+   "hardware": false,
+   "epic": "E5 物理驗證"
+  },
+  "C24": {
+   "id": "C24",
+   "track": "C",
+   "file": "stories/C-frontend/C24.md",
+   "title": "回放模式：播放控制列",
+   "hours": 2.0,
+   "deps": [
+    "C03",
+    "B17"
+   ],
+   "hardware": false,
+   "epic": "E2 資料集"
+  },
+  "C25": {
+   "id": "C25",
+   "track": "C",
+   "file": "stories/C-frontend/C25.md",
+   "title": "設計 token 與跨模式視覺一致性",
+   "hours": 2.0,
+   "deps": [
+    "C05",
+    "C12",
+    "C16",
+    "C22",
+    "C24"
+   ],
+   "hardware": false,
+   "epic": "E4 儀表板"
+  },
+  "D01": {
+   "id": "D01",
+   "track": "D",
+   "file": "stories/D-analysis/D01.md",
+   "title": "ToF 特徵：z-score 與活躍 zone 篩選",
+   "hours": 2.5,
+   "deps": [
+    "T02",
+    "T03"
+   ],
+   "hardware": false,
+   "epic": "E3 特徵"
+  },
+  "D02": {
+   "id": "D02",
+   "track": "D",
+   "file": "stories/D-analysis/D02.md",
+   "title": "音訊特徵：CMN 與長度正規化",
+   "hours": 2.0,
+   "deps": [
+    "T03",
+    "B14"
+   ],
+   "hardware": false,
+   "epic": "E3 特徵"
+  },
+  "D03": {
+   "id": "D03",
+   "track": "D",
+   "file": "stories/D-analysis/D03.md",
+   "title": "特徵組裝與固定長度重採樣",
+   "hours": 2.0,
+   "deps": [
+    "D01",
+    "D02"
+   ],
+   "hardware": false,
+   "epic": "E3 特徵"
+  },
+  "D04": {
+   "id": "D04",
+   "track": "D",
+   "file": "stories/D-analysis/D04.md",
+   "title": "餘弦距離基準",
+   "hours": 1.5,
+   "deps": [
+    "D03"
+   ],
+   "hardware": false,
+   "epic": "E6 Demo"
+  },
+  "D05": {
+   "id": "D05",
+   "track": "D",
+   "file": "stories/D-analysis/D05.md",
+   "title": "DTW 距離（Sakoe-Chiba band）",
+   "hours": 3.0,
+   "deps": [
+    "D04"
+   ],
+   "hardware": false,
+   "epic": "E6 Demo"
+  },
+  "D06": {
+   "id": "D06",
+   "track": "D",
+   "file": "stories/D-analysis/D06.md",
+   "title": "距離轉分數與拒識閾值",
+   "hours": 2.0,
+   "deps": [
+    "D04"
+   ],
+   "hardware": false,
+   "epic": "E6 Demo"
+  },
+  "D07": {
+   "id": "D07",
+   "track": "D",
+   "file": "stories/D-analysis/D07.md",
+   "title": "三軌評分與融合",
+   "hours": 2.0,
+   "deps": [
+    "D06"
+   ],
+   "hardware": false,
+   "epic": "E6 Demo"
+  },
+  "D08": {
+   "id": "D08",
+   "track": "D",
+   "file": "stories/D-analysis/D08.md",
+   "title": "Enrollment 樣板管理與 LOOCV",
+   "hours": 2.5,
+   "deps": [
+    "D06",
+    "B11"
+   ],
+   "hardware": false,
+   "epic": "E6 Demo"
+  },
+  "D09": {
+   "id": "D09",
+   "track": "D",
+   "file": "stories/D-analysis/D09.md",
+   "title": "即時辨識服務",
+   "hours": 2.5,
+   "deps": [
+    "D07",
+    "D08",
+    "B06"
+   ],
+   "hardware": false,
+   "epic": "E6 Demo"
+  },
+  "D10": {
+   "id": "D10",
+   "track": "D",
+   "file": "stories/D-analysis/D10.md",
+   "title": "實驗 C₀：Crosstalk 分析",
+   "hours": 2.0,
+   "deps": [
+    "T02",
+    "B07"
+   ],
+   "hardware": false,
+   "epic": "E5 物理驗證"
+  },
+  "D11": {
+   "id": "D11",
+   "track": "D",
+   "file": "stories/D-analysis/D11.md",
+   "title": "實驗 A：逐 zone SNR 分析",
+   "hours": 2.5,
+   "deps": [
+    "D01"
+   ],
+   "hardware": false,
+   "epic": "E5 物理驗證"
+  },
+  "D12": {
+   "id": "D12",
+   "track": "D",
+   "file": "stories/D-analysis/D12.md",
+   "title": "實驗 B：CV（同次戴 vs 跨次戴）",
+   "hours": 2.0,
+   "deps": [
+    "B08"
+   ],
+   "hardware": false,
+   "epic": "E5 物理驗證"
+  },
+  "D13": {
+   "id": "D13",
+   "track": "D",
+   "file": "stories/D-analysis/D13.md",
+   "title": "實驗 C：Silhouette 多模態比較",
+   "hours": 2.5,
+   "deps": [
+    "D01",
+    "D02",
+    "D03"
+   ],
+   "hardware": false,
+   "epic": "E5 物理驗證"
+  },
+  "D14": {
+   "id": "D14",
+   "track": "D",
+   "file": "stories/D-analysis/D14.md",
+   "title": "實驗 E：Viseme 敏感度熱力圖",
+   "hours": 1.5,
+   "deps": [
+    "D13",
+    "B16"
+   ],
+   "hardware": false,
+   "epic": "E5 物理驗證"
+  },
+  "D15": {
+   "id": "D15",
+   "track": "D",
+   "file": "stories/D-analysis/D15.md",
+   "title": "驗證報告產生器",
+   "hours": 2.5,
+   "deps": [
+    "D10",
+    "D11",
+    "D12",
+    "D13",
+    "D14"
+   ],
+   "hardware": false,
+   "epic": "E5 物理驗證"
+  },
+  "D16": {
+   "id": "D16",
+   "track": "D",
+   "file": "stories/D-analysis/D16.md",
+   "title": "互信息分析",
+   "hours": 1.5,
+   "deps": [
+    "D13"
+   ],
+   "hardware": false,
+   "epic": "E7 統計驗證"
+  },
+  "D17": {
+   "id": "D17",
+   "track": "D",
+   "file": "stories/D-analysis/D17.md",
+   "title": "t-SNE 視覺化",
+   "hours": 2.0,
+   "deps": [
+    "D13"
+   ],
+   "hardware": false,
+   "epic": "E7 統計驗證"
+  },
+  "D18": {
+   "id": "D18",
+   "track": "D",
+   "file": "stories/D-analysis/D18.md",
+   "title": "Permutation Test",
+   "hours": 1.5,
+   "deps": [
+    "D13"
+   ],
+   "hardware": false,
+   "epic": "E7 統計驗證"
+  },
+  "D19": {
+   "id": "D19",
+   "track": "D",
+   "file": "stories/D-analysis/D19.md",
+   "title": "消融實驗套件",
+   "hours": 2.0,
+   "deps": [
+    "D16",
+    "D18"
+   ],
+   "hardware": false,
+   "epic": "E7 統計驗證"
+  },
+  "D20": {
+   "id": "D20",
+   "track": "D",
+   "file": "stories/D-analysis/D20.md",
+   "title": "圖表樣式統一",
+   "hours": 1.5,
+   "deps": [
+    "D15"
+   ],
+   "hardware": false,
+   "epic": "E8 交付"
+  },
+  "E01": {
+   "id": "E01",
+   "track": "E",
+   "file": "stories/E-hardware/E01.md",
+   "title": "Bring-up 冒煙測試（協定 v2 上機）",
+   "hours": 2.0,
+   "deps": [
+    "A04",
+    "A06",
+    "B01"
+   ],
+   "hardware": true,
+   "epic": "E1 訊號地基"
+  },
+  "E02": {
+   "id": "E02",
+   "track": "E",
+   "file": "stories/E-hardware/E02.md",
+   "title": "Crosstalk 資料蒐集",
+   "hours": 1.0,
+   "deps": [
+    "E01",
+    "A08",
+    "C22"
+   ],
+   "hardware": true,
+   "epic": "E5 物理驗證"
+  },
+  "E03": {
+   "id": "E03",
+   "track": "E",
+   "file": "stories/E-hardware/E03.md",
+   "title": "SNR 資料蒐集",
+   "hours": 1.0,
+   "deps": [
+    "E01",
+    "C11",
+    "C12"
+   ],
+   "hardware": true,
+   "epic": "E5 物理驗證"
+  },
+  "E04": {
+   "id": "E04",
+   "track": "E",
+   "file": "stories/E-hardware/E04.md",
+   "title": "CV 資料蒐集（20 次戴脫）",
+   "hours": 1.5,
+   "deps": [
+    "E03"
+   ],
+   "hardware": true,
+   "epic": "E5 物理驗證"
+  },
+  "E05": {
+   "id": "E05",
+   "track": "E",
+   "file": "stories/E-hardware/E05.md",
+   "title": "主資料集蒐集",
+   "hours": 4.0,
+   "deps": [
+    "E03",
+    "C13",
+    "B08"
+   ],
+   "hardware": true,
+   "epic": "E5 物理驗證"
+  },
+  "E06": {
+   "id": "E06",
+   "track": "E",
+   "file": "stories/E-hardware/E06.md",
+   "title": "Enrollment 與 LOOCV 驗收",
+   "hours": 1.0,
+   "deps": [
+    "E05",
+    "D08",
+    "C13"
+   ],
+   "hardware": true,
+   "epic": "E6 Demo"
+  },
+  "E07": {
+   "id": "E07",
+   "track": "E",
+   "file": "stories/E-hardware/E07.md",
+   "title": "Demo 排練 ×3",
+   "hours": 2.0,
+   "deps": [
+    "E06",
+    "C21"
+   ],
+   "hardware": true,
+   "epic": "E8 交付"
+  },
+  "E08": {
+   "id": "E08",
+   "track": "E",
+   "file": "stories/E-hardware/E08.md",
+   "title": "失敗備援演練",
+   "hours": 1.0,
+   "deps": [
+    "E07",
+    "B17",
+    "C24"
+   ],
+   "hardware": true,
+   "epic": "E8 交付"
+  },
+  "T01": {
+   "id": "T01",
+   "track": "T",
+   "file": "stories/T-contracts/T01.md",
+   "title": "凍結協定 v2 規格",
+   "hours": 2.0,
+   "deps": [],
+   "hardware": false,
+   "epic": "E1 訊號地基"
+  },
+  "T02": {
+   "id": "T02",
+   "track": "T",
+   "file": "stories/T-contracts/T02.md",
+   "title": "凍結 HDF5 session schema",
+   "hours": 2.0,
+   "deps": [],
+   "hardware": false,
+   "epic": "E2 資料集"
+  },
+  "T03": {
+   "id": "T03",
+   "track": "T",
+   "file": "stories/T-contracts/T03.md",
+   "title": "凍結特徵向量規格",
+   "hours": 1.5,
+   "deps": [],
+   "hardware": false,
+   "epic": "E3 音訊特徵"
+  },
+  "T04": {
+   "id": "T04",
+   "track": "T",
+   "file": "stories/T-contracts/T04.md",
+   "title": "Mock Device：合成資料產生器",
+   "hours": 4.0,
+   "deps": [
+    "T01"
+   ],
+   "hardware": false,
+   "epic": "E1 訊號地基"
+  },
+  "T05": {
+   "id": "T05",
+   "track": "T",
+   "file": "stories/T-contracts/T05.md",
+   "title": "Mock Device：真實 log 重播",
+   "hours": 2.0,
+   "deps": [
+    "T04",
+    "E01"
+   ],
+   "hardware": false,
+   "epic": "E1 訊號地基"
+  },
+  "T06": {
+   "id": "T06",
+   "track": "T",
+   "file": "stories/T-contracts/T06.md",
+   "title": "專案骨架與軌道目錄劃分",
+   "hours": 1.5,
+   "deps": [],
+   "hardware": false,
+   "epic": "—"
+  }
+ },
+ "level": {
+  "T01": 0,
+  "A01": 1,
+  "A02": 2,
+  "A03": 1,
+  "A04": 0,
+  "A05": 2,
+  "A06": 3,
+  "A07": 1,
+  "A08": 1,
+  "A09": 2,
+  "A10": 0,
+  "T03": 0,
+  "A11": 1,
+  "A12": 2,
+  "A13": 3,
+  "A14": 3,
+  "A15": 4,
+  "T04": 1,
+  "B01": 2,
+  "B02": 3,
+  "B03": 3,
+  "B04": 3,
+  "B05": 4,
+  "B06": 4,
+  "T02": 0,
+  "B07": 5,
+  "B08": 6,
+  "B09": 6,
+  "B10": 7,
+  "B11": 6,
+  "B12": 7,
+  "B15": 8,
+  "B13": 9,
+  "B14": 1,
+  "B16": 9,
+  "E01": 4,
+  "T05": 5,
+  "B17": 6,
+  "B18": 4,
+  "B19": 7,
+  "T06": 0,
+  "C01": 2,
+  "C02": 3,
+  "C03": 4,
+  "C04": 8,
+  "C05": 5,
+  "C06": 8,
+  "C07": 6,
+  "C08": 6,
+  "C09": 8,
+  "D01": 1,
+  "D02": 2,
+  "D03": 3,
+  "C10": 5,
+  "C11": 8,
+  "C12": 9,
+  "C13": 10,
+  "C14": 11,
+  "C15": 10,
+  "D04": 4,
+  "D06": 5,
+  "D07": 6,
+  "C16": 11,
+  "C17": 12,
+  "C18": 12,
+  "C19": 11,
+  "D08": 7,
+  "C20": 11,
+  "C21": 12,
+  "D10": 6,
+  "D11": 2,
+  "D12": 7,
+  "D13": 4,
+  "D14": 10,
+  "D15": 11,
+  "C22": 12,
+  "C23": 13,
+  "C24": 7,
+  "C25": 13,
+  "D05": 5,
+  "D09": 8,
+  "D16": 5,
+  "D17": 5,
+  "D18": 5,
+  "D19": 6,
+  "D20": 12,
+  "E02": 13,
+  "E03": 10,
+  "E04": 11,
+  "E05": 11,
+  "E06": 12,
+  "E07": 13,
+  "E08": 14
+ },
+ "est": {
+  "T01": 0.0,
+  "A01": 2.0,
+  "A02": 4.0,
+  "A03": 2.0,
+  "A04": 0.0,
+  "A05": 4.0,
+  "A06": 5.0,
+  "A07": 2.0,
+  "A08": 2.0,
+  "A09": 3.0,
+  "A10": 0.0,
+  "T03": 0.0,
+  "A11": 3.0,
+  "A12": 5.0,
+  "A13": 9.0,
+  "A14": 9.0,
+  "A15": 9.0,
+  "T04": 2.0,
+  "B01": 6.0,
+  "B02": 8.0,
+  "B03": 8.0,
+  "B04": 8.0,
+  "B05": 11.0,
+  "B06": 11.0,
+  "T02": 0.0,
+  "B07": 14.0,
+  "B08": 17.0,
+  "B09": 17.0,
+  "B10": 18.5,
+  "B11": 17.0,
+  "B12": 20.0,
+  "B15": 20.0,
+  "B13": 22.0,
+  "B14": 1.5,
+  "B16": 22.0,
+  "E01": 8.0,
+  "T05": 10.0,
+  "B17": 17.0,
+  "B18": 9.5,
+  "B19": 20.0,
+  "T06": 0.0,
+  "C01": 6.0,
+  "C02": 9.0,
+  "C03": 11.5,
+  "C04": 22.0,
+  "C05": 14.5,
+  "C06": 20.0,
+  "C07": 16.5,
+  "C08": 14.5,
+  "C09": 22.0,
+  "D01": 2.0,
+  "D02": 4.5,
+  "D03": 6.5,
+  "C10": 14.5,
+  "C11": 20.0,
+  "C12": 22.0,
+  "C13": 24.5,
+  "C14": 26.5,
+  "C15": 24.0,
+  "D04": 8.5,
+  "D06": 10.0,
+  "D07": 12.0,
+  "C16": 26.5,
+  "C17": 29.5,
+  "C18": 29.5,
+  "C19": 26.5,
+  "D08": 20.0,
+  "C20": 26.5,
+  "C21": 28.5,
+  "D10": 17.0,
+  "D11": 4.5,
+  "D12": 18.5,
+  "D13": 8.5,
+  "D14": 24.0,
+  "D15": 25.5,
+  "C22": 28.0,
+  "C23": 31.0,
+  "C24": 19.0,
+  "C25": 31.0,
+  "D05": 10.0,
+  "D09": 22.5,
+  "D16": 11.0,
+  "D17": 11.0,
+  "D18": 11.0,
+  "D19": 12.5,
+  "D20": 28.0,
+  "E02": 31.0,
+  "E03": 24.5,
+  "E04": 25.5,
+  "E05": 26.5,
+  "E06": 30.5,
+  "E07": 31.5,
+  "E08": 33.5
+ },
+ "finish": {
+  "A01": 4.0,
+  "A02": 6.0,
+  "A03": 3.0,
+  "A04": 1.5,
+  "A05": 5.0,
+  "A06": 6.5,
+  "A07": 3.0,
+  "A08": 4.0,
+  "A09": 3.5,
+  "A10": 3.0,
+  "A11": 5.0,
+  "A12": 9.0,
+  "A13": 9.5,
+  "A14": 11.0,
+  "A15": 11.0,
+  "B01": 8.0,
+  "B02": 9.0,
+  "B03": 9.5,
+  "B04": 11.0,
+  "B05": 12.0,
+  "B06": 14.0,
+  "B07": 17.0,
+  "B08": 18.5,
+  "B09": 18.5,
+  "B10": 20.0,
+  "B11": 20.0,
+  "B12": 21.0,
+  "B13": 24.0,
+  "B14": 4.5,
+  "B15": 22.0,
+  "B16": 24.0,
+  "B17": 19.0,
+  "B18": 10.5,
+  "B19": 22.0,
+  "C01": 9.0,
+  "C02": 11.5,
+  "C03": 14.5,
+  "C04": 24.0,
+  "C05": 16.5,
+  "C06": 22.5,
+  "C07": 18.0,
+  "C08": 17.5,
+  "C09": 25.0,
+  "C10": 17.5,
+  "C11": 22.0,
+  "C12": 24.5,
+  "C13": 26.5,
+  "C14": 28.0,
+  "C15": 26.5,
+  "C16": 29.5,
+  "C17": 31.5,
+  "C18": 31.5,
+  "C19": 28.5,
+  "C20": 28.5,
+  "C21": 30.0,
+  "C22": 31.0,
+  "C23": 33.0,
+  "C24": 21.0,
+  "C25": 33.0,
+  "D01": 4.5,
+  "D02": 6.5,
+  "D03": 8.5,
+  "D04": 10.0,
+  "D05": 13.0,
+  "D06": 12.0,
+  "D07": 14.0,
+  "D08": 22.5,
+  "D09": 25.0,
+  "D10": 19.0,
+  "D11": 7.0,
+  "D12": 20.5,
+  "D13": 11.0,
+  "D14": 25.5,
+  "D15": 28.0,
+  "D16": 12.5,
+  "D17": 13.0,
+  "D18": 12.5,
+  "D19": 14.5,
+  "D20": 29.5,
+  "E01": 10.0,
+  "E02": 32.0,
+  "E03": 25.5,
+  "E04": 27.0,
+  "E05": 30.5,
+  "E06": 31.5,
+  "E07": 33.5,
+  "E08": 34.5,
+  "T01": 2.0,
+  "T02": 2.0,
+  "T03": 1.5,
+  "T04": 6.0,
+  "T05": 12.0,
+  "T06": 1.5
+ },
+ "makespan": 34.5,
+ "total_h": 188.5,
+ "critical_path": [
+  "T01",
+  "T04",
+  "B01",
+  "B04",
+  "B06",
+  "B07",
+  "B09",
+  "B10",
+  "C11",
+  "C12",
+  "C13",
+  "E05",
+  "E06",
+  "E07",
+  "E08"
+ ],
+ "buckets": {
+  "1": [
+   "A01",
+   "A03",
+   "A07",
+   "A08",
+   "A11",
+   "B14",
+   "D01",
+   "T04"
+  ],
+  "2": [
+   "A02",
+   "A05",
+   "A09",
+   "A12",
+   "B01",
+   "C01",
+   "D02",
+   "D11"
+  ],
+  "0": [
+   "A04",
+   "A10",
+   "T01",
+   "T02",
+   "T03",
+   "T06"
+  ],
+  "3": [
+   "A06",
+   "A13",
+   "A14",
+   "B02",
+   "B03",
+   "B04",
+   "C02",
+   "D03"
+  ],
+  "4": [
+   "A15",
+   "B05",
+   "B06",
+   "B18",
+   "C03",
+   "D04",
+   "D13",
+   "E01"
+  ],
+  "5": [
+   "B07",
+   "C05",
+   "C10",
+   "D05",
+   "D06",
+   "D16",
+   "D17",
+   "D18",
+   "T05"
+  ],
+  "6": [
+   "B08",
+   "B09",
+   "B11",
+   "B17",
+   "C07",
+   "C08",
+   "D07",
+   "D10",
+   "D19"
+  ],
+  "7": [
+   "B10",
+   "B12",
+   "B19",
+   "C24",
+   "D08",
+   "D12"
+  ],
+  "9": [
+   "B13",
+   "B16",
+   "C12"
+  ],
+  "8": [
+   "B15",
+   "C04",
+   "C06",
+   "C09",
+   "C11",
+   "D09"
+  ],
+  "10": [
+   "C13",
+   "C15",
+   "D14",
+   "E03"
+  ],
+  "11": [
+   "C14",
+   "C16",
+   "C19",
+   "C20",
+   "D15",
+   "E04",
+   "E05"
+  ],
+  "12": [
+   "C17",
+   "C18",
+   "C21",
+   "C22",
+   "D20",
+   "E06"
+  ],
+  "13": [
+   "C23",
+   "C25",
+   "E02",
+   "E07"
+  ],
+  "14": [
+   "E08"
+  ]
+ },
+ "track_hours": {
+  "A": 26.0,
+  "B": 37.0,
+  "C": 57.5,
+  "D": 41.5,
+  "E": 13.5,
+  "T": 13.0
+ },
+ "track_count": {
+  "A": 15,
+  "B": 19,
+  "C": 25,
+  "D": 20,
+  "E": 8,
+  "T": 6
+ },
+ "roots": [
+  "A04",
+  "A10",
+  "T01",
+  "T02",
+  "T03",
+  "T06"
+ ]
+}

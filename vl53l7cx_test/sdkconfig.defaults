@@ -1,0 +1,12 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# Bumped from the 115200 default: the live monitor panel streams a $TOF
+# line per sensor update plus a $MIC line every ~32ms over the same UART,
+# and 115200 baud is too tight for that combined with 8x8-mode traffic.
+# CONFIG_ESP_CONSOLE_UART_BAUDRATE has no Kconfig prompt (and silently
+# reverts to 115200 on every build) unless ESP_CONSOLE_UART_CUSTOM is
+# selected -- still UART0 with the same default TX/RX pins, just with the
+# baud rate actually settable.
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=460800

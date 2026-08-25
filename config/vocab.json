@@ -1,0 +1,13 @@
+{
+  "words": [
+    {"id": "ba",    "text": "八",   "viseme": "A 雙唇", "expect": "ToF"},
+    {"id": "wu",    "text": "五",   "viseme": "B 圓唇", "expect": "ToF"},
+    {"id": "yi",    "text": "一",   "viseme": "C 展唇", "expect": "ToF"},
+    {"id": "a",     "text": "啊",   "viseme": "D 開口", "expect": "雙模態"},
+    {"id": "si",    "text": "四",   "viseme": "F 擦音", "expect": "音訊"},
+    {"id": "hao",   "text": "好",   "viseme": "G 應用", "expect": "雙模態"},
+    {"id": "ting",  "text": "停",   "viseme": "G 應用", "expect": "雙模態"},
+    {"id": "buyao", "text": "不要", "viseme": "G 應用", "expect": "ToF"}
+  ],
+  "reject": {"id": "_reject", "text": "靜止／其他"}
+}

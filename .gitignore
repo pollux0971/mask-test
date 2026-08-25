@@ -1,0 +1,15 @@
+build/
+data/
+voice/
+templates/
+*.zip
+
+# reports/ 是交付物（A04 量測報告、D15 驗證報告），要進版控。
+# 只忽略跑出來的大檔圖表快取。
+reports/**/*.npz
+reports/**/*.pkl
+
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store

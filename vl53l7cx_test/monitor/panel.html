@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>VL53L7CX x2 + Bone Mic — Live Monitor</title>
+<style>
+  :root {
+    --bg: #0b0e0c;
+    --surface: #141915;
+    --surface-2: #1b211c;
+    --border: #262c27;
+    --text: #e7ece8;
+    --text-dim: #8b968e;
+    --accent: #e8a33d;
+    --accent-soft: rgba(232, 163, 61, 0.16);
+    --warn: #e2574c;
+    --warn-soft: rgba(226, 87, 76, 0.16);
+    --good: #5fbf7a;
+    --cell-near: #17495a;
+    --cell-far: #dfe7e2;
+    --cell-invalid: #22271f;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  .mono {
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .title-block { display: flex; flex-direction: column; gap: 2px; }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .subtitle { font-size: 12px; color: var(--text-dim); }
+  .link-dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--warn);
+    margin-right: 6px;
+  }
+  .link-dot.up { background: var(--good); }
+
+  .controls { display: flex; align-items: center; gap: 10px; }
+  .res-btn {
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 8px 16px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+  .res-btn.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+  .res-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .flash-banner {
+    font-size: 12px;
+    padding: 5px 12px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    display: none;
+    white-space: nowrap;
+  }
+  .flash-banner.show { display: inline-block; }
+  .flash-banner.error { background: var(--warn-soft); color: var(--warn); }
+
+  main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    padding: 18px 20px 20px;
+    gap: 18px;
+  }
+
+  section.tof {
+    flex: 3;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .section-label {
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+  .tof-grids {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    gap: 18px;
+  }
+  .sensor-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+    min-width: 0;
+  }
+  .sensor-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 13px;
+  }
+  .sensor-name { font-weight: 600; }
+  .sensor-hz { color: var(--text-dim); font-size: 11px; }
+  .grid {
+    flex: 1;
+    display: grid;
+    gap: 3px;
+    min-height: 0;
+  }
+  .cell {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .cell.invalid { color: var(--text-dim); font-weight: 400; }
+
+  section.mic {
+    flex: 2;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .mic-panel {
+    flex: 1;
+    min-height: 0;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .mic-head {
+    display: flex;
+    justify-content: space-between;
+    font-size: 13px;
+  }
+  .mic-stats { display: flex; gap: 18px; color: var(--text-dim); font-size: 12px; }
+  .mic-stats b { color: var(--text); }
+  canvas#waveform { flex: 1; width: 100%; min-height: 0; display: block; }
+
+  .mic-controls { display: flex; align-items: center; gap: 8px; }
+  .rec-select {
+    font-family: inherit;
+    font-size: 12px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text);
+  }
+  .rec-btn {
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 7px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--warn);
+    background: transparent;
+    color: var(--warn);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .rec-btn::before {
+    content: "";
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--warn);
+  }
+  .rec-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .rec-btn.recording { background: var(--warn-soft); }
+  .rec-btn.recording::before { animation: rec-pulse 1s ease-in-out infinite; }
+  @keyframes rec-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+  .rec-status { font-size: 12px; color: var(--text-dim); }
+  .rec-status.error { color: var(--warn); }
+
+  .recent-recording {
+    display: none;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
+  .recent-recording.show { display: flex; }
+  .recent-recording-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  .recent-recording .rec-label { font-size: 12px; color: var(--text-dim); white-space: nowrap; }
+  .recent-recording audio { height: 32px; width: 100%; }
+  canvas#recentWaveform { width: 100%; height: 64px; display: block; border-radius: 6px; background: var(--surface-2); cursor: pointer; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="title-block">
+    <h1><span id="linkDot" class="link-dot"></span>VL53L7CX x2 + Bone-Conduction Mic</h1>
+    <div class="subtitle">Live monitor over UART bridge (bridge_server.py)</div>
+  </div>
+  <div class="controls">
+    <span id="flashBanner" class="flash-banner"></span>
+    <button id="btn4" class="res-btn">4 &times; 4</button>
+    <button id="btn8" class="res-btn">8 &times; 8</button>
+  </div>
+</header>
+
+<main>
+  <section class="tof">
+    <div class="section-label">ToF depth grids (mm)</div>
+    <div class="tof-grids">
+      <div class="sensor-panel">
+        <div class="sensor-head">
+          <span class="sensor-name">Sensor A</span>
+          <span class="sensor-hz mono" id="rateA">--</span>
+        </div>
+        <div class="grid" id="gridA"></div>
+      </div>
+      <div class="sensor-panel">
+        <div class="sensor-head">
+          <span class="sensor-name">Sensor B</span>
+          <span class="sensor-hz mono" id="rateB">--</span>
+        </div>
+        <div class="grid" id="gridB"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="mic">
+    <div class="section-label">Bone-conduction mic — amplitude envelope</div>
+    <div class="mic-panel">
+      <div class="mic-head">
+        <span>PDM, 16kHz mono</span>
+        <div class="mic-stats mono">
+          <span>RMS <b id="micRms">0</b></span>
+          <span>Peak <b id="micPeak">0</b></span>
+        </div>
+      </div>
+      <div class="mic-controls">
+        <select id="recSeconds" class="rec-select">
+          <option value="3">3s</option>
+          <option value="5" selected>5s</option>
+          <option value="10">10s</option>
+        </select>
+        <button id="recBtn" class="rec-btn">Record</button>
+        <span id="recStatus" class="rec-status"></span>
+      </div>
+      <canvas id="waveform"></canvas>
+      <div id="recentRecording" class="recent-recording">
+        <div class="recent-recording-head">
+          <span class="rec-label mono" id="recentLabel"></span>
+        </div>
+        <canvas id="recentWaveform"></canvas>
+        <audio id="recentAudio" controls></audio>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const DIST_MIN = 0, DIST_MAX = 1200; // mm, clamps the color scale
+const NEAR = [23, 73, 90];   // rgb, close object
+const FAR  = [223, 231, 226]; // rgb, far / no object nearby
+
+let dim = 8;
+let lastFrameAt = { A: 0, B: 0 };
+let rateCounters = { A: [], B: [] }; // timestamps of recent frames, for a rough Hz readout
+
+function distColor(mm) {
+  const t = Math.max(0, Math.min(1, mm / DIST_MAX));
+  const r = Math.round(NEAR[0] + (FAR[0] - NEAR[0]) * t);
+  const g = Math.round(NEAR[1] + (FAR[1] - NEAR[1]) * t);
+  const b = Math.round(NEAR[2] + (FAR[2] - NEAR[2]) * t);
+  return { rgb: `rgb(${r},${g},${b})`, luminance: (0.299 * r + 0.587 * g + 0.114 * b) / 255 };
+}
+
+function buildGrid(el, n) {
+  el.style.gridTemplateColumns = `repeat(${n}, 1fr)`;
+  el.style.gridTemplateRows = `repeat(${n}, 1fr)`;
+  el.innerHTML = "";
+  const cells = [];
+  for (let i = 0; i < n * n; i++) {
+    const c = document.createElement("div");
+    c.className = "cell invalid";
+    c.textContent = "·";
+    el.appendChild(c);
+    cells.push(c);
+  }
+  return cells;
+}
+
+let gridEls = { A: document.getElementById("gridA"), B: document.getElementById("gridB") };
+let cells = { A: buildGrid(gridEls.A, dim), B: buildGrid(gridEls.B, dim) };
+
+function rebuildGrids(n) {
+  dim = n;
+  cells.A = buildGrid(gridEls.A, dim);
+  cells.B = buildGrid(gridEls.B, dim);
+}
+
+function renderTof(sensor, values) {
+  const cs = cells[sensor];
+  if (!cs || cs.length !== values.length) return;
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
+    const c = cs[i];
+    if (v == null || v < 0) {
+      c.className = "cell invalid";
+      c.textContent = "·";
+      c.style.background = "var(--cell-invalid)";
+      c.style.color = "";
+    } else {
+      const { rgb, luminance } = distColor(v);
+      c.className = "cell";
+      c.textContent = v;
+      c.style.background = rgb;
+      c.style.color = luminance > 0.55 ? "#10140f" : "#f3f6f2";
+    }
+  }
+  const now = performance.now();
+  const arr = rateCounters[sensor];
+  arr.push(now);
+  while (arr.length && now - arr[0] > 2000) arr.shift();
+  const hz = arr.length / 2;
+  document.getElementById(sensor === "A" ? "rateA" : "rateB").textContent = hz.toFixed(1) + " Hz";
+}
+
+// ---- mic waveform ----
+const MIC_HISTORY = 400;
+let micHistory = new Array(MIC_HISTORY).fill(0);
+let micPeakHistory = new Array(MIC_HISTORY).fill(0);
+const waveCanvas = document.getElementById("waveform");
+const waveCtx = waveCanvas.getContext("2d");
+
+// Vertical scale as a slowly-decaying peak hold (like a VU meter), not the
+// instantaneous max of the visible window -- that jumped every time a loud
+// transient scrolled in or out of view, making steady music look alternately
+// squashed and huge. Grows instantly on a new peak, decays gradually so the
+// scale only drifts, never jumps.
+let scaleMax = 1000;
+const SCALE_DECAY = 0.985;   // per mic frame (~32ms) -> ~2s time constant
+const SCALE_FLOOR = 500;
+
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = waveCanvas.clientWidth, h = waveCanvas.clientHeight;
+  waveCanvas.width = w * dpr;
+  waveCanvas.height = h * dpr;
+  waveCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resizeCanvas);
+resizeCanvas();
+
+function drawWave() {
+  const w = waveCanvas.clientWidth, h = waveCanvas.clientHeight;
+  waveCtx.clearRect(0, 0, w, h);
+
+  const maxVal = scaleMax;
+  const n = micHistory.length;
+  const step = w / (n - 1);
+  const baseline = h / 2;
+
+  waveCtx.strokeStyle = "#262c27";
+  waveCtx.beginPath();
+  waveCtx.moveTo(0, baseline + 0.5);
+  waveCtx.lineTo(w, baseline + 0.5);
+  waveCtx.stroke();
+
+  // filled RMS envelope, mirrored around the centerline like a waveform
+  waveCtx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const amp = (micHistory[i] / maxVal) * (h / 2 - 6);
+    const x = i * step, y = baseline - amp;
+    if (i === 0) waveCtx.moveTo(x, y); else waveCtx.lineTo(x, y);
+  }
+  for (let i = n - 1; i >= 0; i--) {
+    const amp = (micHistory[i] / maxVal) * (h / 2 - 6);
+    const x = i * step, y = baseline + amp;
+    waveCtx.lineTo(x, y);
+  }
+  waveCtx.closePath();
+  waveCtx.fillStyle = "rgba(232, 163, 61, 0.35)";
+  waveCtx.fill();
+  waveCtx.strokeStyle = "#e8a33d";
+  waveCtx.lineWidth = 1.5;
+  waveCtx.stroke();
+}
+
+// ---- flash banner ----
+const btn4 = document.getElementById("btn4");
+const btn8 = document.getElementById("btn8");
+const flashBanner = document.getElementById("flashBanner");
+const linkDot = document.getElementById("linkDot");
+
+function setActiveButton(n) {
+  btn4.classList.toggle("active", n === 4);
+  btn8.classList.toggle("active", n === 8);
+}
+function setButtonsEnabled(enabled) {
+  btn4.disabled = !enabled;
+  btn8.disabled = !enabled;
+}
+function requestSwitch(n) {
+  if (n === dim) return;
+  setButtonsEnabled(false);
+  fetch(`/switch?res=${n}`, { method: "POST" }).catch(() => {
+    flashBanner.textContent = "request failed — is bridge_server.py running?";
+    flashBanner.className = "flash-banner show error";
+    setButtonsEnabled(true);
+  });
+}
+btn4.addEventListener("click", () => requestSwitch(4));
+btn8.addEventListener("click", () => requestSwitch(8));
+
+const FLASH_LABELS = {
+  editing: "Editing firmware source…",
+  building: "Building (idf.py build)…",
+  flashing: "Flashing over serial…",
+  done: "Reflashed — waiting for board to boot…",
+  error: "Flash failed — see console",
+};
+
+setActiveButton(dim);
+
+// ---- recording ----
+const recBtn = document.getElementById("recBtn");
+const recSeconds = document.getElementById("recSeconds");
+const recStatus = document.getElementById("recStatus");
+const recentRow = document.getElementById("recentRecording");
+const recentLabel = document.getElementById("recentLabel");
+const recentAudio = document.getElementById("recentAudio");
+
+// ---- recording waveform: static envelope of the whole clip, with a
+// playhead + played/unplayed shading that tracks <audio> in real time ----
+const recentWaveCanvas = document.getElementById("recentWaveform");
+const recentWaveCtx = recentWaveCanvas.getContext("2d");
+let recentEnvelope = null; // per-bucket peak amplitude, 0..1
+let sharedAudioCtx = null;
+
+function getAudioCtx() {
+  if (!sharedAudioCtx) {
+    sharedAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  return sharedAudioCtx;
+}
+
+function resizeRecentCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = recentWaveCanvas.clientWidth, h = recentWaveCanvas.clientHeight;
+  if (w === 0 || h === 0) return;
+  recentWaveCanvas.width = w * dpr;
+  recentWaveCanvas.height = h * dpr;
+  recentWaveCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function drawRecordingWaveform() {
+  const w = recentWaveCanvas.clientWidth, h = recentWaveCanvas.clientHeight;
+  recentWaveCtx.clearRect(0, 0, w, h);
+  if (!recentEnvelope || w === 0) return;
+
+  const n = recentEnvelope.length;
+  const barW = w / n;
+  const baseline = h / 2;
+  const progress = recentAudio.duration > 0
+    ? Math.min(1, recentAudio.currentTime / recentAudio.duration)
+    : 0;
+  const playedBars = Math.floor(progress * n);
+
+  for (let i = 0; i < n; i++) {
+    const amp = Math.max(1, recentEnvelope[i] * (h / 2 - 4));
+    const x = i * barW;
+    recentWaveCtx.fillStyle = (i < playedBars) ? "#e8a33d" : "rgba(139, 150, 142, 0.45)";
+    recentWaveCtx.fillRect(x, baseline - amp, Math.max(1, barW - 1), amp * 2);
+  }
+
+  if (recentAudio.duration > 0) {
+    const x = progress * w;
+    recentWaveCtx.strokeStyle = "#e8a33d";
+    recentWaveCtx.lineWidth = 1.5;
+    recentWaveCtx.beginPath();
+    recentWaveCtx.moveTo(x, 0);
+    recentWaveCtx.lineTo(x, h);
+    recentWaveCtx.stroke();
+  }
+}
+
+async function loadRecordingWaveform(url) {
+  recentEnvelope = null;
+  try {
+    const res = await fetch(url);
+    const arrayBuf = await res.arrayBuffer();
+    const audioBuf = await getAudioCtx().decodeAudioData(arrayBuf);
+    const data = audioBuf.getChannelData(0);
+    const buckets = 400;
+    const bucketSize = Math.max(1, Math.floor(data.length / buckets));
+    const env = new Float32Array(buckets);
+    for (let b = 0; b < buckets; b++) {
+      let peak = 0;
+      const start = b * bucketSize;
+      const end = Math.min(data.length, start + bucketSize);
+      for (let i = start; i < end; i++) {
+        const a = Math.abs(data[i]);
+        if (a > peak) peak = a;
+      }
+      env[b] = peak;
+    }
+    recentEnvelope = env;
+  } catch (err) {
+    console.error("waveform decode failed:", err);
+  }
+  resizeRecentCanvas();
+  drawRecordingWaveform();
+}
+
+recentAudio.addEventListener("timeupdate", drawRecordingWaveform);
+recentAudio.addEventListener("seeking", drawRecordingWaveform);
+recentAudio.addEventListener("play", drawRecordingWaveform);
+recentAudio.addEventListener("pause", drawRecordingWaveform);
+recentWaveCanvas.addEventListener("click", (e) => {
+  if (!recentAudio.duration) return;
+  const rect = recentWaveCanvas.getBoundingClientRect();
+  const frac = (e.clientX - rect.left) / rect.width;
+  recentAudio.currentTime = Math.max(0, Math.min(1, frac)) * recentAudio.duration;
+});
+window.addEventListener("resize", () => { resizeRecentCanvas(); drawRecordingWaveform(); });
+
+const REC_LABELS = {
+  recording: (ev) => `Recording ${ev.seconds}s…`,
+  receiving: () => "Transferring…",
+};
+
+function setRecordingUi(active) {
+  recBtn.disabled = active;
+  recSeconds.disabled = active;
+  recBtn.classList.toggle("recording", active);
+}
+
+recBtn.addEventListener("click", () => {
+  const seconds = recSeconds.value;
+  setRecordingUi(true);
+  recStatus.textContent = "Starting…";
+  recStatus.className = "rec-status";
+  fetch(`/record?seconds=${seconds}`, { method: "POST" })
+    .then((r) => {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+    })
+    .catch((err) => {
+      recStatus.textContent = "request failed: " + err.message;
+      recStatus.className = "rec-status error";
+      setRecordingUi(false);
+    });
+});
+
+// ---- SSE ----
+const es = new EventSource("/events");
+es.onopen = () => { linkDot.classList.add("up"); };
+es.onerror = () => { linkDot.classList.remove("up"); };
+
+es.onmessage = (e) => {
+  let ev;
+  try { ev = JSON.parse(e.data); } catch { return; }
+
+  if (ev.type === "link") {
+    linkDot.classList.toggle("up", ev.state === "up");
+  } else if (ev.type === "status") {
+    if (ev.dim !== dim) rebuildGrids(ev.dim);
+    setActiveButton(ev.dim);
+  } else if (ev.type === "tof") {
+    if (ev.dim !== dim) rebuildGrids(ev.dim);
+    renderTof(ev.sensor, ev.values);
+  } else if (ev.type === "mic") {
+    micHistory.push(ev.rms);
+    micHistory.shift();
+    micPeakHistory.push(ev.peak);
+    micPeakHistory.shift();
+    scaleMax = Math.max(scaleMax * SCALE_DECAY, ev.peak, SCALE_FLOOR);
+    document.getElementById("micRms").textContent = ev.rms.toFixed(0);
+    document.getElementById("micPeak").textContent = ev.peak;
+    drawWave();
+  } else if (ev.type === "flash") {
+    if (ev.state === "done" || ev.state === "error") {
+      setButtonsEnabled(true);
+    }
+    flashBanner.textContent = FLASH_LABELS[ev.state] || ev.state;
+    flashBanner.className = "flash-banner show" + (ev.state === "error" ? " error" : "");
+    if (ev.state === "done") {
+      setTimeout(() => { flashBanner.className = "flash-banner"; }, 4000);
+    }
+    if (ev.state === "error") {
+      console.error("flash error:", ev.message);
+    }
+  } else if (ev.type === "record") {
+    if (ev.state === "recording" || ev.state === "receiving") {
+      setRecordingUi(true);
+      recStatus.textContent = (REC_LABELS[ev.state] || (() => ev.state))(ev);
+      recStatus.className = "rec-status";
+    } else if (ev.state === "done") {
+      setRecordingUi(false);
+      recStatus.textContent = `Saved (${ev.duration_sec}s)`;
+      recentLabel.textContent = `voice/${ev.file}`;
+      recentAudio.src = ev.url;
+      recentRow.classList.add("show");
+      loadRecordingWaveform(ev.url);
+      setTimeout(() => { recStatus.textContent = ""; }, 4000);
+    } else if (ev.state === "error") {
+      setRecordingUi(false);
+      recStatus.textContent = "failed: " + (ev.message || "unknown error");
+      recStatus.className = "rec-status error";
+      console.error("record error:", ev.message);
+    }
+  }
+};
+
+drawWave();
+</script>
+</body>
+</html>
