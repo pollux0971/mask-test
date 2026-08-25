@@ -10,6 +10,7 @@
  * output. Commands understood (CONTRACTS.md #1.2):
  *   REC:<seconds>\n     -- trigger bone_mic_request_recording(seconds)
  *   SENS:<A|B>=<0|1>\n  -- enable/disable one ToF sensor (see below)
+ *   PING\n              -- emit one $H immediately, then re-send $STATUS
  */
 void uart_cmd_start(void);
 
@@ -35,9 +36,12 @@ void uart_cmd_start(void);
  *      request that cancels itself out.
  *   3. After a restart, discard the first frame -- the sensor needs 1-2
  *      ranging periods to settle and the first result is not trustworthy.
- *   4. Skip check_data_ready()/get_ranging_data() for a disabled sensor,
- *      and re-emit $STATUS after applying a change (CONTRACTS.md #1.1
- *      "版本協商": the device re-sends $STATUS after every SENS/MEL/switch).
+ *   4. Skip check_data_ready()/get_ranging_data() entirely for a disabled
+ *      sensor -- there is nothing to read and the I2C poll is wasted.
+ *
+ * The consumer does NOT need to re-emit $STATUS: this module calls
+ * tof_print_status() itself when it accepts a SENS command (CONTRACTS.md
+ * #1.1 "版本協商" requires a re-send after every SENS/MEL/switch).
  */
 #define UART_CMD_SENSOR_COUNT 2
 

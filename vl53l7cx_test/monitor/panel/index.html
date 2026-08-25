@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>VL53L7CX x2 + Bone Mic — Live Monitor</title>
+<link rel="stylesheet" href="css/tokens.css">
+<link rel="stylesheet" href="css/shell.css">
+<link rel="stylesheet" href="css/modes/monitor.css">
+<link rel="stylesheet" href="css/modes/record.css">
+<link rel="stylesheet" href="css/modes/quiz.css">
+<link rel="stylesheet" href="css/modes/validate.css">
+<link rel="stylesheet" href="css/modes/replay.css">
+</head>
+<body>
+
+<div id="app" class="app-shell">
+  <nav id="sidebar" class="sidebar">
+    <ul class="mode-nav">
+      <li><button class="mode-nav-item active" data-mode="monitor">
+        <span class="mode-icon">▣</span><span class="mode-label">監測</span><span class="mode-key mono">1</span>
+      </button></li>
+      <li><button class="mode-nav-item" data-mode="record">
+        <span class="mode-icon">⏺</span><span class="mode-label">錄製</span><span class="mode-key mono">2</span>
+      </button></li>
+      <li><button class="mode-nav-item" data-mode="quiz">
+        <span class="mode-icon">◎</span><span class="mode-label">測驗</span><span class="mode-key mono">3</span>
+      </button></li>
+      <li><button class="mode-nav-item" data-mode="validate">
+        <span class="mode-icon">⚗</span><span class="mode-label">驗證</span><span class="mode-key mono">4</span>
+      </button></li>
+      <li><button class="mode-nav-item" data-mode="replay">
+        <span class="mode-icon">▶</span><span class="mode-label">回放</span><span class="mode-key mono">5</span>
+      </button></li>
+    </ul>
+    <button id="collapseToggle" class="collapse-toggle" title="摺疊側邊欄（\）" aria-label="摺疊側邊欄">
+      <span class="mode-icon">«</span><span class="mode-label">摺疊</span><span class="mode-key mono">\</span>
+    </button>
+  </nav>
+
+  <main id="mainContent" class="main-content">
+    <section id="mode-monitor" class="mode-section active" data-mode="monitor"></section>
+    <section id="mode-record" class="mode-section" data-mode="record"></section>
+    <section id="mode-quiz" class="mode-section" data-mode="quiz"></section>
+    <section id="mode-validate" class="mode-section" data-mode="validate"></section>
+    <section id="mode-replay" class="mode-section" data-mode="replay"></section>
+  </main>
+</div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

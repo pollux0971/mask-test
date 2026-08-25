@@ -80,8 +80,10 @@ def zone_snr_grid(snr_zone_arr, n_rows=4, n_cols=4):
     """把 (16,) 逐 zone SNR 攤成 (n_rows, n_cols) 網格供熱力圖使用。
 
     zone 索引 -> (row, col) 採 row-major：zone i 對應 (i // n_cols, i % n_cols)。
-    **此排列假設尚未經硬體端確認**，需要 A 軌核對 vl53l7cx 實際的 zone
-    掃描順序是否也是 row-major，否則熱力圖的方向會跟實體佈局對不上。
+
+    zone layout: row-major (ASSUMED, unverified — see A 軌/E01)。此排列
+    尚未經硬體端確認，需要 E01 冒煙測試時核對 vl53l7cx 實際的 zone 掃描
+    順序是否也是 row-major，否則熱力圖的方向會跟實體佈局對不上。
     """
     snr_zone_arr = np.asarray(snr_zone_arr)
     if snr_zone_arr.shape[-1] != n_rows * n_cols:
@@ -123,11 +125,13 @@ def plot_zone_snr_heatmaps(snr_distance, snr_signal, n_rows=4, n_cols=4, thresho
     grid_s = zone_snr_grid(snr_signal, n_rows, n_cols)
 
     fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-    for ax, grid, title in zip(axes, (grid_d, grid_s), ("距離 SNR", "Signal rate SNR")):
+    for ax, grid, title in zip(axes, (grid_d, grid_s), ("Distance SNR", "Signal-rate SNR")):
         im = ax.imshow(grid, cmap="viridis")
         ax.set_title(title)
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    if threshold is not None:
-        fig.suptitle(f"threshold={threshold}")
+    fig.suptitle(
+        "zone layout: row-major (ASSUMED, unverified — see A track/E01)"
+        + (f"  |  threshold={threshold}" if threshold is not None else "")
+    )
     fig.tight_layout()
     return fig

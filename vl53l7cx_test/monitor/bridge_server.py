@@ -49,6 +49,7 @@ ROOT_DIR = PROJECT_DIR.parent
 MAIN_SRC = PROJECT_DIR / "main" / "vl53l7cx_test.c"
 IDF_EXPORT = Path.home() / "esp" / "esp-idf" / "export.sh"
 PANEL_HTML = MONITOR_DIR / "panel.html"
+PANEL_DIR = MONITOR_DIR / "panel"
 VOICE_DIR = ROOT_DIR / "voice"
 VOICE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -56,8 +57,34 @@ VOICE_DIR.mkdir(parents=True, exist_ok=True)
 # 用之前得先把 repo 根目錄塞進 sys.path。
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
-from host.features.mel_pipeline import wav_to_log_mel_timed  # noqa: E402
-from host.storage.mel_writer import write_mel_to_trial  # noqa: E402
+
+# Imported lazily: mel_pipeline pulls in librosa, which is a heavy optional
+# dependency. The bridge's core job -- serving the panel and relaying $-lines
+# over SSE -- must still start on a machine that only has pyserial, and the
+# E08 fallback demo depends on that. A missing librosa degrades the MFCC
+# feature to an SSE error event instead of killing the whole server.
+_MEL_IMPORT_ERROR = None
+wav_to_log_mel_timed = None
+write_mel_to_trial = None
+
+
+def _load_mel_backend():
+    """Return True once the B14 mel backend is importable; cache the failure."""
+    global wav_to_log_mel_timed, write_mel_to_trial, _MEL_IMPORT_ERROR
+    if wav_to_log_mel_timed is not None:
+        return True
+    if _MEL_IMPORT_ERROR is not None:
+        return False
+    try:
+        from host.features.mel_pipeline import wav_to_log_mel_timed as _w
+        from host.storage.mel_writer import write_mel_to_trial as _t
+    except ImportError as exc:
+        _MEL_IMPORT_ERROR = exc
+        print(f"[bridge] mel backend unavailable ({exc}); "
+              f"MFCC disabled, everything else still works")
+        return False
+    wav_to_log_mel_timed, write_mel_to_trial = _w, _t
+    return True
 
 # B09（session/trial 狀態機）還沒做，這裡先用「每次錄音自動 +1」模擬 trial_idx，
 # 讓 B07/B09 落地前就能對著一個真實 h5 檔驗證「特徵寫回 HDF5」這條路徑通不通。
@@ -162,6 +189,10 @@ def _process_mfcc(filename):
     ~0.1s，但 h5py I/O 加上 GIL 底下沒必要冒風險卡到即時的 $TOF 解析）。
     """
     wav_path = VOICE_DIR / filename
+    if not _load_mel_backend():
+        broadcaster.publish({"type": "mfcc", "state": "error", "file": filename,
+                             "message": f"mel backend unavailable: {_MEL_IMPORT_ERROR}"})
+        return
     broadcaster.publish({"type": "mfcc", "state": "computing", "file": filename})
     try:
         log_mel, elapsed = wav_to_log_mel_timed(wav_path)
@@ -339,7 +370,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass  # keep stdout clean; the important stuff comes from the [bridge] prints
 
     def do_GET(self):
-        if self.path == "/" or self.path == "/panel.html":
+        if self.path == "/" or self.path.startswith("/panel/"):
+            self._serve_panel_asset()
+        elif self.path == "/panel.html":
+            # Legacy single-file panel, kept as the E08 fallback demo path.
             self._serve_panel()
         elif self.path.startswith("/events"):
             self._serve_events()
@@ -366,6 +400,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # <script type="module"> enforces the JS MIME type strictly -- serving
+    # .js as text/plain makes the browser refuse the module outright with
+    # "Failed to load module script". BaseHTTPRequestHandler has no built-in
+    # table, so spell out the types the panel actually ships.
+    _PANEL_MIME = {
+        ".html": "text/html; charset=utf-8",
+        ".js": "text/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".woff2": "font/woff2",
+    }
+
+    def _serve_panel_asset(self):
+        rel = unquote(self.path[len("/panel/"):]) if self.path.startswith("/panel/") else ""
+        rel = rel.split("?", 1)[0].split("#", 1)[0]
+        if not rel or rel.endswith("/"):
+            rel += "index.html"
+
+        # Resolve-then-contain: PANEL_DIR has real subdirectories (js/modes/,
+        # css/modes/), so the basename-only guard used by _serve_voice_file()
+        # would flatten them. Resolve the joined path and require it to stay
+        # under PANEL_DIR -- that rejects ../ and absolute paths alike.
+        try:
+            path = (PANEL_DIR / rel).resolve()
+            path.relative_to(PANEL_DIR.resolve())
+        except (ValueError, OSError):
+            self.send_error(403)
+            return
+        if not path.is_file():
+            self.send_error(404)
+            return
+
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         self._PANEL_MIME.get(path.suffix.lower(), "application/octet-stream"))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

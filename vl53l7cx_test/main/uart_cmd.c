@@ -10,6 +10,7 @@
 #include "esp_log.h"
 
 #include "bone_mic.h"
+#include "vl53l7cx_test.h"
 
 static const char *TAG = "uart_cmd";
 
@@ -63,6 +64,15 @@ static void sensor_request(size_t idx, bool enable)
      * error, but "nothing happened" is worth seeing in the monitor. */
     ESP_LOGI(TAG, "SENS:%c=%d (%s)", (char)('A' + idx), enable ? 1 : 0,
              changed ? "queued" : "already in that state");
+
+    if (changed) {
+        /* CONTRACTS.md #1.1 "版本協商": the device re-sends $STATUS after
+         * every SENS/MEL/switch. Sent on the queued request rather than on
+         * the applied transition -- the ToF loop picks the request up within
+         * one 10 ms poll, and $STATUS only carries res/proto/fw, so it is a
+         * re-handshake, not a report of the sensor's new state. */
+        tof_print_status();
+    }
 }
 
 /* Strips leading and trailing whitespace in place (fgets keeps the '\n',
@@ -138,7 +148,22 @@ static void uart_cmd_task(void *arg)
         bool enable;
         int seconds = 0;
 
-        if (parse_sens(cmd, &idx, &enable)) {
+        if (strcmp(cmd, "PING") == 0) {
+            /* A09. $H goes out first and nothing is logged on this path:
+             * B05 aligns clocks against the t_us inside $H, so every byte
+             * emitted before it is latency folded into that measurement
+             * (an ESP_LOGI line is ~60 bytes ~= 1.3 ms at 460800 baud,
+             * against a 5 ms acceptance budget). CONTRACTS.md #1.1 also
+             * requires $STATUS be re-sent on PING -- that one is not
+             * timing-critical, so it follows.
+             *
+             * No priority queue for the lock: CONTRACTS.md #1.3 already
+             * tells the host that a PING response carries up to 2 ms of
+             * queueing delay and to use the minimum rather than the mean,
+             * which is cheaper than making uart_out_lock() preemptible. */
+            tof_print_heartbeat();
+            tof_print_status();
+        } else if (parse_sens(cmd, &idx, &enable)) {
             sensor_request(idx, enable);
         } else if (sscanf(cmd, "REC:%d", &seconds) == 1 && seconds > 0 && seconds <= 30) {
             ESP_LOGI(TAG, "recording request: %ds", seconds);

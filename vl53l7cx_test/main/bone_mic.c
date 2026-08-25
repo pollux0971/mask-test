@@ -2,16 +2,19 @@
 
 #include <inttypes.h>
 #include <math.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/i2s_pdm.h"
+#include "esp_dsp.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "mbedtls/base64.h"
 
+#include "mel_filterbank.h"
 #include "uart_out.h"
 
 static const char *TAG = "bone_mic";
@@ -165,6 +168,49 @@ void bone_mic_record_and_dump(uint32_t seconds)
     ESP_LOGI(TAG, "dump complete");
 }
 
+/* Periodic (non-symmetric) Hann window, precomputed once in mic_task()
+ * before the streaming loop starts -- CONTRACTS.md §3.1 window function,
+ * matches librosa.filters.get_window("hann", N, fftbins=True). */
+static float s_hann_window[MIC_FRAME_SAMPLES];
+
+/* FFT scratch (interleaved re/im) and the power spectrum derived from it.
+ * `static`, not stack-local: fft_probe.c's spike already established that
+ * a 4 KB FFT buffer doesn't belong on a task stack. Reused every frame. */
+static float s_fft_buf[MIC_FRAME_SAMPLES * 2];
+static float s_power[MEL_N_FFT_BINS];
+
+/* Hann -> FFT -> power spectrum -> sparse mel matmul -> log10 -> x100 int16,
+ * per CONTRACTS.md §3.1. `samples` must be exactly MIC_FRAME_SAMPLES long
+ * (already DC-blocked by the caller, same filtered signal that ends up in
+ * the recorded WAV dump, so a host-side reference run against that WAV
+ * lines up with what this function computes). */
+static void mic_compute_mel_frame(const int16_t *samples, int16_t out_m[MEL_N_FILTERS])
+{
+    for (int i = 0; i < MIC_FRAME_SAMPLES; i++) {
+        s_fft_buf[i * 2]     = (float)samples[i] * s_hann_window[i];
+        s_fft_buf[i * 2 + 1] = 0.0f;
+    }
+
+    dsps_fft2r_fc32(s_fft_buf, MIC_FRAME_SAMPLES);
+    dsps_bit_rev_fc32(s_fft_buf, MIC_FRAME_SAMPLES);
+
+    for (int k = 0; k < MEL_N_FFT_BINS; k++) {
+        float re = s_fft_buf[k * 2];
+        float im = s_fft_buf[k * 2 + 1];
+        s_power[k] = re * re + im * im;
+    }
+
+    for (int m = 0; m < MEL_N_FILTERS; m++) {
+        const mel_filter_t *f = &mel_filterbank[m];
+        float acc = 0.0f;
+        for (int j = 0; j < f->len; j++) {
+            acc += f->w[j] * s_power[f->start + j];
+        }
+        float log_mel = log10f(fmaxf(acc, 1e-10f));
+        out_m[m] = (int16_t)lroundf(log_mel * 100.0f);
+    }
+}
+
 static void mic_task(void *arg)
 {
     int16_t *buf = malloc(MIC_FRAME_SAMPLES * sizeof(int16_t));
@@ -175,6 +221,18 @@ static void mic_task(void *arg)
     }
     dc_blocker_t stream_filter = { 0 };
     uint32_t seq = 0;
+
+    for (int i = 0; i < MIC_FRAME_SAMPLES; i++) {
+        s_hann_window[i] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * i / MIC_FRAME_SAMPLES);
+    }
+
+    /* Initialized once for the life of this task (never deinit -- mic_task
+     * never returns); a failed init just disables $F output, $M keeps
+     * streaming regardless (see fft_ready below). */
+    bool fft_ready = (dsps_fft2r_init_fc32(NULL, MIC_FRAME_SAMPLES) == ESP_OK);
+    if (!fft_ready) {
+        ESP_LOGE(TAG, "dsps_fft2r_init_fc32 failed, $F output disabled");
+    }
 
     while (1) {
         uint32_t requested_seconds;
@@ -216,14 +274,44 @@ static void mic_task(void *arg)
          * magnitude to the lip-to-voice onset delay being measured. */
         int64_t t_start = t_end - (int64_t)n * 1000000 / MIC_SAMPLE_RATE_HZ;
 
+        /* $F needs a full MIC_FRAME_SAMPLES frame (fixed FFT length); a
+         * short read is treated like the failure case above -- no $F for
+         * this seq rather than feeding the FFT a partially-stale buffer. */
+        int16_t mel_out[MEL_N_FILTERS];
+        bool have_mel = false;
+        int64_t mel_us = 0;
+        if (fft_ready && n == MIC_FRAME_SAMPLES) {
+            int64_t t0 = esp_timer_get_time();
+            mic_compute_mel_frame(buf, mel_out);
+            mel_us = esp_timer_get_time() - t0;
+            have_mel = true;
+        }
+
         /* One compact line per ~32ms frame for the live monitor panel
          * (monitor/): plain printf, no ESP_LOG prefix, '$' sentinel so the
          * host bridge can pick it out cleanly. rms/peak are both i16 raw
-         * PCM amplitude per CONTRACTS.md 1.1 (protocol v2). */
+         * PCM amplitude per CONTRACTS.md 1.1 (protocol v2). $F shares this
+         * frame's seq/t_us with $M (CONTRACTS.md §1.1/A12), emitted under
+         * the same lock so the two lines can't be interleaved with output
+         * from another task. */
         uart_out_lock();
         printf("$M,%" PRIu32 ",%" PRId64 ",%d,%d\n", seq, t_start, (int16_t)lround(rms), peak);
+        if (have_mel) {
+            printf("$F,%" PRIu32 ",%" PRId64, seq, t_start);
+            for (int m = 0; m < MEL_N_FILTERS; m++) {
+                printf(",%d", mel_out[m]);
+            }
+            printf("\n");
+        }
         uart_out_unlock();
         seq++;
+
+        if (have_mel) {
+            /* A10's GO/NO-GO still needs an on-hardware number; this is
+             * where it'll come from once someone raises this tag's log
+             * level (ESP_LOGD is compiled in but filtered by default). */
+            ESP_LOGD(TAG, "mel frame fft+mel=%lld us", (long long)mel_us);
+        }
     }
 }
 

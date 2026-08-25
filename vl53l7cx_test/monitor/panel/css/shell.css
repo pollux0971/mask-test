@@ -1,0 +1,146 @@
+/* App shell: fixed-width sidebar + flexible main content area (C01).
+   Mode-switching, keyboard shortcuts, and collapse are C02 (js/shell.js);
+   mode routing / cross-mode state is C03; per-mode content is C05+. */
+
+.app-shell {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.sidebar {
+  flex: 0 0 var(--sidebar-width);
+  width: var(--sidebar-width);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  padding: 12px 0;
+  overflow-y: auto;
+  transition: flex-basis 150ms ease, width 150ms ease;
+}
+
+.sidebar.collapsed {
+  flex-basis: var(--sidebar-width-collapsed);
+  width: var(--sidebar-width-collapsed);
+}
+
+.sidebar.collapsed .mode-label,
+.sidebar.collapsed .mode-key {
+  display: none;
+}
+
+.sidebar.collapsed .mode-nav-item,
+.sidebar.collapsed .collapse-toggle {
+  justify-content: center;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.sidebar.collapsed .collapse-toggle .mode-icon {
+  transform: scaleX(-1); /* « -> » : points the other way once collapsed */
+}
+
+.mode-nav {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.mode-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 16px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mode-nav-item .mode-icon {
+  width: 1.4em;
+  text-align: center;
+  color: inherit;
+}
+
+.mode-nav-item .mode-label {
+  flex: 1;
+}
+
+.mode-nav-item .mode-key {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.mode-nav-item.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.collapse-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  margin-top: auto;
+  padding: 10px 16px;
+  border: none;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.collapse-toggle .mode-icon {
+  width: 1.4em;
+  text-align: center;
+  display: inline-block;
+}
+
+.collapse-toggle .mode-label {
+  flex: 1;
+}
+
+.collapse-toggle .mode-key {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.main-content {
+  flex: 1;
+  min-width: 0;
+  height: 100vh;
+  overflow: auto;
+  padding: 18px 20px 20px;
+}
+
+.mode-section {
+  display: none;
+  height: 100%;
+  flex-direction: column;
+  gap: 18px;
+  opacity: 1;
+}
+
+.mode-section.active {
+  display: flex;
+  transition: opacity 150ms ease;
+}
+
+/* Applied for one frame on activation, then removed by shell.js so the
+   browser animates opacity 0 -> 1 instead of snapping straight to visible. */
+.mode-section.active.fade-in {
+  opacity: 0;
+}

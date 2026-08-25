@@ -1,0 +1,36 @@
+/* Design tokens — moved verbatim from the old single-file panel.html :root
+   block (C01). Values must not change here; that's C25's job. */
+:root {
+  --bg: #0b0e0c;
+  --surface: #141915;
+  --surface-2: #1b211c;
+  --border: #262c27;
+  --text: #e7ece8;
+  --text-dim: #8b968e;
+  --accent: #e8a33d;
+  --accent-soft: rgba(232, 163, 61, 0.16);
+  --warn: #e2574c;
+  --warn-soft: rgba(226, 87, 76, 0.16);
+  --good: #5fbf7a;
+  --cell-near: #17495a;
+  --cell-far: #dfe7e2;
+  --cell-invalid: #22271f;
+
+  --sidebar-width: 200px;
+  --sidebar-width-collapsed: 56px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+}
+
+.mono {
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
