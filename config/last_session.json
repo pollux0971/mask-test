@@ -1,0 +1,15 @@
+{
+  "session_id": "2026-08-26_S01",
+  "subject": "s01",
+  "wear_id": 12,
+  "mode": "quiz",
+  "distance_mm": 30.0,
+  "angle_deg": 0.0,
+  "ambient": "quiet room",
+  "notes": "",
+  "started_at": "2026-08-26T07:45:51.007383",
+  "warnings": [],
+  "target_check": "not_configured",
+  "note": "目標幾何未設定（config/session_targets.json），待 E01 量測",
+  "baseline_done": false
+}

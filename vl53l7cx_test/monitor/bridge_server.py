@@ -65,8 +65,17 @@ from host.capture.protocol import ProtocolParser          # noqa: E402
 from host.capture.dropwatch import DropTracker, tof_stream  # noqa: E402
 from host.clock.align import ClockAligner                 # noqa: E402
 from host.quality.metrics import QualityAggregator, ThresholdTable  # noqa: E402
+from host.align.aligner import Aligner                              # noqa: E402
+from host.storage.session_registry import (                         # noqa: E402
+    SessionRegistry, MissingFieldsError, SessionAlreadyActiveError, NoActiveSessionError,
+)
+from host.storage.baseline import capture_baseline_trial            # noqa: E402
 
 THRESHOLDS_PATH = ROOT_DIR / "config" / "quality_thresholds.json"
+LAST_SESSION_PATH = ROOT_DIR / "config" / "last_session.json"
+#: Fitted PCA models for GET /pca. Nothing writes here yet -- the endpoint
+#: reports "no model" rather than inventing one (see _handle_pca).
+MODELS_DIR = ROOT_DIR / "models"
 
 # Imported lazily: mel_pipeline pulls in librosa, which is a heavy optional
 # dependency. The bridge's core job -- serving the panel and relaying $-lines
@@ -222,6 +231,24 @@ def observe_for_quality(event):
     """Feed one parsed event to the drop tracker and the quality metrics."""
     kind = event.get("type")
     seq = event.get("seq")
+    if kind in ("tof", "mic", "mel"):
+        # One shared buffer: B10's baseline reads the last 30 s of it, and
+        # B11's trial machine reads the capture window out of the same
+        # history. Fed unconditionally so both are already populated when
+        # their request arrives.
+        t_us = event.get("t_us")
+        if t_us is not None:
+            device_clock["last_t_us"] = t_us
+        try:
+            session_aligner.push_event(event)
+        except Exception as exc:
+            print(f"[bridge] aligner rejected a {kind} event: {exc}")
+        trial = session_runtime.get("trial")
+        if trial is not None:
+            try:
+                trial.push_event(event)
+            except Exception as exc:
+                print(f"[bridge] trial machine rejected a {kind} event: {exc}")
     if kind == "tof":
         if seq is not None:
             drop_tracker.observe(tof_stream(event["sensor"]), seq)
@@ -258,6 +285,235 @@ def quality_emitter(interval=1.0):
             broadcaster.publish(quality.snapshot())
         except Exception as exc:  # never let a metric bug kill the stream
             print(f"[bridge] quality snapshot failed: {exc}")
+
+
+def _json_safe(obj):
+    """Replace NaN/Inf with None, recursively.
+
+    json.dumps emits the bare literals NaN / Infinity by default, which are
+    not valid JSON and make the browser's JSON.parse throw -- one such value
+    anywhere in an event kills the whole SSE message.
+
+    None is the right substitute rather than 0.0: a baseline zone with no
+    signal has a NaN mean, and rendering that as zero would show a stable
+    sensor reading where there is none. The zone flag arrays
+    (no_signal_zones and friends) stay authoritative about which is which.
+    """
+    if isinstance(obj, float):
+        return None if (obj != obj or obj in (float("inf"), float("-inf"))) else obj
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+# --- B09 / B10: session lifecycle -----------------------------------------
+
+session_registry = SessionRegistry(LAST_SESSION_PATH)
+
+# Fed from the serial reader for the whole life of the process, not just
+# while a session is open: B10's baseline is computed from the 30 seconds
+# *before* the operator presses the button, so the history has to already be
+# there when the request arrives.
+session_aligner = Aligner()
+
+# Everything a running session owns beyond its metadata. `writer` stays open
+# for the session's lifetime; see the note in _handle_baseline about why the
+# baseline has to create it.
+session_runtime = {"baseline": None, "h5_path": None, "writer": None, "trial": None}
+session_lock = threading.Lock()
+
+# Newest device timestamp seen on any stream. The trial machine needs a
+# device-clock reading to mark capture boundaries (CONTRACTS #1.3 puts trial
+# edges on device time), and the baseline needs one to know where "the last
+# 30 seconds" ends. Host time will not do: the two clocks drift, which is
+# the whole reason B04 exists.
+device_clock = {"last_t_us": None}
+
+
+def sessions_dir():
+    d = ROOT_DIR / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _frames_to_tof(frames, values_attr, present_attr):
+    """AlignedFrame list -> (values (T,32), valid (T,16)) for B10.
+
+    A frame with no reading for that sensor becomes all-NaN with every zone
+    invalid, rather than being dropped: the baseline's zone statistics are
+    per-zone over a fixed time window, so silently shortening the window for
+    one sensor would make the two sensors' numbers incomparable.
+    """
+    values, valid = [], []
+    for f in frames:
+        sample = getattr(f, values_attr)
+        if getattr(f, present_attr) and sample is not None:
+            # TofSample.values is already the 32-wide schema layout, with
+            # None in the invalid slots -- NaN is the HDF5 spelling of the
+            # same thing (CONTRACTS #2), so the two agree on "no reading".
+            values.append([float("nan") if v is None else float(v) for v in sample.values])
+            valid.append([bool(v) for v in sample.valid])
+        else:
+            values.append([float("nan")] * 32)
+            valid.append([False] * 16)
+    return (np.array(values, dtype=np.float32).reshape(len(frames), 32),
+            np.array(valid, dtype=bool).reshape(len(frames), 16))
+
+
+def _baseline_payload(outcome, source):
+    """BaselineOutcome -> the shape C06 draws from.
+
+    The three zone-flag arrays are the authoritative answer to "why is this
+    zone not usable", because the statistics themselves cannot carry that:
+    a no-signal zone has a NaN mean, which crosses the wire as null. Null
+    means "no number", not "zero" -- the panel renders those zones as N/A
+    rather than as a perfectly stable 0.0 mm reading.
+    """
+    d = outcome.to_dict()
+    quality = d.get("quality") or {}
+    merged = {}
+    for key in ("unstable_zones", "no_signal_zones", "suspect_zero_variance_zones"):
+        # Zone indices are per-sensor 0..15, so they are reported per sensor
+        # as well as merged -- a flat union would say "zone 3 is bad" without
+        # saying which sensor's zone 3.
+        merged[key] = {side: list((quality.get(side) or {}).get(key, []))
+                       for side in ("A", "B")}
+    return {
+        "source": source,
+        "ok": d["ok"],
+        "reason": d["reason"],
+        "captured_at_us": outcome_capture_time(outcome),
+        "mu_A": d["baseline_mu_A"], "sigma_A": d["baseline_sigma_A"],
+        "mu_B": d["baseline_mu_B"], "sigma_B": d["baseline_sigma_B"],
+        "noise_floor_mu": d["noise_floor_mu"],
+        "noise_floor_sigma": d["noise_floor_sigma"],
+        "valid_zone_ratio": d["valid_zone_ratio"],
+        "quality": quality,
+        **merged,
+    }
+
+
+def outcome_capture_time(outcome):
+    return getattr(outcome, "captured_at_us", None)
+
+
+def capture_session_baseline(info, seconds):
+    """Run B10's baseline over the last `seconds` of buffered device data.
+
+    Returns ``(outcome, error)``; exactly one is None.
+    """
+    latest = device_clock["last_t_us"]
+    if latest is None:
+        frames = []
+    else:
+        frames = list(session_aligner.frames(latest - int(seconds * 1e6), latest))
+    if len(frames) < 2:
+        return None, (f"緩衝區裡沒有足夠的裝置資料（收到 {len(frames)} 幀）。"
+                      f"確認鏈路是 up 的，並讓它先跑滿 {seconds} 秒。")
+
+    tof_A, valid_A = _frames_to_tof(frames, "tof_A", "tof_A_present")
+    tof_B, valid_B = _frames_to_tof(frames, "tof_B", "tof_B_present")
+    tof_t_us = np.array([f.t_us for f in frames], dtype=np.int64)
+
+    mic = [f for f in frames if f.mic_present and f.mic_rms is not None]
+    if mic:
+        mic_rms = np.array([f.mic_rms for f in mic], dtype=np.float32)
+        mic_peak = np.array([int(f.mic_peak or 0) for f in mic], dtype=np.int16)
+        mic_t_us = np.array([f.t_us for f in mic], dtype=np.int64)
+    else:
+        mic_rms = np.zeros(1, dtype=np.float32)
+        mic_peak = np.zeros(1, dtype=np.int16)
+        mic_t_us = tof_t_us[:1]
+
+    meta_base = build_session_meta_base(info, tof_t_us)
+    h5_path = session_runtime["h5_path"]
+    try:
+        outcome = capture_baseline_trial(
+            h5_path, meta_base,
+            tof_A=tof_A, tof_B=tof_B, tof_t_us=tof_t_us,
+            tof_valid_A=valid_A, tof_valid_B=valid_B,
+            mic_rms=mic_rms, mic_peak=mic_peak, mic_t_us=mic_t_us,
+            wear_id=info.wear_id, mode=info.mode,
+        )
+    except Exception as exc:
+        return None, f"baseline 擷取失敗: {exc}"
+
+    outcome.captured_at_us = int(tof_t_us[-1])
+    with session_lock:
+        session_runtime["baseline"] = outcome
+    return outcome, None
+
+
+def build_session_meta_base(info, tof_t_us):
+    """The `/meta` fields that are known at session start (CONTRACTS #2).
+
+    The clock block comes from the live alignment fit rather than being
+    stubbed: those values are what makes a recorded session verifiable
+    later, so a session recorded before the fit has converged is marked
+    `clock_sync_confirmed: False` instead of carrying plausible-looking
+    numbers nobody checked.
+    """
+    fit = None
+    if clock_aligner.n_buckets >= 3:
+        try:
+            fit = clock_aligner.fit()
+        except Exception:
+            fit = None
+    parser = protocol_state.get("parser")
+    state = parser.state() if parser is not None else {}
+    return {
+        "schema_version": 1,
+        "subject": info.subject,
+        "session_date": info.started_at[:10],
+        "wear_id": info.wear_id,
+        "mode": info.mode,
+        "distance_mm": info.distance_mm,
+        "angle_deg": info.angle_deg,
+        "ambient": info.ambient,
+        "notes": info.notes,
+        "fw_sha": state.get("fw") or "unknown",
+        "proto_version": state.get("protocol_version") or 2,
+        "tof_dim": current_resolution["dim"],
+        "clock_slope": fit.slope if fit else 1.0,
+        "clock_offset": fit.offset_us if fit else 0.0,
+        "clock_residual_p95": fit.residual_p95_us if fit else -1.0,
+        "clock_drift_us": 0.0,
+        "clock_drift_ppm": 0.0,
+        "clock_sync_span_us": 0,
+        "clock_sync_confirmed": bool(fit is not None and not getattr(fit, "anomaly", False)),
+        "session_start_device_us": int(tof_t_us[0]),
+        "session_start_host_us": int(time.time() * 1e6),
+        "session_start_rtt_min_us": -1,
+    }
+
+
+def load_pca_model(source):
+    """Load a fitted PCA model for C10, or None if none has been saved.
+
+    Nothing in the pipeline writes these yet. Returning None (-> 204) rather
+    than fitting one here on the fly is deliberate: C10 clears its trajectory
+    only when `source`/`dims` change, so a model silently refitted on a
+    rolling window would keep the same label while rotating the axes
+    underneath the points already plotted.
+    """
+    path = MODELS_DIR / f"pca_{source}.joblib"
+    if not path.is_file():
+        return None
+    try:
+        import joblib
+        model = joblib.load(path)
+        return {
+            "source": source,
+            "dims": int(model.mean_.shape[0]),
+            "mean": [float(v) for v in model.mean_],
+            "components": [[float(v) for v in row] for row in model.components_],
+            "explainedVarianceRatio": [float(v) for v in model.explained_variance_ratio_],
+        }
+    except Exception as exc:
+        print(f"[bridge] could not load {path}: {exc}")
+        return None
 
 
 # --- B09 / B11 seams -------------------------------------------------------
@@ -520,8 +776,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # keep stdout clean; the important stuff comes from the [bridge] prints
 
+    # -- small helpers shared by the JSON endpoints ----------------------
+
+    def _send_json(self, code, payload=None):
+        body = b"" if payload is None else json.dumps(
+            _json_safe(payload), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        self.send_response(code)
+        if body:
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _read_json_body(self):
+        """Returns the parsed body, or None after already sending a 400."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length else b""
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._send_json(400, {"error": f"body 不是合法的 JSON: {exc}"})
+            return None
+        if not isinstance(parsed, dict):
+            self._send_json(400, {"error": "body 必須是 JSON 物件"})
+            return None
+        return parsed
+
     def do_GET(self):
-        if self.path == "/" or self.path.startswith("/panel/"):
+        if self.path.startswith("/session/current"):
+            self._handle_session_current()
+        elif self.path.startswith("/session/prefill"):
+            self._send_json(200, session_registry.get_prefill())
+        elif self.path.startswith("/baseline"):
+            self._handle_get_baseline()
+        elif self.path.startswith("/pca"):
+            self._handle_pca()
+        elif self.path == "/" or self.path.startswith("/panel/"):
             self._serve_panel_asset()
         elif self.path == "/panel.html":
             # Legacy single-file panel, kept as the E08 fallback demo path.
@@ -538,8 +834,125 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_switch()
         elif self.path.startswith("/record"):
             self._handle_record()
+        elif self.path.startswith("/session/start"):
+            self._handle_session_start()
+        elif self.path.startswith("/session/end"):
+            self._handle_session_end()
+        elif self.path.startswith("/session/baseline"):
+            self._handle_session_baseline()
         else:
             self.send_error(404)
+
+    # -- B09: session lifecycle -----------------------------------------
+
+    def _handle_session_start(self):
+        metadata = self._read_json_body()
+        if metadata is None:
+            return
+        try:
+            info = session_registry.start(metadata)
+        except MissingFieldsError as exc:
+            # 400 with the field names, not just "bad request": the form on
+            # the other end wants to highlight exactly which inputs to fix.
+            self._send_json(400, {"error": str(exc), "missing": exc.fields})
+            return
+        except SessionAlreadyActiveError as exc:
+            self._send_json(409, {"error": str(exc), "session_id": exc.session_id})
+            return
+
+        with session_lock:
+            session_runtime.update(baseline=None, trial=None,
+                                   h5_path=sessions_dir() / f"{info.session_id}.h5",
+                                   writer=None)
+        publish_session_state("started", session=info.to_dict())
+        self._send_json(200, info.to_dict())
+
+    def _handle_session_end(self):
+        try:
+            info = session_registry.end()
+        except NoActiveSessionError as exc:
+            # 409, matching start's "the session state is not what you think
+            # it is" case. CONTRACTS #4.1.1 leaves this code to B19; using
+            # the same one for both directions keeps the panel's handling
+            # symmetric instead of making it learn two conventions.
+            self._send_json(409, {"error": str(exc)})
+            return
+        with session_lock:
+            writer = session_runtime.get("writer")
+            session_runtime.update(trial=None, writer=None)
+        if writer is not None:
+            try:
+                writer.__exit__(None, None, None)
+            except Exception as exc:
+                print(f"[bridge] closing the session writer failed: {exc}")
+        publish_session_state("ended", session=info.to_dict())
+        self._send_json(200, info.to_dict())
+
+    def _handle_session_current(self):
+        info = session_registry.current
+        if info is None:
+            self._send_json(204)      # CONTRACTS #4.1.1
+            return
+        self._send_json(200, info.to_dict())
+
+    # -- B10: baseline ---------------------------------------------------
+
+    def _handle_session_baseline(self):
+        """Capture the 30 s baseline that every session must start with."""
+        info = session_registry.current
+        if info is None:
+            self._send_json(409, {"error": "沒有進行中的 session，不能擷取 baseline"})
+            return
+
+        m = re.search(r"seconds=(\d+)", self.path)
+        seconds = max(1, min(120, int(m.group(1)) if m else 30))
+
+        outcome, err = capture_session_baseline(info, seconds)
+        if err is not None:
+            self._send_json(409, {"error": err})
+            return
+
+        payload = _baseline_payload(outcome, source="session")
+        if not outcome.ok:
+            # Quality gate failed: nothing was written and baseline_done
+            # stays false, so trials remain blocked. The operator is meant
+            # to fix the fit and try again -- reporting "done" here would
+            # let a whole session be recorded against a baseline the code
+            # already knows is untrustworthy.
+            self._send_json(422, payload)
+            return
+
+        session_registry.mark_baseline_recorded()
+        publish_session_state("baseline", session=session_registry.current.to_dict(),
+                              progress={"baseline_seconds": seconds})
+        broadcaster.publish({"type": "baseline", **payload})
+        self._send_json(200, payload)
+
+    def _handle_get_baseline(self):
+        """C06 reads this to draw the per-zone baseline overlay."""
+        with session_lock:
+            outcome = session_runtime.get("baseline")
+        if outcome is None:
+            self._send_json(204)
+            return
+        self._send_json(200, _baseline_payload(outcome, source="session"))
+
+    # -- C10: PCA model ---------------------------------------------------
+
+    def _handle_pca(self):
+        m = re.search(r"model=([A-Za-z_]+)", self.path)
+        source = m.group(1) if m else "tof_only"
+        if source not in ("tof_only", "enrollment"):
+            self._send_json(400, {"error": "model 必須是 tof_only 或 enrollment"})
+            return
+        payload = load_pca_model(source)
+        if payload is None:
+            # 204, not a stub: C10 keeps its own placeholder and retries
+            # every 10 s, and a fabricated model would look like a real one
+            # while putting the trace on axes that mean nothing.
+            self._send_json(204)
+            return
+        self._send_json(200, payload)
 
     def _serve_voice_file(self):
         # basename only: no path traversal out of VOICE_DIR via ../

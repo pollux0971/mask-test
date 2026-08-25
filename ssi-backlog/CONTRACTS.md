@@ -24,6 +24,7 @@
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.3 `TriResult` 的 `theta_reject` 拆成 `theta_reject_tof` / `theta_reject_mel` 兩個獨立欄位。原因：兩模態的原始距離尺度與 `_reject` 樣板距離分布都不同，共用一個閾值必有一邊校準不準，而且失準會安靜地表現為「全部拒識」或「完全不拒識」（`D07` 實作時發現） | `D06`, `D07`, `D09`, `C17`, `C18` | 是 |
 | 2026-08-26 | 1. 序列埠協定 v2 | §1.1.2 `$STATUS` 補 `amb=<0|1>` 欄位，與既有的 `mel=` 對稱。原因：`A16` 加了 `AMB:<0|1>` 開關，但主機端沒有任何方式查詢它目前的狀態——`B18` 的控制端點與 `C04` 狀態列都需要。缺欄位時主機端一律回 `None`（§1.1.2） | `A16`, `B01`, `B18`, `C04` | 是 |
 | 2026-08-26 | 1 + 2 | 新增 §1.1.3 `$A` ambient 幀（第五條獨立串流）與 §1.2 的 `AMB:<0|1>` 指令，HDF5 對應 `tof_ambient_A/B (Ta,16)` + `tof_ambient_t_us (Ta,)`。原因：`D10` 明訂 `ambient_per_spad` 是 crosstalk 最靈敏的指標，但該欄位從韌體到 schema **整條管線都不存在**。設計成獨立行 + 預設關閉 + 1 Hz，而非塞進 `$T`：ambient 變化慢，塞進 `$T` 每幀會讓 8×8 多約 190 bytes/行，而 §1.4 顯示 8×8 開 Mel 已達 70%。韌體實作見新增的 `A16` | `A16`, `B01`, `B07`, `D10`, `E02` | 是 |
+| 2026-08-26 | 2. HDF5 Session Schema | `/trial_NNN` attrs 新增 `speaking_mode`（`normal`/`whisper`/`silent`）與 `vad_confidence`。原因：`B15` 實作時發現契約的 `mode` 是 session／面板模式（`quiz` 之類），**完全沒有定義說話模式**，而 `D13`/`D17` 的「三種 mode 各跑一組」分析依賴它。共用一個欄位會讓 `"quiz"` 與 `"whisper"` 混在一起 | `B07`, `B11`, `B15`, `B16`, `D13`, `D17` | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | `mel` 的時間軸由 `(M, 40)` 改為 **`(F, 40)`**，並新增成對的 `mel_t_us (F,) int64`。原因：`A14` 之後 `$F` 62.5 Hz、`$M` 31.25 Hz，兩者幀數不相等（§1.1.1），原 schema 是 §1.1.1 凍結**之前**的假設。`B11` 實作時撞到 `session_writer.py` 的「mel 幀數必須等於 mic_t_us 長度」檢查才發現。**寫入端必須移除該檢查**，且不可用內插把 mic 湊到 mel 網格（那是捏造未量測的數值） | `B07`, `B11`, `B17`, `D02`, `D03` | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | `/meta` 新增時鐘漂移欄位：`clock_drift_us` / `clock_drift_ppm` / `clock_sync_span_us` / `clock_sync_confirmed`，以及 session 首尾各三個校時欄位（`device_us` / `host_us` / `rtt_min_us`，重算漂移所需的最小集合）。原因：`B05` 的驗收要求「漂移量寫進 metadata」，但 §2 凍結時沒有任何漂移欄位。註：兩點法漂移（`B05`）與回歸法 slope（`B04`）互為獨立檢查，`B07` 寫入時應比對，差太多要標 quality | `B04`, `B05`, `B07`, `D12` | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | §2.2 補充：`n_frames` 明訂為 **ToF 幀數**（`tof_A.shape[0]`，即 `T`），因為 ToF 與麥克風長度不同而原欄位名沒指明（`B08` 實作時才發現）；`session_path` 明訂為「相對於某個 `root`」，且增量與重建必須用同一個 `root` | `B08`, `B19`, `D12` | 是 |
@@ -44,6 +45,8 @@
 | 2026-08-26 | 3. 特徵向量規格 | B14 補上 3.1 遺漏的 `STFT center=False` 決定（T03 當時已在 `reference_mel.py` 實作但正文沒寫進去）；並新增 `tools/compare_mel.py`（B14 產出，B 軌維護，`tools/OWNER.md` 已加註） | A11, A12, D, T03 | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | B09：補上 §4.1.1 `session/start`\|`end`\|`current`\|`prefill` 的請求/回應形狀；新增 `GET /session/prefill`（原表沒有預填的端點）。目標配戴幾何（`target_distance_mm`/`target_angle_deg`）在 `config/session_targets.json`（新增，`E01` 量測前一律 `null`）未設定時，`target_check` 回 `"not_configured"` 且 `warnings` 為空——不捏造沒有依據的偏離警告 | B18, B19, C11, D09, D12, E01 | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | `host/storage/session_writer.py` 同步到最新 schema（B05/B11 追加的欄位落地）：①`REQUIRED_META_KEYS` 補時鐘漂移七欄位，`session_end_*` 三欄位改由新方法 `SessionWriter.finalize_session_end()` 於 session 結束時補寫，不列入建構必填；②`write_trial()` 移除「`mel` 幀數必須等於 `mic_t_us` 長度」的錯誤檢查，改收 `mel_t_us` 參數、與 `mel` 成對驗證；③新增 `tof_ambient_A`/`tof_ambient_B`/`tof_ambient_t_us` 三選填參數，全有或全無，各自時間軸，無效填 NaN；④新增 `/meta` 的 `clock_cross_check_ppm_diff`/`clock_cross_check_ok`（本輪新增的欄位名，見上方 §2 說明），實作 B05 交叉檢查建議，門檻沿用 `host/clock/align.py` 的 `SLOPE_TOLERANCE_PPM`（±200ppm） | B05, B07, B11, B19, D, T02 | 是 |
+| 2026-08-26 | 4. HTTP / SSE 介面 | B18：補上 §4.1.2 裝置控制端點形狀（`SENS`/`MEL`/`AMB` 執行期指令 vs `/switch` 重燒狀態機的區分、`flashing` 中三者一致回 409、`/device/state` 回應形狀）；端點表新增 `POST /ambient?on=0`（`A16` 對應，原表沒有）。明訂 `sensor_a_enabled`/`sensor_b_enabled` 是主機端記錄的上次指令而非裝置確認狀態（`$STATUS` 沒有 `sens_a=`/`sens_b=` 自我描述欄位），`sensor_state_confirmed` 欄位標出這個落差 | B19, C04, C22 | 是 |
+| 2026-08-26 | 4. HTTP / SSE 介面 | D09：§4.3 的 JSON 範例補上前一輪（D07）已在文字說明但沒改到範例本身的 `theta_reject_tof`/`theta_reject_mel`（範例仍寫舊的單一 `theta_reject`，跟上面的文字說明不一致）；新增 `dist_method` 欄位（記錄該次辨識實際用的距離函式，`D09` 預設 `"cosine"`——批次餘弦 0.147ms vs DTW 8-12ms，且 `D05` 合成資料 LOOCV 顯示 DTW 較差，`E05` 後應複驗）；`latency_ms` 的鍵從寫死的 `"dtw"` 改成 `"dist"`（距離函式可換，鍵名不該綁死一種） | D07, D09, C16, C17, C18 | 是 |
 
 ---
 
@@ -363,6 +366,8 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
     audio_t0_us         int64
   (attrs)
     label, trial_idx, wear_id, mode,
+    speaking_mode,          # normal|whisper|silent —— 與上面的 mode 是兩條不同的軸
+    vad_confidence,         # f32，B15 的端點偵測信心度；silent 模式為 None
     valid_zone_ratio, drop_count,
     vad_start_us, vad_end_us, lip_onset_us, voice_onset_us,
     quality ∈ {ok, low, rejected}
@@ -407,6 +412,16 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
 > trial 的 `quality`——兩個獨立方法對不上是「這個 session 的時鐘可疑，
 > 下游該知道」的訊號，不是「這筆資料一定是錯的」，是否要因此下修
 > quality 由讀取端（`D` 軌／`B19` 儀表板）決定。
+
+> **`mode` 與 `speaking_mode` 是兩條不同的軸，不可共用一個欄位。**
+> - `mode`：**session／面板模式**（`quiz`、`record`…），關於**流程**
+> - `speaking_mode`：**說話模式**（`normal` / `whisper` / `silent`），關於**受試者**
+>
+> `B15` 實作時發現契約完全沒有定義後者。讓 `"quiz"` 與 `"whisper"` 出現在同一個
+> 欄位會讓 `D13`/`D17` 的「三種 mode 各跑一組」分析無法正確分群。
+>
+> ⚠️ **沒有 `speaking_mode` 就分不出「一筆漏偵是因為人沒出聲，還是門檻設錯」**——
+> 那是 `E05` 之後回頭 debug 時唯一的線索。
 
 ### 2.1 兩個不可妥協的設計決定
 
@@ -516,9 +531,10 @@ log         log10(max(power, 1e-10))
 | GET | `/` | `C01` | panel 靜態檔 |
 | GET | `/events` | 既有 | SSE 事件流 |
 | POST | `/record?seconds=N` | 既有 | 錄音 |
-| POST | `/switch?res=4\|8` | 既有 | 切解析度（重燒錄） |
-| POST | `/sensor?id=A&on=0` | `B18` | 感測器開關 |
-| POST | `/mel?on=0` | `B18` | Mel 串流開關 |
+| POST | `/switch?res=4\|8` | `B18` | 切解析度（重燒，非執行期） |
+| POST | `/sensor?id=A&on=0` | `B18` | 感測器開關（執行期，立即生效） |
+| POST | `/mel?on=0` | `B18` | Mel 串流開關（執行期，立即生效） |
+| POST | `/ambient?on=0` | `B18` | Ambient 串流開關（`A16`，執行期，立即生效） |
 | GET | `/device/state` | `B18` | 裝置目前狀態 |
 | POST | `/session/start` | `B09` | 開始 session |
 | POST | `/session/end` | `B09` | 結束 session |
@@ -585,6 +601,57 @@ HTTP wiring（`B19`）要對應的形狀，例外型別已經對好該轉成哪�
 
 （`wear_id` 已經 +1；其餘欄位原封不動來自 `config/last_session.json`。）
 沒有歷史紀錄（第一次用）就回 `{}`。
+
+#### 4.1.2 裝置控制（`B18`）
+
+邏輯層是 `host/control/`：`commands.py`（指令字串組裝，§1.2 是唯一事實
+來源，不要在別處重拼字串）、`resolution.py`（`ResolutionController` 狀態
+機）、`device_state.py`（`build_device_state()`）。HTTP wiring 一樣是
+`B19` 的事。
+
+**`SENS`/`MEL`/`AMB` 是同一類：執行期指令，立即生效，跟 `/switch` 完全
+不同。** `POST /sensor?id=A&on=0`、`POST /mel?on=0`、`POST /ambient?on=0`
+都直接 `serial_write_lock` + `ser.write()`，成功就回 202（跟既有
+`/record` 一樣，不用等裝置確認——確認靠下一行 `$STATUS`／SSE）。
+`flashing.is_set()`（`ResolutionController.is_busy`）時三者跟 `/switch`
+一樣回 **409**：燒錄期間序列埠被 build/flash 子行程獨占，寫指令沒有意義。
+
+**`POST /switch?res=4|8` 是重燒，不是執行期指令。** ULD 驅動的 grid size
+不能執行期切換——`bridge_server.py` 現有的 `do_switch_resolution()` 已經
+是這個流程（editing → building → flashing → done|error），`B18` 只是把它
+包成明確的狀態機（`ResolutionController`）供 `/device/state` 查詢進度，
+沒有改變既有的 202 立即回應 + 之後用 SSE `flash` 事件通知結果這個模式。
+
+> **⚠ 重燒期間 `$STATUS` 會重新出現、`seq` 會歸零**（§1.3：`seq` 以
+> `$STATUS` 為 session 邊界）。`B03` 的掉幀偵測看到 `seq` 倒退判定
+> 「重開機」是對的行為，但前端／`C04` 不該把它顯示成故障——`resolution_change_in_progress`
+> 為真時看到 `seq` 歸零，代表的是「重燒中，預期行為」，用這個旗標抑制
+> 誤判，不要另外發明一套判斷。
+
+**`GET /device/state`** 回：
+
+```json
+{"resolution": 8, "proto_version": 2, "fw_sha": "a1b2c3d",
+ "mel_enabled": true, "ambient_enabled": false,
+ "sensor_a_enabled": true, "sensor_b_enabled": true,
+ "sensor_state_confirmed": false,
+ "resolution_change_in_progress": false, "resolution_change_state": "idle"}
+```
+
+> **⚠ `sensor_a_enabled`/`sensor_b_enabled` 是主機端記的「上次送出的
+> `SENS` 指令」，不是裝置確認過的狀態。** `$STATUS` 有 `mel=`/`amb=`
+> 自我描述欄位（§1.1.2），但**沒有**對應的 `sens_a=`/`sens_b=`——裝置
+> 收到 `SENS` 只會重發 `$STATUS`，不會在裡面說「A 現在是關的」。
+> `sensor_state_confirmed: false` 就是把這個落差明講出來，避免前端把
+> 五個欄位當成同等可信。若之後想讓它變 `true`，韌體端要在 `$STATUS`
+> 補 `sens_a=<0|1>`/`sens_b=<0|1>`——這是本 story 發現、還沒決定要不要做
+> 的事，見完成回報「CONTRACTS.md 的疑問」。
+
+`ambient_enabled` 目前恆為 `null`：`host/capture/protocol.py` 的
+`_parse_status()` 還沒解析 `$STATUS` 的 `amb=` 欄位（只有
+`sr`/`mel`/`mel_win`/`mel_hop`/`mic_hop` 五個，§1.1.2 的 `amb=` 是後來才
+加的）。`build_device_state()` 已經在讀 `event.get("amb")`，`protocol.py`
+補上解析後這裡不用改。
 
 ### 4.2 SSE 事件型別
 
@@ -678,9 +745,19 @@ bridge 每秒比一次 mtime，**改完存檔即時生效，不需重啟**。
  "d_tof": [2.1, 0.3, 1.8, ...],
  "d_mel": [1.9, 1.1, 2.4, ...],
  "reject_tof": false, "reject_mel": false,
- "tau": 0.5, "theta_reject": 3.2,
- "latency_ms": {"feature": 12, "dtw": 47, "total": 61}}
+ "tau": 0.5, "theta_reject_tof": 3.2, "theta_reject_mel": 1.7,
+ "dist_method": "cosine",
+ "latency_ms": {"feature": 12, "dist": 1.0, "total": 13}}
 ```
+
+> **`dist_method` 記錄這次辨識實際用的距離函式（`"cosine"` 或 `"dtw"`）。**
+> `D09` 預設 `"cosine"`：批次餘弦實測 0.147 ms，DTW 實測 8-12 ms，量級差
+> 兩個數量級；而且 `D05` 的合成資料 LOOCV 顯示 DTW 準確率反而較差
+> （56.2% vs 37.5%）。沒有證據支持 DTW 更準時，選較快的當預設對 Demo
+> 反應速度更有利，`E05` 真實資料齊全後應該重新驗證。
+>
+> `latency_ms` 的 `"dist"` 鍵取代原本寫死的 `"dtw"`——距離函式本身可換
+> （cosine 或 dtw），鍵名不應該綁死其中一種。
 
 > **回傳的是正規化後的距離向量，不是分數。**
 > 前端拿到就能自己算任意 `w` 的融合結果——這是 `C17` 滑桿

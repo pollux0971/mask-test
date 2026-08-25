@@ -22,6 +22,16 @@
 **D06 的發現在這裡是一等公民**：`_reject` 樣板數與詞類別樣板數的比例
 會系統性影響 `theta_reject` 校準的鬆緊（樣板越多、LOO 最近距離的期望值
 越小），`calibrate_reject_threshold()` 會在比例失衡時明確警告方向。
+
+**D09 的後續發現：這個偏差在高維度、多幀（真實 104 維 x T=24）下會被
+放大。** 用 D06 原本驗證過的樣板數比例（word:reject 約 1:1，20~30 筆）
+在低維度（12 維、T=3）下誤拒率能壓到個位數百分比，但同樣比例換到
+104 維 x T=24（真實系統的實際規模）時，誤拒率可能逼近 100%——
+需要把 word 類別的樣板數拉高到 50 筆以上才能穩定壓低誤拒率
+（見 `analysis/similarity/test_recognition_service.py` 的
+`test_reject_tof_still_works_at_w1_after_full_service_wiring` 註解）。
+`E04`/`E05` 規劃真實 enrollment 錄製次數時，這個「高維度需要更多樣板」
+的效應要一併考慮，不能只沿用低維度合成測試調出來的比例。
 """
 from pathlib import Path
 

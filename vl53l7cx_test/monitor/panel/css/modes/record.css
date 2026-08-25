@@ -1,2 +1,256 @@
-/* record mode styles — owned by the story that builds this mode
-   (see ssi-backlog/README.md track C). Empty shell from C01. */
+/* record mode (C11): session setup form + forced baseline capture screen.
+   See js/modes/record.js for the state machine and backend-wiring notes. */
+
+#mode-record {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+#mode-record .section-label {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+
+#mode-record .record-mode {
+  max-width: 560px;
+}
+
+#mode-record .field {
+  display: block;
+  margin-bottom: 14px;
+}
+
+#mode-record .field > span {
+  display: block;
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+#mode-record .required {
+  color: var(--warn);
+}
+
+#mode-record input[type="text"],
+#mode-record input[type="number"] {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 14px;
+}
+
+#mode-record input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+#mode-record .wear-toggle {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+#mode-record .wear-btn {
+  flex: 1;
+  padding: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+#mode-record .wear-btn.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+#mode-record .wear-id-value {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+#mode-record .wear-no-history-note {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+#mode-record .form-error {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+#mode-record .submit-btn {
+  width: 100%;
+  padding: 12px;
+  background: var(--accent);
+  color: #10140f;
+  border: none;
+  border-radius: 6px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+#mode-record .submit-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+#mode-record .target-check {
+  margin-top: 16px;
+  font-size: 13px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+#mode-record .target-check.not_configured {
+  color: var(--text-dim);
+}
+
+#mode-record .target-check.ok {
+  color: var(--good);
+}
+
+#mode-record .target-check.warning {
+  color: var(--warn);
+}
+
+#mode-record .target-check-note {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+
+#mode-record .warnings-box {
+  margin-top: 10px;
+  background: var(--warn-soft);
+  border-radius: 6px;
+  padding: 10px;
+}
+
+#mode-record .warnings-title {
+  color: var(--warn);
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+#mode-record .warnings-box ul {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+}
+
+/* --- baseline screen --- */
+
+#mode-record .baseline-countdown {
+  font-size: 48px;
+  font-weight: 600;
+  text-align: center;
+  margin: 20px 0 10px;
+}
+
+#mode-record .baseline-bar-track {
+  height: 8px;
+  background: var(--surface-2);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+
+#mode-record .baseline-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.2s linear;
+}
+
+#mode-record .baseline-waiting-note {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
+  margin-bottom: 14px;
+}
+
+#mode-record .live-sigma {
+  font-size: 13px;
+  color: var(--text-dim);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 16px;
+}
+
+#mode-record .live-sigma .hot {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+#mode-record .baseline-unstable-box {
+  background: var(--warn-soft);
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  padding: 14px;
+}
+
+#mode-record .baseline-unstable-title {
+  color: var(--warn);
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+#mode-record .baseline-sensor-report {
+  margin-bottom: 10px;
+}
+
+#mode-record .baseline-sensor-name {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 2px;
+}
+
+#mode-record .zone-flag {
+  font-size: 12px;
+  margin-bottom: 2px;
+}
+
+#mode-record .zone-flag-error {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+#mode-record .zone-flag-warn {
+  color: var(--accent);
+}
+
+#mode-record .zone-flag-note {
+  color: var(--text-dim);
+}
+
+#mode-record .retry-btn {
+  margin-top: 8px;
+  padding: 10px 16px;
+  background: var(--accent);
+  color: #10140f;
+  border: none;
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+}

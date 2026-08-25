@@ -86,7 +86,7 @@ class TriResult:
 
 def compute_tri_result(
     query, templates_by_class, reject_templates, slices, dist_fn,
-    tau=DEFAULT_TAU, reject_percentile=95.0,
+    tau=DEFAULT_TAU, reject_percentile=95.0, precomputed_thresholds=None,
 ):
     """算一次距離，組出可以之後任意 w 重算的 `TriResult`。
 
@@ -99,6 +99,11 @@ def compute_tri_result(
                          例如 {"tof": slice(0,64), "mel": slice(64,104)}
     dist_fn:            (a, b) -> float，套用在單一模態切片後的資料上
                          （例如 D04 `cosine_dist` 或 D05 `dtw_dist`）
+    precomputed_thresholds: 可選，`{"tof": theta, "mel": theta}`。給定時
+                         跳過 `fit_reject_threshold` 重新校準，直接用這兩個
+                         值——`D09` 即時辨識服務熱載入樣板時只校準一次、
+                         快取起來，每次 `recognize()` 呼叫不需要重算
+                         （對 DTW 這種較慢的距離函式尤其重要）。
 
     **ToF 跟 Mel 的原始距離尺度不同，拒識閾值也必須各自校準，
     不能共用一個數字**——這是 `reject_tof`/`reject_mel` 分開存、
@@ -118,8 +123,12 @@ def compute_tri_result(
             f"tof={classes_tof} mel={classes_mel}"
         )
 
-    theta_tof = fit_reject_threshold(reject_templates, tof_dist_fn, percentile=reject_percentile)
-    theta_mel = fit_reject_threshold(reject_templates, mel_dist_fn, percentile=reject_percentile)
+    if precomputed_thresholds is not None:
+        theta_tof = precomputed_thresholds["tof"]
+        theta_mel = precomputed_thresholds["mel"]
+    else:
+        theta_tof = fit_reject_threshold(reject_templates, tof_dist_fn, percentile=reject_percentile)
+        theta_mel = fit_reject_threshold(reject_templates, mel_dist_fn, percentile=reject_percentile)
     reject_tof = bool(d_tof_raw.min() > theta_tof)
     reject_mel = bool(d_mel_raw.min() > theta_mel)
 
