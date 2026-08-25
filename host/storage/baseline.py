@@ -38,6 +38,17 @@ SIGMA_INSTABILITY_THRESHOLD_MM = 2.0
 # 這是警告，不強制重錄——跟「太不穩定」是相反方向的可疑訊號。
 SIGMA_NEAR_ZERO_THRESHOLD_MM = 1e-6
 
+# `compute_noise_floor()` 用 mean/std：baseline 期間如果混進了語音（受試者
+# 忍不住講了話、旁邊有人說話），少數幾幀突然變大聲的樣本會把 mean/std
+# 明顯拉高，但幾乎不會動到 median/MAD（對離群值不敏感的穩健估計）。
+# 兩者差太多，就是「這段錄音看起來不像純底噪」的第四種訊號——只警告，
+# 不強制重錄（跟 sigma 太大/太小/沒訊號那三種一樣是獨立的判準，見
+# `check_zone_quality`；這個判準是 B15 的作者事後指出的，針對音訊，
+# story 原文沒有要求，`B10` 的三級品質判斷不變）。
+NOISE_FLOOR_CONTAMINATION_RATIO = 1.5
+# 常態分布下，median absolute deviation 換算成 sigma 的係數。
+MAD_TO_SIGMA = 1.4826
+
 
 @dataclass
 class ZoneQualityReport:
@@ -70,6 +81,7 @@ class BaselineOutcome:
     noise_floor_mu: Optional[float] = None
     noise_floor_sigma: Optional[float] = None
     valid_zone_ratio: Optional[float] = None
+    noise_floor_warning: Optional[str] = None  # 見 NOISE_FLOOR_CONTAMINATION_RATIO；不影響 ok
 
     def to_dict(self) -> dict:
         def _list_or_none(x):
@@ -83,6 +95,7 @@ class BaselineOutcome:
             "baseline_sigma_B": _list_or_none(self.baseline_sigma_B),
             "noise_floor_mu": self.noise_floor_mu, "noise_floor_sigma": self.noise_floor_sigma,
             "valid_zone_ratio": self.valid_zone_ratio,
+            "noise_floor_warning": self.noise_floor_warning,
         }
 
 
@@ -105,6 +118,38 @@ def compute_noise_floor(mic_rms: np.ndarray) -> "tuple[float, float]":
     """音訊底噪的 μ/σ，供 `B15`（VAD）的閾值使用。不需要無效值處理——
     `mic_rms` 沒有「無效樣本」的概念（§1.1 沒有為 `$M` 定義哨兵值）。"""
     return float(np.mean(mic_rms)), float(np.std(mic_rms))
+
+
+def check_noise_floor_contamination(
+    mic_rms: np.ndarray, sigma: float,
+    ratio_threshold: float = NOISE_FLOOR_CONTAMINATION_RATIO,
+) -> Optional[str]:
+    """`mean`/`std` 對離群值很敏感：baseline 期間如果混進幾句話、或旁邊
+    有人講話，這幾幀會把 `sigma` 明顯拉高，但幾乎不會動到 median/MAD
+    （中位數與中位數絕對偏差，對離群值不敏感的穩健估計）。兩者差太多，
+    就是「這段錄音看起來不像純底噪」的訊號——回一句警告字串，`None`
+    代表沒有異狀。**只警告，不影響 `evaluate_baseline()` 的 `ok`。**
+    """
+    median = float(np.median(mic_rms))
+    mad = float(np.median(np.abs(mic_rms - median)))
+    robust_sigma = MAD_TO_SIGMA * mad
+
+    if robust_sigma < 1e-9:
+        # 穩健 sigma 幾乎是 0（樣本幾乎都一樣），用比例會除以接近 0 爆掉；
+        # 這時只看 sigma 本身是否明顯偏大（絕對門檻，不是這裡的重點路徑，
+        # 純粹避免除零讓函式壞掉）。
+        return (
+            f"mic_rms 的標準差（{sigma:.1f}）跟穩健估計（MAD 換算 σ≈{robust_sigma:.2f}）差異很大，"
+            "底噪錄音可能混進了語音，建議檢查這段是否真的完全安靜"
+        ) if sigma > 50.0 else None
+
+    ratio = sigma / robust_sigma
+    if ratio > ratio_threshold:
+        return (
+            f"mic_rms 的標準差（{sigma:.1f}）是穩健估計（MAD 換算 σ≈{robust_sigma:.1f}）的 "
+            f"{ratio:.1f} 倍，底噪錄音可能混進了語音，建議檢查這段是否真的完全安靜"
+        )
+    return None
 
 
 def check_zone_quality(
@@ -163,6 +208,7 @@ def evaluate_baseline(tof_A: np.ndarray, tof_valid_A: np.ndarray,
     mu_A, sigma_A = compute_zone_stats(tof_A)
     mu_B, sigma_B = compute_zone_stats(tof_B)
     noise_mu, noise_sigma = compute_noise_floor(mic_rms)
+    noise_floor_warning = check_noise_floor_contamination(mic_rms, noise_sigma)
 
     valid_counts_A = tof_valid_A.sum(axis=0)
     valid_counts_B = tof_valid_B.sum(axis=0)
@@ -179,6 +225,7 @@ def evaluate_baseline(tof_A: np.ndarray, tof_valid_A: np.ndarray,
         baseline_mu_B=mu_B, baseline_sigma_B=sigma_B,
         noise_floor_mu=noise_mu, noise_floor_sigma=noise_sigma,
         valid_zone_ratio=overall_valid_ratio,
+        noise_floor_warning=noise_floor_warning,
     )
 
 

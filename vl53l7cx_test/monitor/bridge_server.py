@@ -1035,15 +1035,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
             initial = {"type": "status", "dim": current_resolution["dim"]}
             if parser is not None:
                 initial.update(parser.state())
-            for event in (initial, quality.snapshot()):
-                self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+            opening = [initial, quality.snapshot()]
+            # A tab opened mid-session has missed the `session` broadcast
+            # that fired at start, and polling /session/current just to find
+            # out would defeat the point of the event stream.
+            info = session_registry.current
+            if info is not None:
+                opening.append({"type": "session", "state": "started",
+                                "session": info.to_dict()})
+            with session_lock:
+                baseline = session_runtime.get("baseline")
+            if baseline is not None:
+                opening.append({"type": "baseline",
+                                **_baseline_payload(baseline, source="session")})
+            for event in opening:
+                self.wfile.write(
+                    f"data: {json.dumps(_json_safe(event), ensure_ascii=False, allow_nan=False)}\n\n"
+                    .encode("utf-8"))
             self.wfile.flush()
 
             last_ping = time.time()
             while True:
                 try:
                     event = q.get(timeout=1.0)
-                    self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                    # allow_nan=False plus the sanitiser: a single NaN would
+                    # otherwise be emitted as a bare literal and make the
+                    # browser's JSON.parse throw on that whole message.
+                    self.wfile.write(
+                        f"data: {json.dumps(_json_safe(event), ensure_ascii=False, allow_nan=False)}\n\n"
+                        .encode("utf-8"))
                     self.wfile.flush()
                 except queue.Empty:
                     if time.time() - last_ping > 15:

@@ -404,6 +404,66 @@ function isTypingTarget(el) {
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
 }
 
+// --- C09: quality dashboard -------------------------------------------
+//
+// "前端只負責顯示，所有判定邏輯在 B19" (C09.md) -- this never computes a
+// green/yellow/red level itself, only formats and colors whatever level
+// the quality event already carries. The six metrics below are what
+// host/quality/metrics.py actually emits (confirmed live: CONTRACTS.md
+// 4.2 + a real SSE capture), NOT the seven C09.md's own implementation
+// table lists -- that table has "基線穩定度"/"即時SNR" which don't exist
+// on the wire, and is missing "bandwidth" which does. Same class of stale
+// story-table issue as C05's "2 x dim^2". See the completion report.
+const QUALITY_METRICS = [
+  { key: "drop_rate", label: "掉幀率", format: (v) => (v * 100).toFixed(2) + "%", provenance: "暫定" },
+  { key: "valid_zones", label: "有效 zone", format: (v) => (v * 100).toFixed(0) + "%", provenance: "暫定" },
+  { key: "symmetry", label: "左右對稱性", format: (v) => (v * 100).toFixed(1) + "%", provenance: "暫定" },
+  { key: "clock_resid", label: "對齊殘差", format: (v) => (v * 1000).toFixed(2) + " ms", provenance: "契約" },
+  { key: "noise_floor", label: "音訊底噪", format: (v) => Math.round(v).toString(), provenance: "暫定" },
+  { key: "bandwidth", label: "鏈路使用率", format: (v) => (v * 100).toFixed(0) + "%", provenance: "契約" },
+];
+// [暫定]/[契約] above is a static snapshot of config/quality_thresholds.json's
+// _source field at the time this was written (esp-mask-test-ad suggested
+// this, "建議不是要求") -- there's no endpoint serving that file to the
+// browser, so this doesn't auto-update if B19 revises it. A real fetch
+// would need a new route, same category of gap as C10's /pca.
+
+const QUALITY_LEVEL_COLOR = {
+  green: "#5fbf7a",  // var(--good)
+  yellow: "#e8a33d", // var(--accent)
+  red: "#e2574c",    // var(--warn)
+  unknown: "#8b968e", // var(--text-dim) -- deliberately NOT green; see below
+};
+const QUALITY_SPARKLINE_MS = 60000; // C09.md: "60 秒趨勢迷你圖"
+const DEVICE_STATE_CHECK_MS = 2000;
+
+function drawSparkline(canvas, ctx, points) {
+  if (!canvas || !ctx) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (w === 0 || h === 0) return;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  ctx.clearRect(0, 0, w, h);
+  if (points.length < 2) return;
+  const values = points.map((p) => p.value);
+  const minV = Math.min(...values), maxV = Math.max(...values);
+  const span = Math.max(maxV - minV, 1e-9);
+  const lastLevel = points[points.length - 1].level;
+  ctx.beginPath();
+  points.forEach((p, i) => {
+    const x = (i / (points.length - 1)) * w;
+    const y = h - ((p.value - minV) / span) * (h - 4) - 2;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = QUALITY_LEVEL_COLOR[lastLevel] || QUALITY_LEVEL_COLOR.unknown;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+}
+
 registerMode("monitor", (() => {
   const gridEls = {};   // "A-dist" -> element
   const rateEls = {};   // "A" -> element (shared by both channel panels for that sensor)
@@ -425,6 +485,111 @@ registerMode("monitor", (() => {
   function updateDisplayModeTag() {
     const text = `[${DISPLAY_MODE_LABEL[displayMode]}]`;
     displayModeTagEls.forEach((el) => { el.textContent = text; });
+  }
+
+  // --- C09: quality dashboard state ---
+  const qualityEls = { value: {}, dot: {}, hint: {}, sparkCanvas: {}, sparkCtx: {} };
+  const lastLevels = {}; // key -> "green"|"yellow"|"red"|"unknown", for the record-confirm gate
+  let alarmBannerEl = null;
+  let reflashNoteEl = null;
+  let recBtn = null, recSecondsEl = null, recStatusEl = null;
+  let lastDeviceStateCheckAt = 0;
+
+  function handleQualityEvent(evt) {
+    const metrics = evt.metrics || {};
+    for (const m of QUALITY_METRICS) {
+      const info = metrics[m.key];
+      // Missing metric entirely (shouldn't happen given the six are always
+      // sent, but don't assume) is treated the same as "unknown": still
+      // not green.
+      const level = info ? info.level : "unknown";
+      lastLevels[m.key] = level;
+
+      qualityEls.value[m.key].textContent = (info && typeof info.value === "number") ? m.format(info.value) : "--";
+
+      const dot = qualityEls.dot[m.key];
+      dot.className = "quality-level-dot level-" + level;
+      dot.title = level === "unknown" ? "unknown（尚無門檻或尚無資料，不是綠燈）" : level;
+
+      const hintEl = qualityEls.hint[m.key];
+      if (level !== "green" && info && info.hint) {
+        hintEl.textContent = info.hint;
+        hintEl.style.display = "block";
+      } else {
+        hintEl.textContent = "";
+        hintEl.style.display = "none";
+      }
+    }
+
+    // Sparklines read straight from dataStore's "quality" stream (C09
+    // extended bus.js for this) rather than keeping a second, redundant
+    // history buffer here.
+    const history = dataStore.getRecent("quality", QUALITY_SPARKLINE_MS);
+    for (const m of QUALITY_METRICS) {
+      const points = history
+        .map((e) => {
+          const info = e.metrics && e.metrics[m.key];
+          return info && typeof info.value === "number" ? { value: info.value, level: info.level } : null;
+        })
+        .filter(Boolean);
+      drawSparkline(qualityEls.sparkCanvas[m.key], qualityEls.sparkCtx[m.key], points);
+    }
+
+    // alarms: seq-gap-vs-$H mismatch, a transport fault signal -- kept
+    // visually separate from the drop_rate card per B19's explicit
+    // instruction, not folded into it.
+    const alarms = Array.isArray(evt.alarms) ? evt.alarms : [];
+    if (alarmBannerEl) {
+      if (alarms.length) {
+        alarmBannerEl.textContent = "⚠ 傳輸層警報：" + alarms.join("；");
+        alarmBannerEl.style.display = "block";
+      } else {
+        alarmBannerEl.style.display = "none";
+      }
+    }
+
+    maybeCheckDeviceState(performance.now());
+  }
+
+  // §4.1.2: a resolution switch resets seq (expected -- $STATUS is the
+  // session boundary, CONTRACTS.md 1.3), which would otherwise look like a
+  // fault on this dashboard. Poll /device/state (a real, existing B18
+  // endpoint) so a note can say "this is a reflash" instead of the metrics
+  // just looking alarming for no visible reason.
+  function maybeCheckDeviceState(now) {
+    if (now - lastDeviceStateCheckAt < DEVICE_STATE_CHECK_MS) return;
+    lastDeviceStateCheckAt = now;
+    fetch("/device/state")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((state) => {
+        if (!reflashNoteEl) return;
+        reflashNoteEl.style.display = state && state.resolution_change_in_progress ? "block" : "none";
+      })
+      .catch(() => {
+        // transient fetch failure -- leave the note as it was, don't spam
+      });
+  }
+
+  function anyRedLevel() {
+    return QUALITY_METRICS.some((m) => lastLevels[m.key] === "red");
+  }
+
+  function onRecordClick() {
+    if (anyRedLevel()) {
+      const redLabels = QUALITY_METRICS.filter((m) => lastLevels[m.key] === "red").map((m) => m.label).join("、");
+      const proceed = window.confirm(`目前有紅燈指標（${redLabels}），確定要開始錄製嗎？`);
+      if (!proceed) return;
+    }
+    const seconds = recSecondsEl.value;
+    recStatusEl.textContent = "啟動中…";
+    fetch(`/record?seconds=${seconds}`, { method: "POST" })
+      .then((r) => {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        recStatusEl.textContent = "已送出錄製指令";
+      })
+      .catch((err) => {
+        recStatusEl.textContent = "失敗：" + err.message;
+      });
   }
 
   function captureBaseline() {
@@ -694,6 +859,38 @@ registerMode("monitor", (() => {
             <div class="pca-empty-note">尚無 enrollment 樣板可顯示信賴橢圓（等 D08）</div>
           </div>
         </div>
+        <div class="quality-panel">
+          <div class="section-label">訊號品質
+            <span class="quality-alarm-banner" data-alarm-banner style="display:none"></span>
+          </div>
+          <div class="reflash-note" data-reflash-note style="display:none">
+            ⚠ 解析度切換中（重燒進行中）——以下指標可能暫時異常，這是預期行為
+          </div>
+          <div class="quality-grid">
+            ${QUALITY_METRICS.map((m) => `
+              <div class="quality-card">
+                <div class="quality-card-head">
+                  <span class="quality-label">${m.label}
+                    <span class="prov-badge mono" title="門檻出處：config/quality_thresholds.json 的 _source（靜態快照）">[${m.provenance}]</span>
+                  </span>
+                  <span class="quality-level-dot level-unknown" data-quality-dot="${m.key}" title="unknown"></span>
+                </div>
+                <div class="quality-value mono" data-quality-value="${m.key}">--</div>
+                <canvas class="quality-sparkline" data-quality-spark="${m.key}"></canvas>
+                <div class="quality-hint" data-quality-hint="${m.key}" style="display:none"></div>
+              </div>
+            `).join("")}
+          </div>
+          <div class="quality-record-row">
+            <select class="quality-rec-select" data-rec-seconds>
+              <option value="3">3s</option>
+              <option value="5" selected>5s</option>
+              <option value="10">10s</option>
+            </select>
+            <button class="quality-rec-btn" data-rec-btn>開始錄製</button>
+            <span class="quality-rec-status mono" data-rec-status></span>
+          </div>
+        </div>
       `;
       gridsContainer = root.querySelector("[data-grids]");
       rateEls.A = [];
@@ -725,6 +922,21 @@ registerMode("monitor", (() => {
       // Try once immediately at startup too, not just the periodic check --
       // no reason to wait 10s if the endpoint already happens to exist.
       tryFetchServerPcaModel("tof_only").then((model) => { if (model) setModel(model); });
+
+      for (const m of QUALITY_METRICS) {
+        qualityEls.value[m.key] = root.querySelector(`[data-quality-value="${m.key}"]`);
+        qualityEls.dot[m.key] = root.querySelector(`[data-quality-dot="${m.key}"]`);
+        qualityEls.hint[m.key] = root.querySelector(`[data-quality-hint="${m.key}"]`);
+        const sparkCanvas = root.querySelector(`[data-quality-spark="${m.key}"]`);
+        qualityEls.sparkCanvas[m.key] = sparkCanvas;
+        qualityEls.sparkCtx[m.key] = sparkCanvas.getContext("2d");
+      }
+      alarmBannerEl = root.querySelector("[data-alarm-banner]");
+      reflashNoteEl = root.querySelector("[data-reflash-note]");
+      recBtn = root.querySelector("[data-rec-btn]");
+      recSecondsEl = root.querySelector("[data-rec-seconds]");
+      recStatusEl = root.querySelector("[data-rec-status]");
+      recBtn.addEventListener("click", onRecordClick);
     },
 
     onEnter() {
@@ -740,6 +952,15 @@ registerMode("monitor", (() => {
     },
 
     onData(evt) {
+      if (evt.type === "quality") {
+        // 1Hz, cheap DOM text/canvas updates -- runs directly here rather
+        // than being deferred to the rAF paint loop (unlike the heatmap/
+        // PCA canvases) because there's nothing to gain from tying a
+        // once-a-second update to a 60fps loop, and it means the panel
+        // stays current even while this mode is hidden.
+        handleQualityEvent(evt);
+        return;
+      }
       if (evt.type !== "tof") return;
       const sensor = evt.sensor === "B" ? "B" : "A";
       const { dim, dist, signal, valid } = evt;

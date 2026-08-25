@@ -5,6 +5,7 @@ import pytest
 from host.storage.baseline import (
     SIGMA_INSTABILITY_THRESHOLD_MM,
     capture_baseline_trial,
+    check_noise_floor_contamination,
     check_zone_quality,
     compute_noise_floor,
     compute_zone_stats,

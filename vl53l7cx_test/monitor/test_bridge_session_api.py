@@ -9,6 +9,7 @@ actually there when the baseline request arrives.
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 
@@ -138,14 +139,37 @@ def test_target_check_is_not_configured_when_targets_are_null(rig):
     assert body["note"]  # says why
 
 
-def test_session_start_is_broadcast_over_sse(rig):
-    """C11/C12 follow the session over SSE rather than polling."""
+def test_a_tab_opened_mid_session_is_told_about_it(rig):
+    """C11/C12 follow the session over SSE rather than polling.
+
+    The broadcast at start only reaches tabs that were already connected, so
+    the opening snapshot has to carry the current session too -- otherwise a
+    panel opened during a session shows an idle UI over a live recording.
+    """
     _request(rig, "POST", "/session/start", VALID_METADATA)
-    events = rig.read_events(1.5)
-    sessions = _of_type(events, "session")
-    assert sessions, "no session event reached the SSE stream"
+    sessions = _of_type(rig.read_events(1.5), "session")
+    assert sessions, "a tab opened mid-session was not told a session is running"
     assert sessions[-1]["state"] == "started"
     assert sessions[-1]["session"]["subject"] == "s01"
+
+
+def test_session_end_is_broadcast_to_connected_tabs(rig):
+    """The live fan-out path, as opposed to the opening snapshot."""
+    import threading
+    _request(rig, "POST", "/session/start", VALID_METADATA)
+    collected = []
+
+    def watch():
+        collected.extend(rig.read_events(3.0))
+
+    t = threading.Thread(target=watch)
+    t.start()
+    time.sleep(1.0)
+    _request(rig, "POST", "/session/end")
+    t.join()
+
+    states = [e["state"] for e in _of_type(collected, "session")]
+    assert "ended" in states, f"only saw {states}"
 
 
 # -- baseline ------------------------------------------------------------

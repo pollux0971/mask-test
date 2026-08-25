@@ -17,10 +17,14 @@
 // at 8x8), $M is ~31.25Hz, and $F will move from 31.25Hz to 62.5Hz after
 // A14 -- a fixed entry count would represent a different span of real time
 // depending on current rate and resolution.
+//
+// C09 needs 60s of "quality" history for its sparklines, so retention is
+// 65s (60 + a little slack) -- applies to every stream, not just quality;
+// harmless for the higher-rate ones, just a bigger buffer.
 
 import { forEachRegisteredMode } from "./shell.js";
 
-const RETENTION_MS = 30000;
+const RETENTION_MS = 65000;
 
 function makeRing() {
   return [];
@@ -38,6 +42,9 @@ const streams = {
   // at all today. Reserved so a future stream doesn't need a dataStore
   // shape change, per C03.md's "架構要為未來留位置".
   mel: makeRing(),
+  // B19's 1Hz quality event (CONTRACTS.md 4.2) -- six metrics per tick,
+  // used by C09 for 60s sparklines.
+  quality: makeRing(),
 };
 
 let latestStatus = null;
@@ -76,6 +83,9 @@ function ingest(evt) {
   } else if (evt.type === "mel") {
     streams.mel.push({ ...evt, _recvMs: nowMs });
     trim(streams.mel, nowMs);
+  } else if (evt.type === "quality") {
+    streams.quality.push({ ...evt, _recvMs: nowMs });
+    trim(streams.quality, nowMs);
   } else if (evt.type === "status") {
     latestStatus = { ...evt, _recvMs: nowMs };
   } else if (evt.type === "link") {

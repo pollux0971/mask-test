@@ -19,6 +19,7 @@
 | 日期 | 章節 | 變更 | 影響的 story | 已通知 |
 |---|---|---|---|---|
 | 2026-08-26 | 1. 序列埠協定 v2 | `A15`：`$H` 新增 `bw_bytes_since_last:u32`（第 7 個資料欄），韌體端在 `uart_out.c` 累計、`tof_print_heartbeat()` 每次回報自上次 `$H` 以來送出的位元組數。**⚠️ 破壞性變更且尚未修好**：`host/capture/protocol.py` 的 `_parse_heartbeat()` 目前硬性要求 `len(parts) == 7`（對應舊格式），本變更讓每行 `$H` 變成 8 段，在該函式更新（放寬成 `>= 7` 或改成 key=value）之前，**每一行 `$H` 都無法解析**，不只是新欄位讀不到。`B03`/`dropwatch.py` 的掉幀判定不受影響（純靠 `seq` 缺口，不吃 `$H`），但 heap／溫度／新頻寬欄位在此之前對主機端全部不可見 | `A15`, `B01`, `B03`, `C04` | ⬜ 待通知（見完成回報） |
+| 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 定義 `session` 事件在 `state:"baseline"` 時的 `progress` 形狀（`elapsed_s`/`remaining_s`/`duration_s`/`live_sigma_A|B`，完成時帶 `outcome`），並新增 `POST /session/baseline/retry`。原本 `progress` 只是佔位符沒有形狀，`C11` 實作時提案。前端須用 `elapsed_s` 重新對時；`live_sigma_*` 為 null 時必須明示「倒數是本地估計」不可假裝正常 | `B10`, `B19`, `C11`, `C12` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件補上 `CONFIRM` 狀態（`B12` Hold-to-Record 專用：按住時間超出 0.3–5 s 範圍時，資料算好但**不落盤**，等使用者決定保留或跳過）。與 `B11` 「放棄的 trial 完全不落盤」一致 | `B12`, `B19`, `C12`, `C14` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件補上 `IDLE` 狀態與 `seed` 欄位；明訂 `abort`（跳過此詞）與 `redo`（保留同詞重試）語意不同，兩者都不寫入 HDF5 與 manifest；明訂 `quality` 值域凍結為 `{ok, low, rejected}`（棄用＝`rejected`，不新增第四個值）與 `B11` 的暫定門檻 0.7／0.3，並標註該門檻無實測依據、待 `E01`/`E03` 校準 | `B11`, `B12`, `B19`, `C12`, `C14`, `D12` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.3 `TriResult` 的 `theta_reject` 拆成 `theta_reject_tof` / `theta_reject_mel` 兩個獨立欄位。原因：兩模態的原始距離尺度與 `_reject` 樣板距離分布都不同，共用一個閾值必有一邊校準不準，而且失準會安靜地表現為「全部拒識」或「完全不拒識」（`D07` 實作時發現） | `D06`, `D07`, `D09`, `C17`, `C18` | 是 |
@@ -540,6 +541,9 @@ log         log10(max(power, 1e-10))
 | POST | `/session/end` | `B09` | 結束 session |
 | GET | `/session/current` | `B09` | 當前 session（未開始回 204） |
 | GET | `/session/prefill` | `B09` | 上次設定（`wear_id` 已 +1），供表單預填 |
+| POST | `/session/baseline?seconds=N` | `B10`／`B19` | 擷取 baseline（預設 30 s，取自緩衝區「過去 N 秒」） |
+| GET | `/baseline` | `B10`／`B19` | 目前 session 的 baseline 統計（未擷取回 204） |
+| GET | `/pca?model=tof_only\|enrollment` | `C10`／`B19` | 已擬合的 PCA 模型（沒有模型回 204） |
 | POST | `/trial/hold/start` \| `/stop` | `B12` | Hold-to-Record |
 | POST | `/trial/abort` \| `/redo` | `B11` | 放棄 / 重錄 |
 | POST | `/recognize` | `D09` | 辨識，回 TriResult |
@@ -601,6 +605,53 @@ HTTP wiring（`B19`）要對應的形狀，例外型別已經對好該轉成哪�
 
 （`wear_id` 已經 +1；其餘欄位原封不動來自 `config/last_session.json`。）
 沒有歷史紀錄（第一次用）就回 `{}`。
+
+#### 4.1.1a Baseline 與 PCA（`B10` / `C10` 的 HTTP wiring，`B19`）
+
+**`POST /session/baseline?seconds=N`**（預設 30）——從 bridge 的對齊緩衝區取
+「過去 N 秒」跑 `host/storage/baseline.py` 的品質檢查。沒有進行中的 session
+或緩衝區資料不足 → **409**；品質檢查**沒過** → **422**，
+且**不寫任何檔案、`baseline_done` 維持 `false`**（trial 仍然被擋住）。
+通過 → **200**，呼叫 `mark_baseline_recorded()`，並廣播 `session`（`state:"baseline"`）
+與 `baseline` 兩個 SSE 事件。
+
+**`GET /baseline`** —— 回目前 session 已擷取的 baseline；還沒擷取回 **204**。
+兩者的 body 形狀相同：
+
+```json
+{"source":"session", "ok":true, "reason":null, "captured_at_us":...,
+ "mu_A":[32], "sigma_A":[32], "mu_B":[32], "sigma_B":[32],
+ "noise_floor_mu":.., "noise_floor_sigma":.., "valid_zone_ratio":..,
+ "unstable_zones":{"A":[..],"B":[..]},
+ "no_signal_zones":{"A":[..],"B":[..]},
+ "suspect_zero_variance_zones":{"A":[..],"B":[..]},
+ "quality":{"A":{..},"B":{..}}}
+```
+
+> **⚠ `NaN` 一律序列化成 `null`，不是 `0`。** 沒有訊號的 zone 其 `mu`/`sigma`
+> 本來就是 `NaN`；`json.dumps` 預設會吐出裸的 `NaN` 字面值——**那不是合法 JSON**，
+> 瀏覽器的 `JSON.parse` 會整條訊息拋錯。轉成 `null` 表示「沒有數值」，
+> **三個 zone 旗標陣列才是權威**（前端據此顯示 `N/A` 而不是假裝有個 0.0 mm 的穩定讀數）。
+> 這條同樣適用於**所有 SSE 事件**。
+>
+> zone 索引是**每顆感測器各自 0–15**，所以三個旗標按 `A`/`B` 分開給——
+> 攤平成一個陣列會變成「zone 3 有問題」卻沒說是哪顆的 zone 3。
+
+**`GET /pca?model=tof_only|enrollment`** —— 回已擬合的 PCA 模型：
+
+```json
+{"source":"tof_only", "dims":64, "mean":[N], "components":[[N],[N]],
+ "explainedVarianceRatio":[f,f]}
+```
+
+`model` 不是這兩個值 → **400**。**目前沒有任何流程會產生模型檔**
+（`analysis/features/feature_assembly.py` 有 `fit_pca`/`save_pca`，但沒有人呼叫），
+所以現在一律回 **204**。
+
+> **為什麼回 204 而不是給一個 stub**：`C10` 自己已經有 placeholder 並且每 10 秒重試，
+> 而且它只在 `source`/`dims` 改變時清空軌跡。一個現場即時擬合的模型會維持同一個
+> `source` 標籤卻讓座標軸在既有的點底下轉動——**看起來像真的，但軌跡沒有意義**。
+> 模型檔路徑約定為 `models/pca_<source>.joblib`，**還沒有指定由誰產生**。
 
 #### 4.1.2 裝置控制（`B18`）
 
@@ -712,6 +763,22 @@ bridge 每秒比一次 mtime，**改完存檔即時生效，不需重啟**。
 > **`IDLE` 是合法狀態，必須廣播。** 它出現在 `REST` 結束、以及 `abort`／`redo` 之後，
 > 意思是「可以開始下一個 trial 了」。前端沒有它就只能靠逾時猜，而猜錯的代價是
 > 使用者對著一個不會反應的畫面等——`E05` 要錄 4 小時，這種摩擦會累積成真實成本。
+>
+> **`session` 事件在 `state:"baseline"` 時的 `progress` 形狀**（`C11` 提案，已採納）：
+> ```json
+> // 進行中
+> {"type":"session","state":"baseline","progress":{
+>    "elapsed_s":12.5,"remaining_s":17.5,"duration_s":30,
+>    "live_sigma_A":[16 個 float]|null, "live_sigma_B":[...]|null}}
+> // 完成
+> {"type":"session","state":"baseline","progress":{
+>    "done":true, "outcome": <BaselineOutcome.to_dict()，見 host/storage/baseline.py>}}
+> ```
+> 前端用 `elapsed_s` **重新對時**（本地倒數只是估計，會漂）。
+> `live_sigma_*` 為 `null` 時前端必須顯示「尚未收到伺服器事件、倒數是本地估計」，
+> **不可以假裝正常**。
+>
+> 另有 `POST /session/baseline/retry`（重錄用，`C11` 的重新擷取按鈕）。
 >
 > **`CONFIRM` 是 Hold-to-Record（`B12`）專用的狀態**：按住時間短於 0.3 s
 > 或超過 5 s 時進入。此時資料**已算好但尚未落盤**，等
