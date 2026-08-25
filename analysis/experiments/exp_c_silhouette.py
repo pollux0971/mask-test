@@ -19,6 +19,22 @@
 「開發完成不等於有真實結果」（README 同節）：這支腳本用假資料開發並測過
 就是完整交付；真實結論要等 `E05` 蒐集資料後才能填。`format_report()` 的
 輸出會明確標示 `is_synthetic`，避免假資料的分數被誤讀成真實結論。
+
+**分數普遍偏低時，先懷疑維度詛咒，不要先懷疑資料或模型。**
+`stack_modality()` 把 (T, D) 攤平成單一向量再做 StandardScaler，每一維會
+被正規化成單位變異數——如果某個模態的辨識力其實只集中在少數幾個
+zone/band，攤平後那個訊號只佔幾百維裡的一小塊，其餘維度是跟標籤無關
+的純噪音。StandardScaler 把每一維都拉到同樣的變異數之後，PCA 在「樣本數
+遠小於維度數」的情況下不保證抓得到那一小塊有結構的子空間——這正是
+`n_pca_components=50` 想解決但不保證解決的維度詛咒本身。開發本模組時
+真的踩過這個坑：一開始用「單一 zone / 單一 band 帶詞彙訊號」的合成資料，
+Silhouette 全部卡在 0.05-0.08（判定：fail）；改成「多個 zone / 多個 band
+一致的 pattern」（更接近真實唇形/頻譜同時牽動多個通道的物理直覺）之後，
+同一套程式碼在同一組門檻下拿到 0.75-0.78（強分離）——**程式邏輯完全沒
+變，變的只是訊號在特徵空間裡的分散程度。** 完整推導見
+`reports/D13_silhouette_notes.md`。`E05` 之後若真實分數普遍偏低，
+`format_report()` 會印出這個提示，但人工排查時記得：這通常代表訊號集中
+在少數通道，不是模型或資料本身有問題。
 """
 import numpy as np
 
@@ -189,6 +205,36 @@ def silhouette_report(trials_by_mode, n_pca_components=DEFAULT_PCA_COMPONENTS,
     return {"is_synthetic": is_synthetic, "modes": modes, "verdicts": verdicts}
 
 
+_LOW_SCORE_HINT_THRESHOLD = 0.3   # "marginal" 以下算「偏低」
+_LOW_SCORE_HINT_FRACTION = 0.5    # 超過一半的組合偏低才提示，避免對單一低分洗版
+
+
+def _low_score_hint(report):
+    """分數普遍偏低時的提示——見模組 docstring「先懷疑維度詛咒」那段。
+
+    (silent, mel) 刻意排除在統計之外：那一格「接近 0」是預期中的現象
+    （見 silent 模式討論），不是需要警覺的異常，混進來統計會製造假警報。
+    """
+    low = 0
+    total = 0
+    for mode, data in report["modes"].items():
+        for modality, r in data["table"].items():
+            if mode == "silent" and modality == "mel":
+                continue
+            total += 1
+            if r["score"] < _LOW_SCORE_HINT_THRESHOLD:
+                low += 1
+    if total == 0 or low / total < _LOW_SCORE_HINT_FRACTION:
+        return None
+    return (
+        f"> 💡 **{low}/{total} 個組合的分數低於 {_LOW_SCORE_HINT_THRESHOLD}。**"
+        " 分數普遍偏低時，先檢查是不是訊號本來就分散在少數幾個 zone/band——"
+        " 攤平成向量後單一通道的訊號會被其餘幾百維純噪音稀釋，"
+        " `PCA(50)` 不保證救得回來（維度詛咒，不是模型或資料本身的問題）。"
+        " 完整推導見 `reports/D13_silhouette_notes.md`。"
+    )
+
+
 def format_report(report):
     """把 `silhouette_report()` 的結果轉成人類可讀的 Markdown 字串。
 
@@ -200,6 +246,11 @@ def format_report(report):
     if report["is_synthetic"]:
         lines.append("> ⚠️ **假資料（synthetic）產生的分數，不是真實結論。**"
                       " 真實結論待 `E05` 資料蒐集後重跑本模組取得。")
+        lines.append("")
+
+    hint = _low_score_hint(report)
+    if hint is not None:
+        lines.append(hint)
         lines.append("")
 
     lines.append("## Silhouette 分數表")

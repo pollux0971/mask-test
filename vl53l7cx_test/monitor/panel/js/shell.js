@@ -32,6 +32,23 @@ const sections = Object.fromEntries(
 // every mode regardless of visibility" (C03.md) both work.
 const modeHooks = Object.fromEntries(MODES.map((mode) => [mode, {}]));
 const modeInitDone = Object.fromEntries(MODES.map((mode) => [mode, false]));
+const modeEntered = Object.fromEntries(MODES.map((mode) => [mode, false]));
+
+// enterMode/leaveMode (not calling hooks.onEnter/onLeave directly) exist so
+// "already active, nobody switched to it" and "just switched into it" both
+// funnel through one place with an idempotency guard -- see registerMode's
+// comment below for why the first one is needed.
+function enterMode(mode) {
+  if (modeEntered[mode]) return;
+  if (typeof modeHooks[mode].onEnter === "function") modeHooks[mode].onEnter();
+  modeEntered[mode] = true;
+}
+
+function leaveMode(mode) {
+  if (!modeEntered[mode]) return;
+  if (typeof modeHooks[mode].onLeave === "function") modeHooks[mode].onLeave();
+  modeEntered[mode] = false;
+}
 
 export function registerMode(mode, hooks) {
   if (!MODES.includes(mode)) return;
@@ -40,6 +57,14 @@ export function registerMode(mode, hooks) {
     modeHooks[mode].init(sections[mode]);
     modeInitDone[mode] = true;
   }
+  // The mode shown by default in the static HTML (or targeted by the
+  // initial URL hash, handled further down) never goes through
+  // activateMode()'s switch path -- nothing "switches" into the mode
+  // that's already active on first paint. Without this, a mode whose
+  // onEnter() starts a render loop would never actually start rendering
+  // until the user left and came back once (found via real testing in
+  // C05, monitor.js's heatmap never painted until switched away and back).
+  if (mode === currentMode) enterMode(mode);
 }
 
 // Used by bus.js to deliver onData(evt) to every registered mode, visible
@@ -88,7 +113,7 @@ export function activateMode(mode, { instant = false } = {}) {
   const nextSection = sections[mode];
   if (!prevSection || !nextSection) return;
 
-  if (typeof modeHooks[prevMode].onLeave === "function") modeHooks[prevMode].onLeave();
+  leaveMode(prevMode);
 
   // Hide the outgoing section and show the incoming one in the same tick --
   // there is never a frame where both are display:none (a blank flash) or

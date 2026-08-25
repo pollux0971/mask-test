@@ -193,6 +193,58 @@ def test_tof_vs_mel_gap_known_value():
 
 
 # ---------------------------------------------------------------------------
+# format_report(): 維度詛咒提示
+# ---------------------------------------------------------------------------
+
+def _fake_report(mode_score_kwargs, is_synthetic=True):
+    """用 `_table_with_scores()` 手動組一份 `format_report()` 需要的最小
+    report dict，不用真的跑資料——只測 format_report 自己的邏輯。"""
+    modes = {}
+    for mode, scores in mode_score_kwargs.items():
+        table = _table_with_scores(**scores)
+        modes[mode] = {
+            "table": table,
+            "complementarity": complementarity_check(table),
+            "tof_vs_mel_gap": tof_vs_mel_gap(table),
+        }
+    verdicts = {
+        mode: {m: verdict_for_score(r["score"]) for m, r in data["table"].items()}
+        for mode, data in modes.items()
+    }
+    return {"is_synthetic": is_synthetic, "modes": modes, "verdicts": verdicts}
+
+
+def test_format_report_low_score_hint_appears_when_scores_mostly_low():
+    low = dict(tof_l=0.1, tof_r=0.1, tof_combined=0.12, mel=0.05, all=0.08)
+    report = _fake_report({"normal": low, "whisper": low})
+
+    text = format_report(report)
+
+    assert "維度詛咒" in text
+    assert "reports/D13_silhouette_notes.md" in text
+
+
+def test_format_report_low_score_hint_absent_when_scores_mostly_high():
+    high = dict(tof_l=0.7, tof_r=0.7, tof_combined=0.8, mel=0.6, all=0.75)
+    report = _fake_report({"normal": high, "whisper": high})
+
+    text = format_report(report)
+
+    assert "維度詛咒" not in text
+
+
+def test_format_report_low_score_hint_ignores_expected_silent_mel_low_score():
+    """(silent, mel) 接近 0 是預期現象，不該單獨觸發維度詛咒提示。"""
+    high = dict(tof_l=0.7, tof_r=0.7, tof_combined=0.8, mel=0.6, all=0.75)
+    silent = dict(tof_l=0.7, tof_r=0.7, tof_combined=0.8, mel=-0.01, all=0.75)
+    report = _fake_report({"normal": high, "whisper": high, "silent": silent})
+
+    text = format_report(report)
+
+    assert "維度詛咒" not in text
+
+
+# ---------------------------------------------------------------------------
 # 整合測試：真的走 D01 -> D02 -> D03 -> D13，不重寫任何特徵計算
 # ---------------------------------------------------------------------------
 

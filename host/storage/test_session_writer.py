@@ -209,6 +209,34 @@ def test_exception_after_some_trials_still_leaves_them_readable(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 無效 zone：None -> NaN，不是 -1
+
+
+def test_invalid_tof_zone_none_becomes_nan_not_minus_one(tmp_path):
+    """`host/align/aligner.py` 的 `TofSample.values` 用 Python `None`
+    標記無效 zone；HDF5 的 float32 dataset 沒有 `None`，寫入時要轉成
+    `NaN`，不能悄悄變成 `-1` 或 `0`（T02 的核心設計決定）。"""
+    path = tmp_path / "session.h5"
+    kwargs = _sample_trial_kwargs(T=3, M=5, include_mel=False, include_audio=False)
+    tof_A = [[float(x) for x in row] for row in kwargs["tof_A"].tolist()]
+    tof_A[1][5] = None
+    tof_A[1][5 + 16] = None
+    kwargs["tof_A"] = tof_A
+    kwargs["tof_valid_A"] = np.ones((3, 16), dtype=bool)
+    kwargs["tof_valid_A"][1, 5] = False
+
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, **kwargs)
+
+    with h5py.File(path, "r") as f:
+        values = f["trial_000"]["tof_A"][:]
+        assert np.isnan(values[1, 5])
+        assert np.isnan(values[1, 5 + 16])
+        assert not np.any(values[1, 5] == -1)
+        assert np.isfinite(values[0]).all()  # 其他幀沒被誤傷
+
+
+# ---------------------------------------------------------------------------
 # 邊界：0 幀的 trial（呼應 T02 schema_example.py 的 placeholder 案例）
 
 

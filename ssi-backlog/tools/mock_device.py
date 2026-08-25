@@ -263,11 +263,20 @@ class MockDevice:
         seq = self.seq[sensor]
         self.seq[sensor] += 1
         t_us = self.now_us()
-        vals = ",".join(str(v) for v in d_vals + s_vals)
         if self.args.proto == "v2":
+            vals = ",".join(str(v) for v in d_vals + s_vals)
             self._write(f"$T,{sensor},{seq},{t_us},{self.dim},{vals}")
         else:
-            self._write(f"$TOF,{sensor},{self.dim},{vals}")
+            # v1 is a faithful replay of the pre-T01 firmware, not a stripped
+            # -down v2. That firmware (fb286d1:vl53l7cx_test/main/
+            # vl53l7cx_test.c:135) printed the grid *side* (4|8, i.e.
+            # TOF_GRID_DIM) and distances only -- signal_per_spad was never on
+            # the v1 wire at all. Emitting zone-count + signal here made v1
+            # mode a format no firmware has ever spoken, which defeats the
+            # point of having it: anyone using --proto v1 as the reference for
+            # "what the old firmware sends" would be misled.
+            vals = ",".join(str(v) for v in d_vals)
+            self._write(f"$TOF,{sensor},{self.args.dim},{vals}")
 
     def emit_mic(self, t):
         if self.faults.should_drop():
@@ -308,17 +317,31 @@ class MockDevice:
             self.resend_status()
             return
         if line.startswith("SENS:"):
+            # Validated as strictly as the firmware validates it (A08's
+            # uart_cmd.c rejects anything that is not exactly A|B and 0|1).
+            # Without the membership checks "SENS:C=1" would quietly invent a
+            # third sensor here and answer with a $STATUS, which no real
+            # board would ever do.
             try:
                 sensor, val = line[len("SENS:"):].split("=")
-                self.sensor_enabled[sensor] = (val == "1")
-                print(f"[mock_device] SENS {sensor}={val}", file=sys.stderr)
             except ValueError:
-                pass
-            else:
-                self.resend_status()  # output config changed (CONTRACTS.md #1.1)
+                return
+            if sensor not in self.sensor_enabled or val not in ("0", "1"):
+                print(f"[mock_device] ignoring malformed SENS: {line}", file=sys.stderr)
+                return
+            self.sensor_enabled[sensor] = (val == "1")
+            print(f"[mock_device] SENS {sensor}={val}", file=sys.stderr)
+            self.resend_status()  # output config changed (CONTRACTS.md #1.1)
             return
         if line.startswith("MEL:"):
-            self.mel_enabled = line.endswith("1")
+            # Same strictness as SENS above: endswith("1") alone would take
+            # "MEL:garbage1" as an enable and answer with a $STATUS claiming
+            # mel=1, which no real board would do.
+            val = line[len("MEL:"):]
+            if val not in ("0", "1"):
+                print(f"[mock_device] ignoring malformed MEL: {line}", file=sys.stderr)
+                return
+            self.mel_enabled = (val == "1")
             # $F generation is still out of T04 scope, but the mel= field in
             # $STATUS is not: the host reads it to know the stream's state.
             self.resend_status()

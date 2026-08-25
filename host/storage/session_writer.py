@@ -100,8 +100,8 @@ class SessionWriter:
         if quality not in VALID_QUALITY_VALUES:
             raise ValueError(f"quality 必須是 {VALID_QUALITY_VALUES} 之一，收到 {quality!r}")
 
-        tof_A = np.asarray(tof_A, dtype=np.float32)
-        tof_B = np.asarray(tof_B, dtype=np.float32)
+        tof_A = _to_float32_nan_safe(tof_A)
+        tof_B = _to_float32_nan_safe(tof_B)
         tof_t_us = np.asarray(tof_t_us, dtype=np.int64)
         tof_valid_A = np.asarray(tof_valid_A, dtype=np.bool_)
         tof_valid_B = np.asarray(tof_valid_B, dtype=np.bool_)
@@ -163,6 +163,20 @@ class SessionWriter:
 
         self._trial_indices_written.add(idx)
         self._file.flush()
+
+
+def _to_float32_nan_safe(array_like) -> np.ndarray:
+    """`tof_A`/`tof_B` 的來源（例如 `host/capture/protocol.py` 的解析結果、
+    `host/align/aligner.py` 的 `TofSample.values`）用 Python `None` 標記無效
+    zone——這是刻意的，跟 T02「無效值不要塞 -1」是同一個原則的延伸。但
+    HDF5 的 `float32` dataset 沒有 `None` 這個值，所以這裡把 `None` 轉成
+    `NaN`：跟 `-1` 不同，`NaN` 參與任何算術都會讓結果變成 `NaN` 而不是
+    悄悄給一個看似合理的錯誤數字，忘記檢查 `tof_valid_*` 的下游會立刻
+    看到異常，而不是像 `-1` 那樣被誤當成一個「很近的距離」。
+    """
+    arr = np.asarray(array_like, dtype=object)
+    arr = np.where(arr == None, np.nan, arr)  # noqa: E711 -- identity check needed for object dtype
+    return arr.astype(np.float32)
 
 
 def _create_dataset(grp, name, array: np.ndarray):

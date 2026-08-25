@@ -69,27 +69,44 @@ idf.py monitor
 esp_log_level_set("bone_mic", ESP_LOG_DEBUG);
 ```
 
-### 3. 收集 ToF stack 餘裕（本 story 新增，已經在程式裡了）
+### 3. 收集 stack 餘裕（ToF task 與 mic_task，都已經在程式裡了）
 
 `vl53l7cx_test.c` 的主迴圈每 10 次心跳（約每 10 秒）會印一行：
 ```
 I (xxx) vl53l7cx: a15_perf: tof_task stack headroom = XXXX bytes
 ```
-`mic_task` 的 stack 餘裕不在我的檔案裡，需要另外請 `A12`/`A14` 的負責人
-（`bone_mic.c`）補一行類似的 `uxTaskGetStackHighWaterMark()` log，
-或人工用 `idf.py monitor` 搭配除錯工具查——**這是本報告唯一一個我這邊沒有
-現成產出的欄位，見下方表格備註**。
+`bone_mic.c` 的 `mic_task` 每 10 秒也會印一行（拿到 `bone_mic.*` 的所有權後補的）：
+```
+I (xxx) bone_mic: a15_perf: mic_task stack headroom = XXXX bytes
+```
 
-### 4. 每個組態跑滿 5 分鐘，收集這些
+### 4. 用 `tools/fw_regression.py` 跑，不要手動數
 
-- **ToF 幀率**：數 5 分鐘內收到的 `$T,A,...` / `$T,B,...` 行數 ÷ 300 秒
-- **幀間隔標準差**：見 `reports/A04_polling.md`「量測方法」
-- **掉幀率**：讀 `$H` 行的 `drop_A`/`drop_B`（本 story 之前 `A05`/`A06` 做的，
-  是**自開機累積值**，測試開始與結束各記一次，相減再除以理論總幀數）
-- **heap 走勢**：`$H` 的 `heap` 欄位，測試開始與結束各記一次，算 Δ
-- **頻寬使用率**：見下方「理論頻寬對照」，實測用序列埠吞吐量工具（例如
-  `pv` 接在 socat／cat 到 `/dev/ttyUSB0`）或用行長 × 實測幀率反推
-- **stack 餘裕**：見上方第 3 點
+不用手動數行、算 σ、心算頻寬——直接跑：
+```bash
+python3 tools/fw_regression.py --port /dev/ttyUSB0 --duration 300 \
+    --config "4x4+mel" --out reports/A15/
+```
+四種組態各跑一次，`--config` 換成對應標籤（`4x4+mel` / `4x4-mel` /
+`8x8+mel` / `8x8-mel`，切法見上面第 1 步）。腳本會：
+- 直接重用 `host/capture/protocol.py`／`host/capture/dropwatch.py`
+  （B01/B03 的解析器與掉幀交叉驗證邏輯，沒有自己重刻一份）
+- 算出 ToF 幀率、幀間隔標準差、掉幀率（靠 `seq` 缺口，跟裝置端 `drop_*`
+  是兩個獨立算法，見 `dropwatch.py` 的 cross-check 設計）、Mel Hz、
+  **實際頻寬使用率**（用序列埠層真實收到的 bytes/秒 ÷ 46000，不依賴
+  `$H` 的欄位，見下方已知限制）
+- 掉幀率 > 1% 時**以結束碼 1 退出**（`echo $?` 檢查），符合 A15 驗收條件
+- 把結果寫成 `reports/A15/<config>_<git-sha>_<時間>.md`（自動建立
+  `reports/A15/` 目錄，檔名含 git sha——`git sha` 是韌體自己在 `$STATUS`
+  的 `fw=` 回報的，不是主機這邊的 `git rev-parse`，確保報告對得上實際燒的韌體）
+
+⚠️ **已知限制**：`$H`（heap／溫度／新加的頻寬欄位）目前**解析不出來**——
+這一批改動把 `$H` 從 6 欄擴成 7 欄，但 `host/capture/protocol.py` 的
+`_parse_heartbeat()` 還在檢查 `len(parts) == 7`（對應舊格式），這個新
+欄位讓整行變成 8 段而被判成畸形行。**這不影響掉幀率判定**（那條路完全
+靠 `seq`，見上面），但 `heap Δ` 這一欄目前只能標 `N/A`，直到
+`host/capture/protocol.py` 更新為止（不是我的檔案，已經在 CONTRACTS.md
+變更紀錄和完成回報裡標成待處理項目）。
 
 ## 理論頻寬對照（可先核對，不必等上機）
 
@@ -114,9 +131,9 @@ I (xxx) vl53l7cx: a15_perf: tof_task stack headroom = XXXX bytes
 | 8×8 +Mel | 待測 | 待測 | 待測 | 待測 | 待測 | 待測 | 待測 | 待測* |
 | 8×8 −Mel | 待測 | 待測 | 待測 | — | 待測 | 待測 | 待測 | — |
 
-\* `mic_task` stack 餘裕：目前沒有現成的 log 輸出這個數字（見上方第 3 點），
-需要 `bone_mic.c` 的負責人補一行 `uxTaskGetStackHighWaterMark()` log，或人工
-用除錯工具查。
+這張表由 `tools/fw_regression.py` 四次輸出自動填（ToF Hz／幀間 σ／掉幀率／
+Mel Hz／頻寬），只有 `heap Δ`（已知限制，見上）跟兩個 stack 餘裕（人工讀
+`idf.py monitor` 裡的 `a15_perf:` log 行）要手動抄進來。
 
 ## 判讀門檻
 
@@ -133,14 +150,17 @@ I (xxx) vl53l7cx: a15_perf: tof_task stack headroom = XXXX bytes
 
 ## 结果存放
 
-依驗收條件，結果要存進 `reports/A15/`（本檔案是操作手冊放在 `reports/`，
-實測產出的原始 log／CSV／截圖建議另外放 `reports/A15/`，檔名帶上 git sha
-與日期，例如 `reports/A15/4x4_mel_<sha>_<date>.log`）。**這個子目錄本身還沒
-建立，上機測試時再建即可**，不在這輪程式碼變更範圍內。
+`tools/fw_regression.py --out reports/A15/` 會自動建立 `reports/A15/` 目錄
+並把每次跑的結果寫成 `reports/A15/<config>_<git-sha>_<時間>.md`，滿足
+驗收條件「結果存進 `reports/A15/`，含 git sha」，不需要人工另外建立或搬檔案。
 
 ## 待人工完成事項
 
-- 上面「四種組態對照表」全部欄位
-- `mic_task` stack 餘裕的 log 輸出（需要 `bone_mic.c` 負責人補，或人工查）
-- `reports/A15/` 目錄與原始量測檔案
+- 實際上機跑 `tools/fw_regression.py` 四次（四種組態），把輸出結果的數字
+  彙整進上面「四種組態對照表」
+- 兩個 `a15_perf:` stack 餘裕 log（`idf.py monitor` 裡讀）手動抄進表格
+- `heap Δ`：等 `host/capture/protocol.py` 的 `_parse_heartbeat()` 更新
+  支援 8 欄 `$H` 後才能拿到（見上方已知限制），這條驗收條件本輪無法自動判定
 - 依「判讀門檻」表逐項判定過/不過，不過的要照表裡的建議處理或回報給調度員
+- FFT+Mel 單幀耗時仍照 `reports/A10_spike.md` 的步驟另外收集（`fw_regression.py`
+  沒有處理這個，因為它要求拉高 `bone_mic` tag 的 log level 手動讀）
