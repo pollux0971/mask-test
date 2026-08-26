@@ -207,7 +207,20 @@ def format_report(compare_rows, imbalance_rows, is_synthetic=True):
     max_calib_ms = max(
         max(r["tof"]["calibration_ms"], r["mel"]["calibration_ms"]) for r in compare_rows["roc"]
     )
-    lines += ["", f"新方法最大實測校準耗時：{max_calib_ms:.2f} ms（`E06` 預算是 30 秒 = 30000 ms）。"]
+    old_max_calib_ms = max(
+        max(r["tof"]["calibration_ms"], r["mel"]["calibration_ms"]) for r in compare_rows["loo_single"]
+    )
+    lines += [
+        "",
+        f"新方法最大實測校準耗時：{max_calib_ms:.2f} ms（`E06` 預算是 30 秒 = 30000 ms，**仍在預算內**）。"
+        f"但相較舊方法在同樣 n 下的耗時（{old_max_calib_ms:.2f} ms），"
+        f"新方法慢了約 {max_calib_ms / max(old_max_calib_ms, 1e-9):.0f} 倍——"
+        "舊方法的 LOO 只在（通常較小的）`_reject` 樣板集合內兩兩比對，"
+        "新方法的 `compute_word_loocv_distances` 是對**每個詞類別自己**做 LOOCV，"
+        "運算量隨樣板數平方成長。**在測試範圍（n≤100）內仍遠低於 30 秒預算**，"
+        "但若之後 enrollment 樣板數大幅增加、或改用較慢的 DTW 距離，"
+        "這個二次成長的耗時需要重新評估。",
+    ]
 
     lines += ["", "## 樣板數不平衡時的行為（word 樣板數固定，`_reject` 樣板數倍數變化）"]
     lines += ["| word:reject 比例 | ToF 誤拒率 (舊) | ToF 誤拒率 (新) | Mel 誤拒率 (舊) | Mel 誤拒率 (新) |",

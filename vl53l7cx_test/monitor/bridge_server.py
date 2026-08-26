@@ -330,6 +330,11 @@ def _json_safe(obj):
 
 # --- B09 / B10: session lifecycle -----------------------------------------
 
+# Both paths are overridable from the command line so a test run does not
+# write into the working tree: `sessions/*.h5` and `config/last_session.json`
+# are real runtime artefacts, and a test that leaves them behind shows up as
+# repo changes nobody made on purpose.
+runtime_paths = {"sessions": ROOT_DIR / "sessions", "last_session": LAST_SESSION_PATH}
 session_registry = SessionRegistry(LAST_SESSION_PATH)
 
 # Fed from the serial reader for the whole life of the process, not just
@@ -353,7 +358,7 @@ device_clock = {"last_t_us": None}
 
 
 def sessions_dir():
-    d = ROOT_DIR / "sessions"
+    d = Path(runtime_paths["sessions"])
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -1250,6 +1255,12 @@ def main():
     parser.add_argument("--baud", type=int, default=460800, help="must match CONFIG_ESP_CONSOLE_UART_BAUDRATE")
     parser.add_argument("--http-port", type=int, default=8765)
     parser.add_argument(
+        "--sessions-dir", default=None,
+        help="session HDF5 檔的輸出目錄（預設 <repo>/sessions）")
+    parser.add_argument(
+        "--last-session", default=None,
+        help="表單預填用的 last_session.json 路徑（預設 config/last_session.json）")
+    parser.add_argument(
         "--allow-v1", action="store_true",
         help="B02 降級模式：接受舊韌體的 $TOF/$MIC 行。預設關閉——v1 沒有 "
              "t_us，錄下來的 session 無法做時間對齊，所以必須明確打開。")
@@ -1262,6 +1273,13 @@ def main():
 
     if args.h5_session:
         mfcc_target["h5_path"] = Path(args.h5_session)
+
+    global session_registry
+    if args.sessions_dir:
+        runtime_paths["sessions"] = Path(args.sessions_dir)
+    if args.last_session:
+        runtime_paths["last_session"] = Path(args.last_session)
+        session_registry = SessionRegistry(runtime_paths["last_session"])
 
     reader = threading.Thread(
         target=serial_reader, args=(args.port, args.baud, args.allow_v1), daemon=True)

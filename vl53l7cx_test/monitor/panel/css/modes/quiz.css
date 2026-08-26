@@ -1,2 +1,154 @@
-/* quiz mode styles — owned by the story that builds this mode
-   (see ssi-backlog/README.md track C). Empty shell from C01. */
+/* quiz mode styles — C15: 8-option closed-set layout. See js/modes/quiz.js. */
+
+#mode-quiz {
+  gap: 12px;
+  min-height: 0;
+}
+
+#mode-quiz .section-label {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.quiz-baseline {
+  margin-left: auto;
+  font-size: 12px;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.quiz-prompt {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.quiz-vad-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  width: fit-content;
+}
+.quiz-vad-status.ready {
+  color: var(--good);
+  background: rgba(95, 191, 122, 0.14);
+}
+.quiz-vad-status.unavailable {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+.quiz-vad-icon.breathing {
+  display: inline-block;
+  animation: quiz-breathe 1.6s ease-in-out infinite;
+}
+@keyframes quiz-breathe {
+  0%, 100% { opacity: 0.35; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+
+.quiz-speaking-mode,
+.quiz-trigger-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.quiz-control-label {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-right: 4px;
+}
+.quiz-mode-btn {
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.quiz-mode-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.quiz-trigger-row {
+  font-size: 12px;
+  color: var(--warn);
+}
+
+.quiz-cards {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  align-content: start;
+}
+
+.quiz-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 10px;
+  min-height: 110px;
+  text-align: center;
+}
+
+.quiz-card-text {
+  font-size: 28px;
+  font-weight: 700;
+}
+
+.quiz-card-viseme {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.quiz-card-expect {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.quiz-card-expect[data-expect="ToF"] {
+  color: #17495a;
+  background: #dfe7e2;
+}
+.quiz-card-expect[data-expect="音訊"] {
+  color: #f1b441;
+  background: rgba(255, 191, 64, 0.16);
+}
+.quiz-card-expect[data-expect="雙模態"] {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* Reject is the 9th position, deliberately styled differently (C15.md:
+   "reject 指示...樣式不同") so it doesn't read as "just another word". */
+.quiz-card-reject {
+  border-style: dashed;
+  background: transparent;
+  opacity: 0.85;
+}
+.quiz-card-reject .quiz-card-text {
+  font-size: 18px;
+  color: var(--text-dim);
+}

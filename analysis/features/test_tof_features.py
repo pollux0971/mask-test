@@ -3,6 +3,7 @@ import pytest
 
 from analysis.features.tof_features import (
     N_ZONES,
+    SIGMA_FLOOR,
     TOF_DIM,
     active_zone_indices,
     active_zone_mask,
@@ -115,8 +116,8 @@ def test_sigma_near_zero_does_not_produce_nan_or_inf():
     z = tof_features(tof, valid, mu, sigma)
 
     assert np.all(np.isfinite(z))
-    # sigma 被 floor 到 1e-3，(5-0)/1e-3 = 5000
-    np.testing.assert_allclose(z, 5000.0)
+    # sigma 被 floor 到 SIGMA_FLOOR（量化雜訊的理論下限 1/√12，不是任意小數）
+    np.testing.assert_allclose(z, 5.0 / SIGMA_FLOOR)
 
 
 def test_active_zone_mask_rejects_wrong_shape():

@@ -22,7 +22,12 @@ signal rate 其中一種），呼叫端對同一顆感測器呼叫兩次，分�
 import numpy as np
 
 N_ZONES = 16
-SIGMA_FLOOR = 1e-3
+# `$T` 的所有通道都是整數量化值，均勻量化誤差的 σ 是 Δ/√12（Δ=1 個單位）——
+# 這是「有意義的最小 σ」的理論下限，1e-3 只擋得住除以零，擋不住「小到沒有
+# 意義」（見 CONTRACTS §3.2.2、`analysis/features/tof_features.py` 的
+# SIGMA_FLOOR 註解）。這裡的 SNR 是直接餵給 D01 活躍 zone 篩選的指標，
+# 剛性表面貼合的 zone 若守衛不足會算出虛高的 SNR、被錯誤選為活躍 zone。
+SIGMA_FLOOR = 1.0 / 12 ** 0.5  # ≈ 0.28868，量化雜訊的理論下限，不是任意小數
 DEFAULT_OVERALL_THRESHOLD = 3.0  # 與 E03「SNR < 3 時已嘗試至少 3 種戴法調整」一致
 
 VERDICT_PASS = "pass_both"

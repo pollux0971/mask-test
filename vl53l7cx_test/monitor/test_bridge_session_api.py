@@ -340,7 +340,7 @@ def test_baseline_meta_carries_the_measured_clock_block(rig):
     if status != 200:
         pytest.skip(f"baseline quality gate rejected the synthetic scene: {body.get('reason')}")
 
-    sessions = list((Path(__file__).resolve().parents[2] / "sessions").glob("*.h5"))
+    sessions = list((rig.workdir / "sessions").glob("*.h5"))
     assert sessions, "no session file was written"
     newest = max(sessions, key=lambda p: p.stat().st_mtime)
     with h5py.File(newest, "r") as f:

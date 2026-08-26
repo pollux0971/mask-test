@@ -115,7 +115,7 @@ function zoneListText(zones) {
 
 registerMode("record", (() => {
   let root = null;
-  let screen = "form"; // "form" | "baseline" | "ready"
+  let screen = "form"; // "form" | "baseline" | "trial"
   let els = {};
   let prefill = {};
   let lastWearId = null; // derived from prefill.wear_id - 1, null if no history
@@ -124,6 +124,16 @@ registerMode("record", (() => {
   let baselineStartedAt = null; // performance.now(), for the local pacing countdown
   let baselineWaitTimer = null;
   let baselineOutcome = null; // last BaselineOutcome.to_dict(), or null
+
+  // --- C12: trial screen state ---
+  let trialState = "IDLE"; // mirrors the last {"type":"trial",...} event's `state`
+  let trialLabel = null;
+  let trialNextLabel = null;
+  let trialIdx = null;
+  let trialSeed = null;
+  let holdKeyDown = false; // debounce: OS key-repeat fires keydown many times per real press
+  let beepEnabled = true;
+  let audioCtx = null; // created lazily on first real user gesture (browser autoplay policy)
 
   function fmtMissingFieldsMessage(fields) {
     const labels = fields.map((f) => {
@@ -273,7 +283,7 @@ registerMode("record", (() => {
     screen = name;
     els.formScreen.style.display = name === "form" ? "block" : "none";
     els.baselineScreen.style.display = name === "baseline" ? "block" : "none";
-    els.readyScreen.style.display = name === "ready" ? "block" : "none";
+    els.trialScreen.style.display = name === "trial" ? "flex" : "none";
   }
 
   function enterBaselineScreen() {
@@ -329,10 +339,8 @@ registerMode("record", (() => {
     baselineOutcome = outcome;
     if (outcome.ok) {
       els.baselineUnstableBox.style.display = "none";
-      showScreen("ready");
-      els.readySummary.textContent =
-        `baseline 完成（valid_zone_ratio=${(outcome.valid_zone_ratio ?? 0).toFixed(2)}）—— ` +
-        "可以開始錄製 trial（C12 尚未接上，這裡先停在這一步）";
+      showScreen("trial");
+      renderTrialCard(); // no `trial` event has arrived yet -- render the "press to begin" placeholder
       return;
     }
 
@@ -375,6 +383,199 @@ registerMode("record", (() => {
       // expected for now
     }
     enterBaselineScreen();
+  }
+
+  // --- C12: trial prompt card / countdown / capture -----------------------
+
+  function ensureAudioCtx() {
+    // Must be created/resumed from inside a real user gesture (keydown is
+    // one) -- browsers block audio autoplay otherwise. Reused across beeps
+    // rather than recreated per-beep to avoid hitting any per-page context
+    // limits over a 4-hour E05 session.
+    if (!audioCtx) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      audioCtx = new Ctx();
+    }
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    return audioCtx;
+  }
+
+  function playBeep(freqHz) {
+    if (!beepEnabled) return;
+    try {
+      const ctx = ensureAudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.frequency.value = freqHz;
+      osc.type = "sine";
+      // Short linear fade-out instead of a hard stop -- a click at the cut
+      // point is exactly the kind of "recording quiz sound" artifact that
+      // could contaminate a Hold-to-Record capture if the mic ever hears
+      // the panel's own speaker (e.g. testing on a laptop instead of
+      // headphones). Cheap to avoid, so avoid it.
+      gain.gain.setValueAtTime(0.15, ctx.currentTime);
+      gain.gain.linearRampToValueAtTime(0, ctx.currentTime + BEEP_DURATION_S);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + BEEP_DURATION_S);
+    } catch (err) {
+      console.warn("[record] beep failed (non-fatal):", err);
+    }
+  }
+
+  function setTrialError(text) {
+    els.trialError.textContent = text || "";
+    els.trialError.style.display = text ? "block" : "none";
+  }
+
+  function renderTrialCard() {
+    const card = els.trialCard;
+    card.className = "trial-card state-" + trialState.toLowerCase();
+
+    if (trialState === "CONFIRM") {
+      els.trialWord.textContent = trialLabel || "—";
+    } else if (trialState === "IDLE" || trialState === "REST") {
+      // "顯示下一個詞的預告" (C12.md's REST row) -- IDLE gets the same
+      // treatment so Hold-to-Record's very first press also has something
+      // to read beforehand, not just after REST once already.
+      els.trialWord.textContent = trialNextLabel || "—";
+    } else {
+      els.trialWord.textContent = trialLabel || "—";
+    }
+
+    els.trialStateLabel.textContent = TRIAL_STATE_LABEL[trialState] || trialState;
+    els.trialIdx.textContent = trialIdx != null ? `#${trialIdx}` : "—";
+    els.trialSeed.textContent = trialSeed != null ? `seed=${trialSeed}` : "";
+
+    const showPrefix = trialState === "REST" && trialLabel;
+    els.trialPrevLabel.style.display = showPrefix ? "block" : "none";
+    if (showPrefix) els.trialPrevLabel.textContent = `剛才：${trialLabel}`;
+
+    els.trialConfirmBox.style.display = trialState === "CONFIRM" ? "flex" : "none";
+    if (trialState === "CONFIRM") {
+      els.trialConfirmReason.textContent =
+        (lastTrialEvent && lastTrialEvent.warning === "too_short")
+          ? "按住時間太短（< 0.3s），可能是誤觸"
+          : (lastTrialEvent && lastTrialEvent.warning === "too_long")
+          ? "按住時間太長（> 5s），可能忘了放開"
+          : "時長超出正常範圍";
+    }
+  }
+
+  let lastTrialEvent = null;
+
+  function onTrialEvent(evt) {
+    lastTrialEvent = evt;
+    trialState = evt.state;
+    trialLabel = evt.label != null ? evt.label : trialLabel;
+    trialIdx = evt.idx != null ? evt.idx : trialIdx;
+    trialSeed = evt.seed != null ? evt.seed : trialSeed;
+    if (evt.next_label !== undefined) trialNextLabel = evt.next_label;
+
+    if (trialState === "COUNTDOWN") playBeep(BEEP_GET_READY_HZ);
+    if (trialState === "CAPTURE") playBeep(BEEP_GO_HZ);
+
+    renderTrialCard();
+  }
+
+  async function postTrialAction(path) {
+    try {
+      const res = await fetch(path, { method: "POST" });
+      if (!res.ok && res.status !== 404) {
+        const body = await res.json().catch(() => ({}));
+        setTrialError(body.error || `HTTP ${res.status}`);
+        return false;
+      }
+      if (res.status === 404) {
+        // Expected right now -- /trial/* wiring (B19/ed) isn't live yet
+        // for every one of these endpoints. Say so instead of pretending
+        // the button did nothing for no reason.
+        setTrialError(`後端路由 ${path} 尚未接上（見完成回報）`);
+        return false;
+      }
+      setTrialError("");
+      return true;
+    } catch (err) {
+      setTrialError(`無法連上 ${path}：${err.message}`);
+      return false;
+    }
+  }
+
+  function triggerHoldStart() {
+    if (holdKeyDown) return; // OS key-repeat guard
+    holdKeyDown = true;
+    ensureAudioCtx(); // arm audio on the same user gesture, before any beep is due
+    postTrialAction("/trial/hold/start");
+  }
+
+  function triggerHoldStop() {
+    if (!holdKeyDown) return;
+    holdKeyDown = false;
+    postTrialAction("/trial/hold/stop");
+  }
+
+  function triggerAbort() {
+    postTrialAction("/trial/abort");
+  }
+
+  function triggerRedo() {
+    postTrialAction("/trial/redo");
+  }
+
+  function triggerConfirmKeep() {
+    postTrialAction("/trial/confirm/keep"); // proposed endpoint, see file-top note
+  }
+
+  function triggerConfirmDiscard() {
+    postTrialAction("/trial/confirm/discard"); // proposed endpoint, see file-top note
+  }
+
+  function isRecordTrialScreenActive() {
+    const section = document.getElementById("mode-record");
+    return !!section && section.classList.contains("active") && screen === "trial";
+  }
+
+  function onTrialKeydown(e) {
+    if (!isRecordTrialScreenActive()) return;
+    if (isTypingTarget(e.target)) return; // no text inputs on this screen, but stay consistent with C02's rule
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+
+    if (e.code === "Space" || e.key === " ") {
+      if (trialState === "CONFIRM") return; // space shouldn't start a new hold while a decision is pending
+      e.preventDefault(); // C12.md: "否則會捲動頁面"
+      triggerHoldStart();
+    } else if (e.key === "Enter" && trialState === "CONFIRM") {
+      e.preventDefault();
+      triggerConfirmKeep();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      // During CONFIRM, ESC's "throw this away, don't save" meaning lines
+      // up exactly with discard_pending() -- reusing it here is consistent
+      // with what ESC means everywhere else on this screen, not a new rule.
+      if (trialState === "CONFIRM") triggerConfirmDiscard();
+      else triggerAbort();
+    } else if (e.key.toLowerCase() === "r" && trialState !== "CONFIRM") {
+      // Not in C12.md's literal "包含" list (only ESC/abort is) -- added
+      // because esp-mask-test-ad's dispatch explicitly called out that
+      // abort vs redo must both be reachable and distinguishable. No key
+      // was specified for redo anywhere, so this is this story's own
+      // choice; flagged in the completion report for confirmation.
+      triggerRedo();
+    }
+  }
+
+  function onTrialKeyup(e) {
+    if (!isRecordTrialScreenActive()) return;
+    if (e.code === "Space" || e.key === " ") {
+      e.preventDefault();
+      triggerHoldStop();
+    }
+  }
+
+  function isTypingTarget(el) {
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
   }
 
   // --- lifecycle -----------------------------------------------------
@@ -470,9 +671,37 @@ registerMode("record", (() => {
             </div>
           </section>
 
-          <section class="record-screen" data-screen="ready" style="display:none">
-            <div class="section-label">Session 就绪</div>
-            <div data-ready-summary></div>
+          <section class="record-screen trial-screen" data-screen="trial" style="display:none">
+            <div class="trial-topbar">
+              <label class="beep-toggle">
+                <input type="checkbox" data-beep-toggle checked /> 🔊 嗶聲
+              </label>
+              <div class="trial-meta mono">
+                <span data-trial-idx>—</span>
+                <span data-trial-seed></span>
+              </div>
+            </div>
+
+            <div class="trial-card state-idle" data-trial-card>
+              <div class="trial-prev-label" data-trial-prev-label style="display:none"></div>
+              <div class="trial-word" data-trial-word>—</div>
+              <div class="trial-state-label" data-trial-state-label>準備中</div>
+            </div>
+
+            <div class="trial-confirm-box" data-trial-confirm style="display:none">
+              <div class="trial-confirm-title">⚠ 尚未存檔 —— 請選擇</div>
+              <div class="trial-confirm-reason" data-trial-confirm-reason></div>
+              <div class="trial-confirm-buttons">
+                <button type="button" class="confirm-keep-btn" data-confirm-keep>✅ 保留（Enter）</button>
+                <button type="button" class="confirm-discard-btn" data-confirm-discard>⏭ 跳過此詞（Esc）</button>
+              </div>
+            </div>
+
+            <div class="trial-error" data-trial-error style="display:none"></div>
+
+            <div class="trial-hint mono">
+              按住空白鍵開始錄音、放開結束　｜　Esc 放棄（跳過此詞）　｜　R 重來（保留此詞）
+            </div>
           </section>
         </div>
       `;
@@ -480,7 +709,7 @@ registerMode("record", (() => {
       els = {
         formScreen: root.querySelector('[data-screen="form"]'),
         baselineScreen: root.querySelector('[data-screen="baseline"]'),
-        readyScreen: root.querySelector('[data-screen="ready"]'),
+        trialScreen: root.querySelector('[data-screen="trial"]'),
         form: root.querySelector("[data-form]"),
         subject: root.querySelector("[data-subject]"),
         mode: root.querySelector("[data-mode]"),
@@ -508,7 +737,18 @@ registerMode("record", (() => {
         baselineUnstableReason: root.querySelector("[data-baseline-unstable-reason]"),
         baselineUnstableZones: root.querySelector("[data-baseline-unstable-zones]"),
         retryBtn: root.querySelector("[data-retry-baseline]"),
-        readySummary: root.querySelector("[data-ready-summary]"),
+        beepToggle: root.querySelector("[data-beep-toggle]"),
+        trialIdx: root.querySelector("[data-trial-idx]"),
+        trialSeed: root.querySelector("[data-trial-seed]"),
+        trialCard: root.querySelector("[data-trial-card]"),
+        trialPrevLabel: root.querySelector("[data-trial-prev-label]"),
+        trialWord: root.querySelector("[data-trial-word]"),
+        trialStateLabel: root.querySelector("[data-trial-state-label]"),
+        trialConfirmBox: root.querySelector("[data-trial-confirm]"),
+        trialConfirmReason: root.querySelector("[data-trial-confirm-reason]"),
+        confirmKeepBtn: root.querySelector("[data-confirm-keep]"),
+        confirmDiscardBtn: root.querySelector("[data-confirm-discard]"),
+        trialError: root.querySelector("[data-trial-error]"),
       };
 
       els.form.addEventListener("submit", (e) => {
@@ -524,6 +764,14 @@ registerMode("record", (() => {
         updateWearIdUI();
       });
       els.retryBtn.addEventListener("click", retryBaseline);
+
+      els.beepToggle.addEventListener("change", () => {
+        beepEnabled = els.beepToggle.checked;
+      });
+      els.confirmKeepBtn.addEventListener("click", triggerConfirmKeep);
+      els.confirmDiscardBtn.addEventListener("click", triggerConfirmDiscard);
+      document.addEventListener("keydown", onTrialKeydown);
+      document.addEventListener("keyup", onTrialKeyup);
 
       updateWearIdUI();
       showScreen("form");
@@ -541,16 +789,23 @@ registerMode("record", (() => {
         clearInterval(countdownTimer);
         countdownTimer = null;
       }
+      // Mode switched away mid-hold: release the key so a stray
+      // hold_start() on this device never gets stuck open server-side with
+      // nothing left to send its matching hold_stop().
+      if (holdKeyDown) triggerHoldStop();
     },
 
     onData(evt) {
-      if (evt.type !== "session") return;
-      if (evt.state === "baseline" && evt.progress) {
-        if (evt.progress.done && evt.progress.outcome) {
-          renderBaselineOutcome(evt.progress.outcome);
-        } else {
-          renderLiveStability(evt.progress);
+      if (evt.type === "session") {
+        if (evt.state === "baseline" && evt.progress) {
+          if (evt.progress.done && evt.progress.outcome) {
+            renderBaselineOutcome(evt.progress.outcome);
+          } else {
+            renderLiveStability(evt.progress);
+          }
         }
+      } else if (evt.type === "trial") {
+        onTrialEvent(evt);
       }
     },
   };

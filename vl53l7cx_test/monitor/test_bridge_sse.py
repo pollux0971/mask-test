@@ -13,8 +13,10 @@ import json
 import os
 import re
 import socket
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -47,9 +49,16 @@ class Rig:
         self.pty = m.group(1)
 
         self.http_port = _free_port()
+        # Sandboxed runtime paths: without these the bridge writes session
+        # HDF5 files and last_session.json into the working tree, so every
+        # test run leaves the repo dirty.
+        self.workdir = Path(tempfile.mkdtemp(prefix="bridge-test-"))
         self.bridge = subprocess.Popen(
             [sys.executable, str(BRIDGE), "--port", self.pty,
-             "--http-port", str(self.http_port), *bridge_args],
+             "--http-port", str(self.http_port),
+             "--sessions-dir", str(self.workdir / "sessions"),
+             "--last-session", str(self.workdir / "last_session.json"),
+             *bridge_args],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=str(REPO_ROOT),
         )
@@ -96,6 +105,7 @@ class Rig:
         return events
 
     def close(self):
+        shutil.rmtree(self.workdir, ignore_errors=True)
         for proc in (self.bridge, self.mock):
             proc.terminate()
             try:
