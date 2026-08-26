@@ -828,6 +828,80 @@ def test_baseline_energy_floor_is_passed_through_to_detect_lips(tmp_path, monkey
     assert captured["energy_sigma"] == 0.2
 
 
+# ---------------------------------------------------------------------------
+# B21 F：union_min 雙感測器融合（調度員裁決：取 onset 較早的那顆整個結果）
+
+
+def test_union_min_prefers_earlier_onset_between_two_detected_sensors():
+    from host.trial.state_machine import _union_min_lips
+    from host.vad.test_tof_vad import baseline, synth_tof
+
+    baseline_mu, baseline_sigma = baseline()
+    # B 的動作比 A 早（onset_frame 較小），union_min 應該選 B。
+    tof_A, t_A, _, _ = synth_tof(np.random.RandomState(30), onset_frame=60)
+    tof_B, t_B, _, _ = synth_tof(np.random.RandomState(31), onset_frame=20)
+    # detect_lips 是 detect_from_events 的別名（吃事件字典）；這裡直接用
+    # 陣列版本 detect_lip_activity() 比較省事，不用另外組事件字典。
+    from host.vad.tof_vad import detect_lip_activity
+    lips_A = detect_lip_activity(tof_A, t_A, baseline_mu, baseline_sigma)
+    lips_B = detect_lip_activity(tof_B, t_B, baseline_mu, baseline_sigma)
+    assert lips_A.detected and lips_B.detected
+
+    fused = _union_min_lips(lips_A, lips_B)
+    assert fused is lips_B, "B 的 onset 較早，union_min 應該選 B 整個結果"
+
+
+def test_union_min_falls_back_to_whichever_sensor_detected():
+    from host.trial.state_machine import _union_min_lips
+    from host.vad.tof_vad import TofVadResult
+
+    from host.vad.tof_vad import Segment
+
+    not_detected = TofVadResult(applicable=True, segments=())  # 跑過了，但沒偵測到動作
+    detected = TofVadResult(applicable=True, segments=(
+        Segment(start_us=100, end_us=200, peak_z=5.0, mean_z=3.0, n_frames=3, n_frames_above_enter=3),
+    ))
+
+    assert _union_min_lips(detected, not_detected) is detected
+    assert _union_min_lips(not_detected, detected) is detected
+    # 兩顆都沒偵測到：回傳 A（reason 說明用），不拋例外。
+    assert _union_min_lips(not_detected, not_detected) is not_detected
+
+
+def test_lip_onset_us_a_and_b_written_separately_when_only_a_detects(tmp_path):
+    """B 缺席是 union_min 設計本身假設的正常狀況——只餵 sensor A 的唇動
+    資料，sensor B 全程平靜（沒有動作），`lip_onset_us_A` 應該有值，
+    `lip_onset_us_B` 應該整個 attr 不寫入（不是 0，也不是跟 A 綁在一起
+    檢查）。"""
+    from host.vad.test_tof_vad import N_ZONES, baseline, synth_tof
+
+    baseline_mu, baseline_sigma = baseline()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(
+        tmp_path, baseline_mu_A=baseline_mu, baseline_sigma_A=baseline_sigma,
+        baseline_mu_B=baseline_mu, baseline_sigma_B=baseline_sigma,
+    )
+
+    tof_A, t_A, _, _ = synth_tof(np.random.RandomState(32))
+    flat_B = np.tile(baseline_mu, (len(t_A), 1))  # 完全靜止，沒有任何動作
+    for e in _tof_events_from_synth(tof_A, t_A, "A", N_ZONES):
+        sm.push_event(e)
+    for e in _tof_events_from_synth(flat_B, t_A, "B", N_ZONES):
+        sm.push_event(e)
+
+    hold_start_t_us = t_A[0] + 1_500_000
+    hold_stop_t_us = hold_start_t_us + 1_200_000
+    sm.hold_start(device_t_us=hold_start_t_us)
+    sm.hold_stop(device_t_us=hold_stop_t_us)
+    writer.__exit__(None, None, None)
+
+    with h5py.File(h5_path, "r") as f:
+        attrs = f["trial_000"].attrs
+        assert "lip_onset_us_A" in attrs
+        assert "lip_onset_us_B" not in attrs
+        # 融合後的 lip_onset_us 應該跟 A 自己的 onset 一致（B 沒有東西可選）。
+        assert attrs["lip_onset_us"] == attrs["lip_onset_us_A"]
+
+
 def test_silent_mode_has_lip_onset_but_no_voice_onset(tmp_path):
     """驗收條件：silent 模式下 voice_onset_us 缺席但 lip_onset_us 仍有值
     ——不可假設四個欄位同時存在或同時缺席。"""

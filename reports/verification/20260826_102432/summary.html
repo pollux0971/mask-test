@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>驗證報告 summary</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 60rem;
+        line-height: 1.6; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: left; }
+th { background: #f2f2f2; }
+tr.fail td, tr.error td { background: #fdecec; }
+tr.pass td { background: #f0f9f0; }
+tr.skipped td { background: #f6f6f6; color: #666; }
+td.verdict { font-weight: bold; white-space: nowrap; }
+.banner { padding: 0.8rem 1rem; border-radius: 4px; margin: 0.6rem 0; }
+.banner.error { background: #ffe1e1; border-left: 6px solid #c00; }
+.banner.warn { background: #fff6e0; border-left: 6px solid #d99000; }
+li.conflict { color: #c00; }
+pre { background: #f6f6f6; padding: 0.6rem; overflow-x: auto; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>驗證報告 summary</h1>
+<div class="banner warn"><strong>合成資料，不是真實結論</strong><br>真實結論待 E05 蒐集資料後重跑。</div>
+<h2>通過矩陣</h2>
+<table>
+<thead><tr><th>實驗</th><th>指標</th><th>實測</th><th>標準</th><th>判定</th></tr></thead>
+<tbody>
+<tr class="skipped"><td>C0 串擾 <span class="lock" title="must pass">&#128274;</span></td><td>Δ_dist</td><td>—</td><td>&lt; 2 mm</td><td class="verdict">— SKIPPED</td></tr><tr class="skipped"><td>A 逐 zone SNR <span class="lock" title="must pass">&#128274;</span></td><td>SNR_L / SNR_R</td><td>—</td><td>&gt; 3</td><td class="verdict">— SKIPPED</td></tr><tr class="skipped"><td>B 跨次戴 CV</td><td>CV_between</td><td>—</td><td>&lt; 30%</td><td class="verdict">— SKIPPED</td></tr><tr class="skipped"><td>C Silhouette <span class="lock" title="must pass">&#128274;</span></td><td>Silhouette</td><td>—</td><td>&gt; 0.15</td><td class="verdict">— SKIPPED</td></tr><tr class="skipped"><td>E Viseme 敏感度</td><td>擦音 Mel &gt; ToF</td><td>—</td><td>有模式</td><td class="verdict">— SKIPPED</td></tr>
+</tbody>
+</table>
+<p>&#128274; = 必通過項目（失敗時整份報告的數字都不可信）。</p>
+
+<h2>跨實驗一致性</h2>
+<ul><li class="note"><strong>第二顆 ToF 是否帶來額外資訊</strong>（）</li><li class="note"><strong>有實驗沒有跑</strong>（C0、A、B、C、E）</li></ul>
+<h2>已知限制</h2>
+<ul><li>本報告的所有數字來自合成資料，不是真實結論。 真實結論待 E05 蒐集資料後重跑。</li><li>舌音（viseme E）未涵蓋。 config/vocab.json（§6）的八個詞不含任何 /t,d,k/ 類的詞，因此 D14 的舌音那一列永遠是空的——本系統無法驗證該類別的表現。這是詞彙集的設計取捨，不是量測失敗。</li><li>zone 佈局 row-major 仍是未驗證假設（ASSUMED, unverified — see A track/E01）。所有逐 zone 的空間結論（D11 的活躍 zone、D14 的熱力圖）在佈局確認前方向可能是反的。</li></ul>
+</body>
+</html>

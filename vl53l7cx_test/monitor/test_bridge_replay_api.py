@@ -28,7 +28,16 @@ def _recorded_session(rig):
         pytest.skip(f"baseline gate rejected the synthetic scene: {body.get('reason')}")
     _request(rig, "POST", "/trial/hold/start", {})
     time.sleep(1.2)
-    assert _request(rig, "POST", "/trial/hold/stop")[1]["state"] == "REST"
+    state = _request(rig, "POST", "/trial/hold/stop")[1]["state"]
+    if state == "CONFIRM":
+        # 高負載下 hold 時長從**實際進入 HOLD** 才起算，所以測試這邊的
+        # `sleep(1.2)` 可能只換到 0.13 秒的 hold，被判定 too_short。
+        # 落在 CONFIRM 不是失敗——狀態機刻意不猜、改問使用者，確認之後
+        # trial 一樣會存起來。硬斷言 `== "REST"` 會偽陽性失敗，而偽陽性跟
+        # 真的壞掉長得一模一樣。
+        assert _request(rig, "POST", "/trial/confirm")[0] == 200
+    else:
+        assert state == "REST", f"hold/stop 回到未預期的狀態: {state}"
     assert _request(rig, "POST", "/session/end")[0] == 200
     time.sleep(0.5)
 

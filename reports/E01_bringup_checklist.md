@@ -12,6 +12,9 @@
 
 - [ ] 確認 `/dev/ttyUSB0` 存在、使用者在 `dialout` 群組
 - [ ] `. ~/esp/esp-idf/export.sh`
+- [ ] ⚠️ **`cd vl53l7cx_test`**（`CMakeLists.txt` 在這個子目錄，不在 repo
+      根目錄——repo 根目錄沒有 `CMakeLists.txt`，直接在根目錄下
+      `idf.py build` 會找不到專案）
 - [ ] `idf.py -p /dev/ttyUSB0 build flash monitor`
 - [ ] **記下燒進去的 git sha**（`$STATUS` 的 `fw=` 會自報，
       `tools/fw_regression.py` 的報告會用它命名）
@@ -33,6 +36,26 @@
 | > 2 ms 或 bin ≠ 32±1 | **NO-GO** — 改走 `B14` 主機端路線 |
 
 ⚠️ `fft_probe_run()` 沒有呼叫點，要**暫時**在 `app_main()` 加一行，測完拆掉。
+**這是獨立的第二次燒錄**——跟上面「§0 開始之前」燒的是同一個 `app_main.c`，
+但要先改、重編、重燒，不是燒一次就同時測完全部項目。
+
+**精確步驟（已核對現在的原始碼行號，2026-08-26）**：
+1. `vl53l7cx_test/main/vl53l7cx_test.c` 第 16 行（`#include
+   "vl53l7cx_test.h"` 之後）加一行：
+   ```c
+   #include "fft_probe.h"
+   ```
+2. 同一個檔案第 317 行 `uart_out_init();` 之後加一行：
+   ```c
+   fft_probe_run();
+   ```
+   （`fft_probe_run()` 定義在 `vl53l7cx_test/main/fft_probe.c`，
+   宣告在 `fft_probe.h`——兩個檔案都已存在，不用新建）
+3. `cd vl53l7cx_test && idf.py -p /dev/ttyUSB0 build flash monitor`
+4. 看 log 裡 `fft_probe` 這個 tag 的輸出，照下面「怎麼判讀 log」章節
+   （`reports/A10_spike.md`）填表
+5. **測完把上面兩行加的程式碼拿掉，再重燒一次**——這行不是要留在
+   正式版裡的功能碼，只是這次量測的觸發點。
 
 ### 1.2 真實 UART 的掉幀率 → 決定 `E05` 能不能開始錄
 
@@ -260,8 +283,15 @@ ST 的 ULD 標頭**沒有文件化** zone 的物理佈局。目前全鏈路假�
       → **在 Demo 用的那台筆電上重量一次**（有 GPU、沒有別的 agent 搶 CPU）
       才是乾淨的數字。若 `TaskDuration` 仍明顯超過 15%，
       Demo 期間建議停在測驗模式（11–13%，而且 Demo 四步全在那裡）。
-- [ ] **`validate` 模式目前是空白**（`C22` 進行中）——
-      Demo 前確認它已經有內容，或至少不會被誤點進去。
+- [ ] ⚠️ **更正：`validate` 模式已經有內容了**（`C22` 已完成，實測確認
+      `vl53l7cx_test/monitor/panel/js/modes/validate.js` 486 行、已接進
+      `main.js`，不再是空白）。**但它的後端 `POST /verify/run`／
+      `GET /verify/state` 還沒接**（跟 `/recognize` 同一類缺口，
+      `validate.js` 自己的註解寫明「confirmed live, both currently
+      404」）——點進 `validate` 模式畫面會出現，但按下去會顯示「尚未
+      串接」，不是空白畫面，也不是可以跑的驗證。Demo 前確認這個後端
+      有沒有接上，接上了才需要驗證畫面內容，沒接上就當作跟
+      `/recognize` 一起追蹤。
 
 ---
 

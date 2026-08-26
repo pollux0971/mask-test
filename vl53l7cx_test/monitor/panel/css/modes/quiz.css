@@ -397,6 +397,14 @@
   height: 6px;
   border-radius: 999px;
   background: var(--surface-2);
+  /* Not a dead end -- the default outline would draw around the whole
+     track's bounding box on a custom-styled range input, which looks
+     wrong (a rectangle spanning the entire slider width instead of
+     marking the thumb). Replaced below with a ring on the thumb itself
+     via :focus-visible, not just removed -- found missing entirely
+     during the keyboard-navigation audit (this slider is the C17 fusion
+     weight control, a load-bearing Demo element, and it had zero visible
+     focus indicator when tabbed to). */
   outline: none;
 }
 .quiz-w-slider::-webkit-slider-thumb {
@@ -416,6 +424,15 @@
   background: var(--accent);
   border: 2px solid var(--surface);
   cursor: pointer;
+}
+/* C25: keyboard-audit fix -- the halo ring, not outline, is the standard
+   way to focus-ring a custom slider thumb (outline on a ::-webkit-*-thumb
+   pseudo-element doesn't render reliably across browsers; box-shadow does). */
+.quiz-w-slider:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px var(--bg), 0 0 0 6px var(--accent);
+}
+.quiz-w-slider:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 3px var(--bg), 0 0 0 6px var(--accent);
 }
 /* w 的當前值要大字顯示（C17.md 明確驗收條件），不是塞在小字狀態列裡 */
 .quiz-w-value {

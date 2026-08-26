@@ -53,8 +53,9 @@ def _recorded_session(rig):
         # 「太短」而走到 CONFIRM 而不是直接存檔。那不是失敗——狀態機刻意
         # 不猜，改問使用者。這裡確認它，trial 一樣會存起來。
         #
-        # ⚠️ `test_bridge_replay_api.py` 的同名 helper 是硬斷言 `== "REST"`，
-        # 所以它在高負載下會偽陽性失敗。那個檔案不是我的，只回報不改。
+        # 同一個處理已經套到另外三個 helper（`test_e2e_pipeline.py`、
+        # `test_bridge_trial_api.py`、`test_bridge_replay_api.py`）——原本
+        # 它們硬斷言 `== "REST"`，在高負載下會偽陽性失敗。
         assert _request(rig, "POST", "/trial/confirm")[0] == 200
     elif state != "REST":
         pytest.fail(f"hold/stop 回到未預期的狀態: {state}")

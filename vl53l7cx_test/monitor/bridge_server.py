@@ -376,7 +376,8 @@ def _json_safe(obj):
 # are real runtime artefacts, and a test that leaves them behind shows up as
 # repo changes nobody made on purpose.
 runtime_paths = {"sessions": ROOT_DIR / "sessions", "last_session": LAST_SESSION_PATH,
-                 "verification": ROOT_DIR / "reports" / "verification"}
+                 "verification": ROOT_DIR / "reports" / "verification",
+                 "templates": ROOT_DIR / "templates"}
 
 # What this link is actually connected to (CONTRACTS #4.2). Declared on the
 # command line, never inferred: a pty from T04's synthetic device and a pty
@@ -400,6 +401,130 @@ session_aligner = Aligner()
 # baseline has to create it.
 session_runtime = {"baseline": None, "h5_path": None, "writer": None, "trial": None}
 session_lock = threading.Lock()
+
+# --- D09: POST /recognize, GET /templates --------------------------------
+#
+# RecognitionService (analysis/similarity/recognition_service.py) and the
+# whole D01->D02->D03 feature-assembly chain it needs already exist and are
+# individually tested -- this block only imports and wires them, it does not
+# reimplement any of them. host/features/live_pipeline.py is the one
+# genuinely new piece: nothing in the repo previously turned aligned device
+# frames into the (T,104) vector RecognitionService.recognize() expects
+# (see reports/PANEL_LEAK_AUDIT.md-adjacent investigation notes / the
+# completion report for this story). RecognitionService/enrollment are
+# imported lazily inside the functions below, matching this file's existing
+# h5py/librosa convention (see read_baseline_thresholds above) rather than
+# adding new eager imports to the stdlib-only block at the top of the file.
+RECOGNIZE_WINDOW_S = 2.0  # live-capture path: how far back into session_aligner to look
+
+recognition_service_state = {"service": None, "error": None, "path": None}
+recognition_service_lock = threading.Lock()
+
+
+def _load_recognition_service():
+    """Lazily build (and cache) a RecognitionService from the first .npz
+    found under runtime_paths["templates"]. That directory is empty in this
+    repo right now -- no enrollment has ever been recorded -- and that is
+    the expected, common state, not an error condition: callers get an
+    honest "no templates yet" reason string back, never a 500 from deep
+    inside RecognitionService's constructor.
+    """
+    with recognition_service_lock:
+        if recognition_service_state["service"] is not None:
+            return recognition_service_state["service"], None
+        if recognition_service_state["error"] is not None:
+            return None, recognition_service_state["error"]
+
+        from analysis.similarity.recognition_service import RecognitionService
+        from host.storage.enrollment import load_templates
+
+        templates_dir = Path(runtime_paths["templates"])
+        npz_files = sorted(templates_dir.glob("*.npz")) if templates_dir.is_dir() else []
+        if not npz_files:
+            reason = f"{templates_dir} 底下沒有任何 enrollment 樣板（*.npz）—— 尚未錄過 enrollment"
+            recognition_service_state["error"] = reason
+            return None, reason
+
+        path = npz_files[0]
+        try:
+            templates_by_class, meta, warning = load_templates(path)
+            if warning:
+                print(f"[bridge] /recognize: {warning}")
+            reject_templates = templates_by_class.pop("_reject", [])
+            if not reject_templates:
+                reason = f"{path.name} 沒有 _reject 樣板，RecognitionService 無法校準拒識門檻"
+                recognition_service_state["error"] = reason
+                return None, reason
+            slices = {"tof": slice(0, 64), "mel": slice(64, 104)}  # CONTRACTS.md §3.3
+            service = RecognitionService(
+                templates_by_class, reject_templates, slices,
+                subject=meta.get("subject"), wear_id=meta.get("wear_id"),
+            )
+        except Exception as exc:
+            reason = f"讀取/建立 RecognitionService 失敗（{path.name}）: {exc}"
+            recognition_service_state["error"] = reason
+            return None, reason
+
+        recognition_service_state["service"] = service
+        recognition_service_state["path"] = str(path)
+        return service, None
+
+
+def _frames_from_live_session(window_s):
+    """Same idiom as capture_session_baseline() above: last `window_s`
+    seconds out of the always-running session_aligner buffer."""
+    latest = device_clock["last_t_us"]
+    if latest is None:
+        return []
+    return list(session_aligner.frames(latest - int(window_s * 1e6), latest))
+
+
+def _frames_from_stored_trial(h5_path, trial_group):
+    """Read one already-recorded trial's tof_A/tof_B/mel back out of the
+    session HDF5 file and re-align them through a fresh Aligner. Read-only;
+    does not import or touch host/storage/session_writer.py or
+    session_loader.py. ToF (@30Hz) and Mel (@62.5Hz) are stored on their
+    own separate time axes (CONTRACTS.md §2: "mel 的時間軸是 F 不是 M")
+    and are not frame-aligned to each other on disk, so this cannot just
+    concatenate the raw arrays -- it has to go back through Aligner exactly
+    like the live-capture path does, via the same
+    assemble_query_from_aligned_frames() downstream.
+    """
+    import h5py
+
+    with h5py.File(h5_path, "r") as f:
+        if trial_group not in f:
+            raise KeyError(f"{trial_group} 不存在於 {h5_path}")
+        g = f[trial_group]
+        tof_A = np.asarray(g["tof_A"])
+        tof_B = np.asarray(g["tof_B"])
+        tof_valid_A = np.asarray(g["tof_valid_A"])
+        tof_valid_B = np.asarray(g["tof_valid_B"])
+        tof_t_us = np.asarray(g["tof_t_us"])
+        if "mel" not in g or "mel_t_us" not in g:
+            raise ValueError(f"{trial_group} 沒有 mel/mel_t_us（選填欄位，這筆錄音當下 Mel 未開啟）")
+        mel = np.asarray(g["mel"])
+        mel_t_us = np.asarray(g["mel_t_us"])
+
+    n_zones = tof_valid_A.shape[1]
+    aligner = Aligner()
+    for i in range(len(tof_t_us)):
+        aligner.push_tof(
+            "A", int(tof_t_us[i]),
+            [None if np.isnan(v) else float(v) for v in tof_A[i, :n_zones]],
+            [None if np.isnan(v) else float(v) for v in tof_A[i, n_zones:]],
+            [bool(v) for v in tof_valid_A[i]])
+        aligner.push_tof(
+            "B", int(tof_t_us[i]),
+            [None if np.isnan(v) else float(v) for v in tof_B[i, :n_zones]],
+            [None if np.isnan(v) else float(v) for v in tof_B[i, n_zones:]],
+            [bool(v) for v in tof_valid_B[i]])
+    for i in range(len(mel_t_us)):
+        aligner.push_mel(int(mel_t_us[i]), [float(v) for v in mel[i]])
+
+    t_start = int(min(tof_t_us[0], mel_t_us[0]))
+    t_end = int(max(tof_t_us[-1], mel_t_us[-1]))
+    return list(aligner.frames(t_start, t_end))
 
 # Newest device timestamp seen on any stream. The trial machine needs a
 # device-clock reading to mark capture boundaries (CONTRACTS #1.3 puts trial
@@ -1402,6 +1527,93 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None
         return parsed
 
+    # --- D09: /recognize, /templates --------------------------------
+
+    def _handle_templates(self):
+        """GET /templates -- list_templates() is RecognitionService's own
+        method, written for exactly this endpoint (analysis/similarity/
+        recognition_service.py's docstring names it explicitly)."""
+        service, error = _load_recognition_service()
+        if service is None:
+            self._send_json(200, {"loaded": False, "reason": error})
+            return
+        self._send_json(200, {"loaded": True, **service.list_templates()})
+
+    def _handle_recognize(self):
+        """POST /recognize -- returns a CONTRACTS.md §4.3 TriResult.
+
+        Optional body {"trial_id": "trial_003"}: re-reads that trial's
+        already-recorded tof/mel back out of the current session's HDF5
+        file. Without trial_id: live capture from the last
+        RECOGNIZE_WINDOW_S seconds of session_aligner's buffer.
+
+        §4.3 requires d_tof_raw/d_mel_raw (quiz.js's reject_fused() cannot
+        work without them, verified in reports/REJECT_PATH.md) -- _json_safe
+        does not handle np.ndarray, so the four distance arrays are
+        .tolist()'d here explicitly.
+        """
+        from host.features.live_pipeline import (
+            InsufficientFramesError, assemble_query_from_aligned_frames,
+        )
+
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        service, error = _load_recognition_service()
+        if service is None:
+            self._send_json(503, {"error": "尚無 enrollment 樣板，無法辨識", "reason": error})
+            return
+
+        trial_id = body.get("trial_id")
+        try:
+            if trial_id:
+                h5_path = session_runtime["h5_path"]
+                if not h5_path:
+                    self._send_json(409, {"error": "目前沒有開啟中的 session，無法用 trial_id 查詢"})
+                    return
+                frames = _frames_from_stored_trial(h5_path, trial_id)
+                baseline = read_baseline_thresholds(h5_path)
+                mu_A, sigma_A = baseline.get("baseline_mu_A"), baseline.get("baseline_sigma_A")
+                mu_B, sigma_B = baseline.get("baseline_mu_B"), baseline.get("baseline_sigma_B")
+            else:
+                baseline_outcome = session_runtime["baseline"]
+                if baseline_outcome is None:
+                    self._send_json(409, {"error": "尚無 session baseline，無法即時辨識（先 POST /session/baseline）"})
+                    return
+                frames = _frames_from_live_session(RECOGNIZE_WINDOW_S)
+                mu_A, sigma_A = baseline_outcome.baseline_mu_A, baseline_outcome.baseline_sigma_A
+                mu_B, sigma_B = baseline_outcome.baseline_mu_B, baseline_outcome.baseline_sigma_B
+
+            if mu_A is None or mu_B is None:
+                self._send_json(409, {"error": "baseline 缺少 mu/sigma，無法計算 ToF 特徵"})
+                return
+
+            query = assemble_query_from_aligned_frames(frames, mu_A, sigma_A, mu_B, sigma_B)
+        except InsufficientFramesError as exc:
+            self._send_json(422, {"error": str(exc)})
+            return
+        except (KeyError, ValueError) as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+
+        # query.data (fixed T=24) matches RecognitionService's default
+        # dist_method="cosine". dist_method selection isn't exposed on this
+        # endpoint yet -- out of scope for this pass, see completion report.
+        tri, latency_ms = service.recognize(query.data)
+
+        self._send_json(200, {
+            "classes": list(tri.classes),
+            "d_tof": tri.d_tof.tolist(), "d_mel": tri.d_mel.tolist(),
+            "d_tof_raw": tri.d_tof_raw.tolist(), "d_mel_raw": tri.d_mel_raw.tolist(),
+            "reject_tof": bool(tri.reject_tof), "reject_mel": bool(tri.reject_mel),
+            "tau": float(tri.tau),
+            "theta_reject_tof": float(tri.theta_reject_tof),
+            "theta_reject_mel": float(tri.theta_reject_mel),
+            "dist_method": "cosine",
+            "latency_ms": latency_ms,
+        })
+
     def do_GET(self):
         if self.path.startswith("/session/current"):
             self._handle_session_current()
@@ -1413,6 +1625,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_pca()
         elif self.path.startswith("/config/"):
             self._handle_config()
+        elif self.path.startswith("/templates"):
+            self._handle_templates()
         elif self.path.startswith("/replay/sessions"):
             self._handle_replay_sessions()
         elif self.path.startswith("/replay/state"):
@@ -1450,6 +1664,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_session_baseline()
         elif self.path.startswith("/trial/"):
             self._handle_trial()
+        elif self.path.startswith("/recognize"):
+            self._handle_recognize()
         elif self.path.startswith("/replay/"):
             self._handle_replay()
         elif self.path.startswith("/verify/run"):
@@ -2151,6 +2367,12 @@ def main():
         help="B14 備援路線：每次錄音完成後，除了存 .npy，也把 log-mel 寫進這個 "
              "session HDF5 檔（trial group 要已經存在，例如用 "
              "ssi-backlog/tools/schema_example.py 產生）。不給就只存 .npy。")
+    parser.add_argument(
+        "--templates-dir", default=None,
+        help="D09 /recognize、/templates：enrollment 樣板 .npz 的目錄"
+             "（預設 <repo>/templates，見 host/storage/enrollment.py "
+             "template_path()）。目錄裡沒有任何 .npz 時兩個端點都回明確的"
+             "「尚無樣板」狀態，不是 500。")
     args = parser.parse_args()
 
     if args.h5_session:
@@ -2166,6 +2388,8 @@ def main():
         runtime_paths["sessions"] = Path(args.sessions_dir)
     if args.verification_dir:
         runtime_paths["verification"] = Path(args.verification_dir)
+    if args.templates_dir:
+        runtime_paths["templates"] = Path(args.templates_dir)
     if args.last_session:
         runtime_paths["last_session"] = Path(args.last_session)
         session_registry = SessionRegistry(runtime_paths["last_session"])

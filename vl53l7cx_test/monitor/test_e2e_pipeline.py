@@ -49,9 +49,21 @@ def _record_one_in_range_trial(rig):
     time.sleep(0.8)
     status, body = _request(rig, "POST", "/trial/hold/stop")
     assert status == 200, body
+    if body["state"] == "CONFIRM":
+        # 機器忙的時候，`time.sleep(0.8)` 在**測試這邊**過了 0.8 秒，但
+        # bridge 那邊量到的 hold 可能只有 0.13 秒——時長從**實際進入
+        # HOLD** 才起算，而 `POST /trial/hold/start` 在高負載下會被處理得晚。
+        #
+        # 落在 CONFIRM 不是失敗：狀態機刻意**不猜**，改問使用者。確認之後
+        # trial 一樣會存起來，這個 helper 要的東西（一筆存好的 trial）拿得到。
+        #
+        # 原本硬斷言 `== "REST"` 會在整套一起跑時**偽陽性失敗**——而偽陽性
+        # 跟真的壞掉長得一模一樣，兩者混在一起會侵蝕「紅色 = 要修」的訊號。
+        status, body = _request(rig, "POST", "/trial/confirm")
+        assert status == 200, body
     assert body["state"] == "REST", (
-        f"hold 落在 {body['state']} 而不是直接 SAVE -- 這條路徑預期是"
-        f"「按住 0.8 秒，落在正常範圍內」: {body}"
+        f"hold 落在 {body['state']} -- 預期是 REST（直接存檔）或 "
+        f"CONFIRM（確認後存檔）: {body}"
     )
     # REST is timed (REST_S = 1.5s) and only a background ticker drives it
     # back to IDLE (host/trial/state_machine.py tick()) -- hold_start() from

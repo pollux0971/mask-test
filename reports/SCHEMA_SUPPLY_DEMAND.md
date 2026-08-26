@@ -3,23 +3,30 @@
 > 方法：`grep` 全 repo 找出每一個直接開 h5py 的地方，讀懂它在幹嘛；
 > 再把 `CONTRACTS.md` §2 的每一個欄位，對照 `host/storage/session_writer.py`
 > （唯一的正式寫入端）跟實際的呼叫端、`analysis/` 底下的每一個消費點，
-> 逐一分類。**這輪只盤點，不修**——除了兩處落在自己檔案裡、明顯是文件
-> 遺漏的小 Edit（見文末）。
+> 逐一分類。這份報告分兩輪寫：第一輪只盤點；第二輪把調度員指名的三筆
+> 結清（`mic_peak`/`mel_t_us`/`tof_ambient_t_us` 的結構性缺口、`source`
+> 的落差、`mel_writer.py` 的精確偵察清單），邊界也跟著放寬到
+> `session_loader.py`/`session_writer.py` 本身。
 
-## 結論先講
+## 結論先講（第二輪更新後）
 
 - 掃過的直接 h5py 存取有 **6 處**，其中 5 處是刻意、窄範圍、風險低；
-  **1 處是死碼**（`host/storage/mel_writer.py`，寫出來的檔案會違反現在的
-  schema）。
-- 供需對帳表裡，🔴 **第三類（有人讀、沒人寫）目前是 0 筆**——但這不是
-  一直都成立：`energy_mu`/`energy_sigma` **今天稍早**曾經正是這一類，
-  `bridge_server.py` 已經在讀、寫入端卻還沒接住，直到這輪把它加進
-  `session_writer.py` 才補上。細節見下方，這是這張表唯一「抓到現行進行式
-  的那三種歷史 bug」的一筆，不是舉例。
-- 第二類（有寫、沒人讀）有 **12 筆**，大多是「D14/D-track 還沒做完」的
-  正常暫態，不是 bug；但其中 `mel_t_us`/`tof_ambient_t_us` 是**結構性**
-  讀不到（`session_loader.py` 的 `Trial` dataclass 沒有對應欄位，不是
-  「剛好沒人寫」），值得記一筆。
+  **1 處是死碼**（`host/storage/mel_writer.py`）——這輪已經把精確的偵察
+  清單（誰引用、哪一行呼叫、`--h5-session` 還有沒有人用、刪掉會不會連累
+  無關的 `.npy` 路徑）交出去，**沒有動手刪**，因為呼叫點在 `bridge_server.py`，
+  現在有三個人同時在裡面。
+- 🔴 第三類（有人讀、沒人寫）目前是 0 筆，`energy_mu`/`energy_sigma`
+  當時的那個案例已經修掉（細節見下，留著是證明這張表抓得到這一類 bug）。
+- 情況四（契約定義、兩邊都沒實作）**這輪也清空了**：`source` 原本卡在
+  這一類（呼叫端在傳、寫入端沒接住、沒人讀），這輪把 `session_writer.py`
+  接住了，現在改列進情況二（有寫、沒人讀）。
+- `mic_peak`/`mel_t_us`/`tof_ambient_t_us` 這三筆原本「結構性讀不到」
+  （`Trial` dataclass 根本沒有對應欄位）的技術缺口這輪也解掉了——但**沒有
+  升級成情況一**：介面通了不等於有人在用，`analysis/` 目前還沒有實際消費
+  這三個欄位的程式碼，仍然歸在情況二。
+- `59` 同一輪把 `d14_viseme_sensitivity.py` 接上 `lip_onset_us`/
+  `comparable` 等 7 個欄位，從情況二移到情況一，是這份報告目前唯一真正
+  升級到「有寫有讀」的一批。
 
 ---
 
@@ -38,7 +45,7 @@
 | `host/storage/mel_writer.py` | 寫 | dataset：`mel`（**沒有** `mel_t_us`） | 🔴 **不是**——見下方 | 🔴 **高，但目前無害**，因為死碼（見下） |
 | `ssi-backlog/tools/schema_example.py` | 寫 | 透過 `SessionWriter`，不是直接開檔 | 不算繞過 | 無 |
 
-### 🔴 死碼：`host/storage/mel_writer.py`
+### 🔴 死碼：`host/storage/mel_writer.py`（偵察清單，沒有動手）
 
 自己的文件字串就寫明：
 
@@ -46,27 +53,71 @@
 > 能被驗收」
 
 `SessionWriter.write_trial()` 早就已經吃 `mel`/`mel_t_us` 了（B07/B14 都已
-落地），但這支模組沒有跟著退場。它唯一的呼叫點在
-`bridge_server.py`（`_handle_mfcc_ready` 附近，`--h5-session` 這條**舊的、
-B09/B11 之前的示範路徑**，程式裡自己的註解寫著「B09（session/trial 狀態
-機）還沒做，這裡先用『每次錄音自動 +1』模擬 trial_idx」——現在 B09/B11
-早就做完了，真正的 `/trial/*` 走 `TrialStateMachine.write_trial()`，兩條
-路徑不會同時對同一個 trial 動作，所以**目前**不會互相覆寫打架。
+落地），但這支模組沒有跟著退場。
 
-但只要有人還在用 `--h5-session` 這個舊旗標，`write_mel_to_trial()` 會寫出
-一個**違反現行 schema** 的檔案：`mel` 沒有搭配的 `mel_t_us`。
-`session_loader.py` 讀取時只檢查 `"mel" in group` 就直接讀，不會報錯，
-但會產生一個「有 `mel` 卻沒有 `mel_t_us`」的檔案——如果將來有任何程式碼
-假設「有 `mel` 就一定有 `mel_t_us`」（`_validate_mel()` 在 `SessionWriter`
-這一側保證了這件事，容易讓人誤以為所有 `mel` 都成對），會在這種檔案上
-悄悄壞掉。
+#### 1. 誰引用它（全 repo）
 
-**這是 `bridge_server.py` 裡的呼叫點，屬於 ed／`7c [c32fd9]` 正在動的檔案
-範圍，這輪按邊界規定不動，只回報。**`host/storage/mel_writer.py` 本身
-沒有主人明確認領，兩種修法都值得考慮：退場（呼叫點改用
-`TrialStateMachine`／`SessionWriter` 的正式路徑）或至少讓它一起寫
-`mel_t_us`（用 dataset 的 index 當 timestamp 顯然不對，真正的時間戳
-`--h5-session` 這條路徑目前也沒有在算）。
+| 檔案 | 怎麼用 |
+|---|---|
+| `vl53l7cx_test/monitor/bridge_server.py:97` | 模組層級佔位：`write_mel_to_trial = None` |
+| `vl53l7cx_test/monitor/bridge_server.py:109` | `_load_mel_backend()` 裡：`from host.storage.mel_writer import write_mel_to_trial as _t`——**跟 `host/features/mel_pipeline.py` 的 `wav_to_log_mel_timed` 綁在同一個 `try/except ImportError` 區塊裡**（見下方風險） |
+| `vl53l7cx_test/monitor/bridge_server.py:1173` | 唯一的**真正呼叫點**：`_process_mfcc()` 函式裡，`write_mel_to_trial(h5_path, trial_idx, log_mel)` |
+| `host/storage/test_mel_writer.py` | 4 個測試，全部針對 `write_mel_to_trial()` 本身（正常寫入、覆蓋既有 placeholder、band 數錯誤時報錯、trial 不存在時報 `KeyError`）——**這 4 個測試會在刪除時直接壞掉** |
+
+#### 2. `bridge_server.py` 裡精確到哪個函式、哪條路徑
+
+- 觸發點：`_process_mfcc()`（`bridge_server.py:1140`），自己的文件字串寫著
+  「**B14 備援路線**」——由 `/record` 這個 HTTP 端點驅動（不是
+  `/trial/*`），流程是「錄一段 WAV → 用 `wav_to_log_mel_timed()` 算
+  log-mel → 存一份 `.npy` → **若命令列給了 `--h5-session`**，再多寫一份
+  進指定 session 檔的下一個 trial（`mfcc_target["next_trial_idx"]` 每次
+  `_process_mfcc()` 呼叫自動 +1，跟 `TrialStateMachine`/
+  `SessionRegistry` 完全無關，也不檢查 baseline 是否已完成）。
+- 跟現行 `/trial/*` 流程（`TrialStateMachine.write_trial()`）是**兩條完全
+  獨立、不互相知道對方存在**的路徑；只要沒有人同時對同一個 session 檔
+  又走 `/record --h5-session` 又走 `/trial/*`，目前不會互相覆寫打架，
+  但也沒有任何機制**阻止**兩者同時對著同一個檔案動作。
+
+#### 3. `--h5-session` 這條舊路徑現在還有人用嗎
+
+- `--h5-session` 的 argparse `help=` 文字自己承認是「B14 備援路線」。
+- 全 repo 搜尋 `h5-session`/`h5_session`：**只有 `bridge_server.py` 自己
+  的定義/讀取**，沒有任何 README、`HANDOFF.md`、`HANDOFF_DRYRUN.md`、
+  `DEMO_RUNBOOK.md` 提到這個旗標。
+- `DEMO_RUNBOOK.md` 明講「`E01`-`E08` 全部跳過」——這條路徑唯一存在的
+  理由（`E08` 的「真板子壞掉時的示範備援」）**目前一次都沒被實際跑過**。
+- 結論：目前找不到任何文件或使用紀錄顯示這個旗標還在被誰依賴，看起來
+  是純粹的遺跡，但沒有查到 100% 排除的辦法（沒有人能替沒發生過的使用
+  紀錄背書）。
+
+#### 4. 刪掉會不會有東西壞——⚠️ 有一個不明顯的風險
+
+直接刪 `host/storage/mel_writer.py` 這個檔案：
+
+- `host/storage/test_mel_writer.py` 的 4 個測試會直接壞掉（`ImportError`），
+  這個很好預期。
+- **不明顯的風險**：`bridge_server.py:108-109` 把
+  `wav_to_log_mel_timed`（來自 `host/features/mel_pipeline.py`，這支
+  才是真正在算 mel 的邏輯）跟 `write_mel_to_trial`（`mel_writer.py`）
+  **放在同一個 `try/except ImportError` 區塊裡一起 import**。如果直接
+  刪掉 `mel_writer.py` 而不同時修改 `bridge_server.py:108-109` 的 import
+  結構，`from host.storage.mel_writer import write_mel_to_trial as _t`
+  會拋 `ModuleNotFoundError`（`ImportError` 的子類），被同一個
+  `except ImportError` 接住，`_load_mel_backend()` 從此對每次呼叫都回
+  `False`——**結果是整個 mel backend（含 `.npy` 這條完全正常、沒有
+  schema 問題的路徑）被一起關掉**，不只是 `--h5-session` 那段有問題的
+  程式碼停用。這是「只刪 `mel_writer.py`」這個最直覺的修法會踩到的坑，
+  修的時候要**同時**把 `bridge_server.py` 的 import 拆開（或者把
+  `write_mel_to_trial` 的 import 移到只在 `--h5-session` 真的有給值時
+  才嘗試），這正是為什麼這輪只回報、不動手——這個坑本身就落在
+  `bridge_server.py`，屬於 ed／`7c [c32fd9]` 現在正在動的檔案範圍。
+
+**兩種修法都要有人排進 story**：(a) 讓 `_process_mfcc()` 改走
+`TrialStateMachine`/`SessionWriter` 的正式路徑，`mel_writer.py` 整個退場；
+或 (b) 保留 `--h5-session` 這條備援路線，但至少讓它一起寫 `mel_t_us`
+（目前完全沒有算真正的時間戳，用 dataset index 當 timestamp 也不對，
+`_process_mfcc()` 現有的資訊裡沒有裝置時鐘可以推），並且修 import 順序
+避免上面那個風險。**這輪按邊界規定不動手，只回報。**
 
 ---
 
@@ -101,11 +152,16 @@ B09/B11 之前的示範路徑**，程式裡自己的註解寫著「B09（session
 | `vad_confidence` | `write_trial()`，選填 | 同上，B15 有算，`analysis/` 沒有消費點 |
 | `noise_floor_mu`, `noise_floor_sigma` | `SessionWriter._write_meta()`，必填 | `bridge_server.read_baseline_thresholds()` 有讀（給 VAD 用），但 `analysis/` 沒有任何實驗直接用它算東西 |
 | `clock_slope`, `clock_offset`, `clock_residual_p95`, `clock_drift_us`, `clock_drift_ppm`, `clock_sync_span_us`, `clock_sync_confirmed`, `session_start_*`, `session_end_*`, `clock_cross_check_ppm_diff`, `clock_cross_check_ok` | `SessionWriter._write_meta()`，必填/`finalize_session_end()` | 純校時診斷欄位，`analysis/` 沒有任何程式碼檢查它們——**這點比單純的「還沒輪到」更值得注意**：如果一個 session 的 `clock_sync_confirmed=False` 或 `clock_cross_check_ok=False`，代表這個檔案的時間戳可能不可信，但目前**沒有任何分析流程會因此警告或排除它**。不算這次的三種歷史 bug模式，但值得另開一個 story 評估要不要在 `availability()`／`verification_report.py` 加一道檢查 |
-| `mic_peak` | `write_trial()`，必填 dataset | `Trial` dataclass 沒有 `mic_peak` 欄位（`mic_rms` 有，`mic_peak` 沒有）——**結構性讀不到**：不是「沒人剛好去讀」，是 loader 從沒把它接進 `Trial`。目前沒有實驗需要峰值（跟削波偵測相關，`D` 軌尚未有這類實驗），先記錄 |
-| `mel_t_us` | `write_trial()`，跟 `mel` 成對必寫 | **結構性讀不到**：`Trial.mel` 有暴露，但沒有對應的 `Trial.mel_t_us`——任何要對齊 mel 幀與其他串流時間戳的分析（例如驗證 D14 的 `lip_onset_us` 落在哪個 mel 幀）目前做不到，要先加欄位 |
-| `tof_ambient_t_us` | `write_trial()`，跟 `tof_ambient_*` 成對必寫 | 同上，`Trial.ambient_a/b` 有暴露，沒有 `Trial.ambient_t_us` |
+| `mic_peak` | `write_trial()`，必填 dataset | **這輪已把「結構性讀不到」的部分解掉**：`Trial` dataclass 現在有 `mic_peak` 欄位了（原本 `mic_rms` 有、`mic_peak` 沒有）。但介面通了不等於有人在用——`analysis/` 目前還沒有任何削波偵測一類的實驗需要它，仍然歸在「有寫、沒人讀」，只是不再是「連讀都讀不到」 |
+| `mel_t_us` | `write_trial()`，跟 `mel` 成對必寫 | 同上，這輪加進 `Trial.mel_t_us`，結構性缺口解掉了；`analysis/` 還沒有任何要對齊 mel 幀與其他串流時間戳的分析會用到它 |
+| `tof_ambient_t_us` | `write_trial()`，跟 `tof_ambient_*` 成對必寫 | 同上，這輪加進 `Trial.ambient_t_us` |
 | `audio`, `audio_t0_us` | `write_trial()`，選填 | `Trial` dataclass完全沒有 `audio` 欄位；目前沒有任何錄音管線真的餵 `audio` 給 `write_trial()`（`schema_example.py` 的範例檔是唯一寫過的地方），純示範用途 |
-| `source` | **半供應**——見情況三前的特別說明 | 見下 |
+| `source` | `SessionWriter._write_meta()`，選填——**這輪加了**（原本是情況四，見下方「已解決」） | 呼叫端（`bridge_server.py`）一直都在傳，現在寫入端接住了；`analysis/` 目前還沒有人讀，跟上面幾筆一樣屬於「接口通了、還沒被用」 |
+
+`mic_peak`/`mel_t_us`/`tof_ambient_t_us`/`source` 這四筆**這輪把「讀不到」
+的技術缺口解掉了，但沒有升級成情況一**——情況一要求真的有消費者，這四筆
+目前都還沒有，跟上面 `speaking_mode`/`vad_confidence` 是同一種「準備好、
+等人來用」的暫態，不是已經被驗證過的資料流。
 
 **這輪移出這張表的 7 筆**（`vad_start_us`、`vad_end_us`、`lip_onset_us`、
 `voice_onset_us`、`lip_onset_us_A`、`lip_onset_us_B`、`comparable`）——
@@ -170,11 +226,11 @@ B09/B11 之前的示範路徑**，程式裡自己的註解寫著「B09（session
 > `TrialStateMachine.__init__` 的每個關鍵字參數都一一核對過）。列在這裡
 > 是為了證明這張表**真的能抓到這一類 bug**，不是憑空舉例。
 
-**目前的欄位裡沒有找到第二個活生生的例子**——但 `source` 接近：見下方。
+**目前的欄位裡沒有找到第二個活生生的例子。**
 
-### 情況四：契約有定義、兩邊都沒真的實作（半路的例外：`source`）
+### 情況四：契約有定義、兩邊都沒真的實作（目前 0 筆——`source` 這輪已解決）
 
-`source` 是這四種情況裡最特殊的一個，嚴格來說不完全屬於任何一類：
+`source` 原本就落在這一類，寫上一版報告時的狀態是：
 
 - **契約定義了**（`CONTRACTS.md` §2 明確列出 `source`）
 - **呼叫端努力要寫**：`bridge_server.py` 組 baseline 的 `meta` dict 時，
@@ -182,36 +238,59 @@ B09/B11 之前的示範路徑**，程式裡自己的註解寫著「B09（session
   「Passed, but currently dropped: `SessionWriter._write_meta` only writes
   `REQUIRED_META_KEYS`……the moment `source` joins the schema this starts
   working with no change on this side」
-- **但寫入端真的沒接住**：`session_writer.py` 的 `REQUIRED_META_KEYS`/
-  `OPTIONAL_META_KEYS` 都沒有 `source`，這個值進了 `_write_meta()` 就被
-  忽略，`/meta` 裡完全沒有這個 attr
-- **也沒有人在讀**：`grep` 過 `analysis/`，沒有任何地方讀 `meta.get("source")`
+- **但寫入端真的沒接住**：`session_writer.py` 完全沒有欄位可以接住它
+- **也沒有人在讀**：`analysis/` 沒有任何地方讀 `meta.get("source")`
 
-跟 `energy_mu` 那個案例的差別：**還沒有人開始讀**，所以現在拿到的不是
-「安靜的錯誤答案」，是單純的「這個欄位目前不存在」——**還不是活的 bug，
-是下一個 `energy_mu`**。一旦哪天有人（例如 `E05` 要驗證四小時錄製真的是
-拿真板子錄的，不是不小心接到 mock）開始寫 `meta.get("source")`，會拿到
-`None`，而 `bridge_server.py` 那句註解已經先講好「這裡不用改」，所以
-**修法非常小**：把 `source` 加進 `session_writer.py` 的
-`OPTIONAL_META_KEYS`，跟 `sensors_enabled` 同一個模式。
+跟 `energy_mu` 那個案例的差別是**還沒有人開始讀**，所以當時拿到的不是
+「安靜的錯誤答案」，是單純的「這個欄位不存在」——**是還沒發作的
+`energy_mu`**。修法正是預告過的那樣：把 `source` 加進
+`session_writer.py` 的 `OPTIONAL_META_KEYS`，值域跟 `bridge_server.py`
+的 `VALID_SOURCES` 同步（`live`/`mock`/`replay-log`/`replay-session`），
+**這輪已經做完**（`host/storage/test_session_writer.py` 新增 4 個測試，
+含四個合法值各自都能收）。`bridge_server.py` 那端沒有動——它本來就
+已經在傳，不需要改。
 
-這處落在自己的檔案（`session_writer.py`），但**這輪先不修**——照邊界規定
-先盤點，等調度員決定要不要排進這輪或另開一個小 story（改動本身預期
-不到 10 行，跟 `sensors_enabled` 那次一樣小）。
+`analysis/` 目前仍然沒有人讀 `source`，所以它現在的正確歸類是「情況
+二：有寫、沒人讀」（已經搬過去），不是情況一——**接口通了不等於已經
+有人在用**，跟 `mic_peak`/`mel_t_us`/`tof_ambient_t_us` 是同一種暫態。
 
 ---
 
-## 這輪順手修的兩處文件遺漏（都是自己先前編輯留下的缺）
+## 這輪順手修的文件遺漏
 
 `CONTRACTS.md` §2 的 schema 列表原本漏列 `sensors_enabled_confirmed`
 （`sensors_enabled` 的確認旗標，程式碼裡一直都有、`session_loader.py`
 的 `sensors_confirmed` 也真的在讀，只是列表忘了寫）——已補上一行，
 不影響任何邏輯，純粹讓這份供需對帳表本身站得住腳。
 
+## 第二輪：結清 `mic_peak`/`mel_t_us`/`tof_ambient_t_us`/`source`
+
+- `analysis/reporting/session_loader.py`：`Trial` dataclass 新增
+  `mic_peak`/`mel_t_us`/`ambient_t_us` 三個欄位，`load_session()` 對應
+  讀出來（`mic_peak` 必填直接讀，`mel_t_us`/`ambient_t_us` 跟著
+  `mel`/`tof_ambient_A` 是否存在來決定讀不讀，選填時缺席回 `None` 不報錯）。
+  `analysis/reporting/test_run_all.py` 新增 2 個測試：有 mel/ambient 時
+  三個新欄位都讀得到且長度跟資料對得上，沒有 mel/ambient 時新欄位是
+  `None` 不是空陣列或報錯。
+- `host/storage/session_writer.py`：`OPTIONAL_META_KEYS` 加入 `source`，
+  值域跟 `bridge_server.py` 的 `VALID_SOURCES` 同步
+  （`live`/`mock`/`replay-log`/`replay-session`），沒給就整個 attr 不寫入。
+  `host/storage/test_session_writer.py` 新增 4 個測試（省略、給值、四個
+  合法值各自都能收、非法值拒絕）。
+- 都跑過對應測試套件確認全線通過，見文末。
+
+## `mel_writer.py`：偵察清單交出去，沒有動手刪
+
+見上方第一部分的完整偵察小節（誰引用、`bridge_server.py` 精確到哪個
+函式與哪一行、`--h5-session` 有沒有人在用、刪掉會不會連累
+`wav_to_log_mel_timed` 這條完全正常的 `.npy` 路徑）。**這輪沒有刪除或
+修改 `mel_writer.py`**，也沒有動 `bridge_server.py` 的 import 結構。
+
 ---
 
 ## 沒有動的檔案
 
 `host/storage/baseline.py`、`host/trial/state_machine.py`（4f 正在改）、
-`vl53l7cx_test/monitor/bridge_server.py`（ed／`7c [c32fd9]` 同時在改）——
-全程只讀不改，上面每一筆涉及這些檔案的發現都只回報，沒有動手修。
+`vl53l7cx_test/monitor/bridge_server.py`（ed／`7c [c32fd9]`／`7c [4bedc9]`
+三個人同時在改）——全程只讀不改，上面每一筆涉及這些檔案的發現都只回報，
+沒有動手修，也沒有刪除 `host/storage/mel_writer.py`（只列清單）。

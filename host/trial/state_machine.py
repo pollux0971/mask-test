@@ -115,6 +115,25 @@ def classify_quality(valid_zone_ratio: float, drop_count: int) -> str:
     return "rejected"
 
 
+def _union_min_lips(lips_A, lips_B):
+    """B21：雙感測器唇動偵測融合，`union_min`（調度員裁決，59 的分析）：
+    兩顆都測到取 onset 較早的那顆**整個** `TofVadResult`（不是逐欄位混合
+    兩顆的數字——union_min 選的是「哪一顆的偵測結果」），只有一顆測到就
+    用那顆；兩顆都沒測到就回傳 sensor A 的（`applicable=False`/沒有
+    segment，`reason` 說明用）。B 缺席是這個融合策略本身就假設的正常
+    狀況，不是資料損毀。
+    """
+    onset_A = lips_A.primary.start_us if lips_A.detected else None
+    onset_B = lips_B.primary.start_us if lips_B.detected else None
+    if onset_A is not None and onset_B is not None:
+        return lips_A if onset_A <= onset_B else lips_B
+    if onset_A is not None:
+        return lips_A
+    if onset_B is not None:
+        return lips_B
+    return lips_A
+
+
 def _frames_to_tof_arrays(frames, values_attr: str, present_attr: str):
     """把 `Aligner.frames()` 吐出的 `AlignedFrame` 序列轉成 T02 schema 要的
     `(T, 32) float32`／`(T, 16) bool`。無效通道（`TofSample.values` 裡的
@@ -598,31 +617,39 @@ class TrialStateMachine:
         quality = classify_quality(valid_zone_ratio, drop_count)
 
         # B21：真的呼叫 B15/B16，餵原始事件串（_raw_events_window()，不是
-        # AlignedFrame）與建構時給的 baseline/底噪統計。只用 sensor A 餵唇動
-        # 偵測——B21.md 自己給的介面範例只示範了單一感測器，沒有提兩顆怎麼
-        # 融合，這裡照給的範例做，不是自己發明一個融合策略。
+        # AlignedFrame）與建構時給的 baseline/底噪統計。
         #
-        # energy_mu/energy_sigma 從 baseline 期間算好傳進來（host/storage/
-        # baseline.py 的 evaluate_baseline()，跟這裡用同一組
-        # zone_energy()/estimate_energy_floor()，不是抄一份）——沒給
-        # （例如舊測試沒傳）就讓 detect_lip_activity() 自己用
-        # estimate_energy_floor() 從這筆 trial 的資料估，精度差一點但不會
-        # 壞掉（B16 量過：自估比 baseline 算好的偏嚴約 23%）。
-        #
-        # excluded_zones 也沒有帶 ZoneQualityReport 進來排除已知壞掉的
-        # zone——B21.md 的建構子簽章範圍只列了 baseline_mu/sigma，沒有列
-        # quality report，這裡沒有跟著多加一個沒被要求的參數。
+        # 兩顆 ToF 都跑，融合策略是 union_min（調度員裁決，採納 59 的分析：
+        # intersection 弱訊號下偵測率崩到 0-3%、merged_energy 掉到剩
+        # 24%，union_min 全程 100%、偏差 ≤0.8ms）——兩顆都測到取 onset
+        # 較早的那顆*整個* TofVadResult，只有一顆測到就用那顆，B 缺席是
+        # union_min 設計本身就假設的正常狀況，不是損毀。energy_mu/sigma
+        # 兩顆共用同一組（host/storage/baseline.py 的 evaluate_baseline()
+        # 目前只算 sensor A 這段的能量門檻，B21 當時的範圍就只列了單一
+        # sensor；沒有另外幫 B 算一份，這是最小改動下的判斷，不是假設兩顆
+        # 的能量分布相同）。
         raw_window = self._raw_events_window(self._capture_start_t_us, self._capture_end_t_us)
-        lips = detect_lips(
+        lips_A = detect_lips(
             raw_window, self._baseline_mu_A, self._baseline_sigma_A, sensor="A",
             energy_mu=self._energy_mu, energy_sigma=self._energy_sigma,
         )
+        lips_B = detect_lips(
+            raw_window, self._baseline_mu_B, self._baseline_sigma_B, sensor="B",
+            energy_mu=self._energy_mu, energy_sigma=self._energy_sigma,
+        )
+        lips = _union_min_lips(lips_A, lips_B)
         voice = detect_voice(
             raw_window, self._noise_floor_mu, self._noise_floor_sigma,
             speaking_mode=self._speaking_mode,
         )
         lead = measure_lip_lead(lips, voice)
         vad_attrs = lead.to_trial_attrs()  # 四個都可能是 None，見 to_trial_attrs() 的文件字串
+        # lip_onset_us_A/_B：融合前各自獨立的 onset，給 E05 事後檢驗
+        # union_min 選得對不對用（59 的分析方法要這個）。session_writer.py
+        # 的 write_trial() 已經接了這兩個鍵（18 剛加的），這裡先傳值——
+        # 跟之前 energy_mu/comparable 一樣的模式，兩邊各自完成後自動接上。
+        lip_onset_us_A = lips_A.primary.start_us if lips_A.detected else None
+        lip_onset_us_B = lips_B.primary.start_us if lips_B.detected else None
         # `vad_confidence`：CONTRACTS.md §2 說「B15 的端點偵測信心度；silent
         # 模式為 None」——直接沿用 VadResult.to_dict() 自己的 vad_confidence
         # 定義（primary 是 None 就是 None），不重寫一份可能跟它不一致的邏輯。
@@ -646,6 +673,7 @@ class TrialStateMachine:
             # 自己分 None（沒算過/沒偵測到，整個 attr 不寫）vs. False（算過，
             # 結論就是不可比）——原樣傳過去，不在這裡多做判斷。
             comparable=lead.comparable,
+            lip_onset_us_A=lip_onset_us_A, lip_onset_us_B=lip_onset_us_B,
             quality=quality, **vad_attrs,
         )
         add_session(self._session_h5_path, self._manifest_path, root=self._manifest_root)
