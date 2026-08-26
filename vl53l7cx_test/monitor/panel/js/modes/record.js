@@ -224,6 +224,18 @@ const CAPTURE_STALL_POLL_MS = 750;
 const BASELINE_STALE_MS = 10 * 60 * 1000;
 const QUALITY_DOT_LABEL = { ok: "●", low: "●", rejected: "●" };
 
+// Real-hardware audit (this session): every silent failure mode found today
+// looked identical to normal on screen -- sensor A dropping mid-record,
+// mic never actually connected, a stream stopping outright -- because
+// nothing showed the raw numbers live. "有沒有資料在流" reuses
+// CAPTURE_STALL_MS's own threshold/meaning (same question, not a new one).
+// The user's own request was for numbers, not a pass/fail judgment --
+// quiet is not broken (a bone-conduction mic reads ~4-6 RMS untouched,
+// confirmed on real hardware), only "no data" or "always exactly zero"
+// gets flagged.
+const LIVE_SENSOR_HZ_WINDOW_MS = 2000;
+const LIVE_MIC_BAR_MAX = 500; // generous scale for the bar's width, not a pass/fail threshold
+
 // Small self-contained z-score color, deliberately not imported from
 // monitor.js (nothing there is exported for reuse) -- same thresholds and
 // meaning as monitor.js's zscoreColor() so a red/blue cell means the same
@@ -945,6 +957,55 @@ registerMode("record", (() => {
     }
   }
 
+  // --- live sensor readout (real-hardware audit) --------------------------
+
+  function renderLiveSensorReadout() {
+    const tofA = dataStore.getRecent("tofA", CAPTURE_STALL_MS);
+    const tofB = dataStore.getRecent("tofB", CAPTURE_STALL_MS);
+    const mic = dataStore.getRecent("mic", CAPTURE_STALL_MS);
+    const tofAHz = dataStore.getRecent("tofA", LIVE_SENSOR_HZ_WINDOW_MS).length / (LIVE_SENSOR_HZ_WINDOW_MS / 1000);
+    const tofBHz = dataStore.getRecent("tofB", LIVE_SENSOR_HZ_WINDOW_MS).length / (LIVE_SENSOR_HZ_WINDOW_MS / 1000);
+    const micHz = dataStore.getRecent("mic", LIVE_SENSOR_HZ_WINDOW_MS).length / (LIVE_SENSOR_HZ_WINDOW_MS / 1000);
+
+    const renderTof = (frames, hz, dotEl, textEl) => {
+      const fresh = frames.length > 0;
+      dotEl.className = "quality-dot " + (fresh ? "quality-ok" : "quality-rejected");
+      if (!fresh) {
+        textEl.textContent = "無資料（斷線或串流已停止）";
+        return;
+      }
+      const latest = frames[frames.length - 1];
+      const validText = Array.isArray(latest.valid)
+        ? `　${latest.valid.filter((v) => v !== false).length}/${latest.valid.length} 有效`
+        : "";
+      textEl.textContent = `${hz.toFixed(0)} Hz${validText}`;
+    };
+    renderTof(tofA, tofAHz, els.liveTofADot, els.liveTofAText);
+    renderTof(tofB, tofBHz, els.liveTofBDot, els.liveTofBText);
+
+    // 麥克風：不用門檻判斷「好不好」（接觸式骨傳導麥克風安靜時 RMS 4-6
+    // 是真板子上量到的正常值，不是壞掉）——只標兩種真正算損壞的狀況：
+    // 完全沒有資料、或有資料但 RMS 恆為 0（後者是「沒接上」，不是「很安
+    // 靜」，兩者對使用者的意義完全不同，不能混在一起變成同一個「安靜」）。
+    const micFresh = mic.length > 0;
+    const micAllZero = micFresh && mic.every((m) => (m.rms || 0) === 0);
+    if (!micFresh) {
+      els.liveMicDot.className = "quality-dot quality-rejected";
+      els.liveMicText.textContent = "無資料（麥克風串流已停止）";
+      els.liveMicBar.style.width = "0%";
+    } else if (micAllZero) {
+      els.liveMicDot.className = "quality-dot quality-rejected";
+      els.liveMicText.textContent = "RMS 恆為 0 —— 麥克風可能沒接上（不是「很安靜」）";
+      els.liveMicBar.style.width = "0%";
+    } else {
+      const latest = mic[mic.length - 1];
+      els.liveMicDot.className = "quality-dot quality-ok";
+      els.liveMicText.textContent =
+        `RMS ${(latest.rms ?? 0).toFixed(1)}　peak ${latest.peak ?? "—"}　${micHz.toFixed(0)} Hz`;
+      els.liveMicBar.style.width = `${Math.min(100, ((latest.rms || 0) / LIVE_MIC_BAR_MAX) * 100)}%`;
+    }
+  }
+
   // --- disconnect-during-CAPTURE watch (ca's audit) -----------------------
   //
   // "斷線這件事前端已經知道了，只是 record 模式沒有用這個資訊" -- shell.js
@@ -1529,6 +1590,14 @@ registerMode("record", (() => {
             </div>
 
             <aside class="progress-dash" data-progress-dash>
+              <div class="section-label">即時感測器</div>
+              <div class="mono live-sensor-panel" data-live-sensor-panel style="font-size:12px; display:flex; flex-direction:column; gap:4px; margin-bottom:14px;">
+                <div><span class="quality-dot quality-ok" data-live-tofa-dot>●</span> ToF A：<span data-live-tofa-text>—</span></div>
+                <div><span class="quality-dot quality-ok" data-live-tofb-dot>●</span> ToF B：<span data-live-tofb-text>—</span></div>
+                <div><span class="quality-dot quality-ok" data-live-mic-dot>●</span> 麥克風：<span data-live-mic-text>—</span></div>
+                <div class="label-bar-track"><div class="label-bar-fill" data-live-mic-bar style="width:0%"></div></div>
+              </div>
+
               <div class="section-label">進度（C13）</div>
               <label class="target-per-label-field mono">
                 每詞目標 <input type="number" min="1" step="1" data-target-per-label value="${DEFAULT_TARGET_PER_LABEL}" /> 次
@@ -1627,6 +1696,13 @@ registerMode("record", (() => {
         progressEta: root.querySelector("[data-progress-eta]"),
         labelBars: root.querySelector("[data-label-bars]"),
         recentList: root.querySelector("[data-recent-list]"),
+        liveTofADot: root.querySelector("[data-live-tofa-dot]"),
+        liveTofAText: root.querySelector("[data-live-tofa-text]"),
+        liveTofBDot: root.querySelector("[data-live-tofb-dot]"),
+        liveTofBText: root.querySelector("[data-live-tofb-text]"),
+        liveMicDot: root.querySelector("[data-live-mic-dot]"),
+        liveMicText: root.querySelector("[data-live-mic-text]"),
+        liveMicBar: root.querySelector("[data-live-mic-bar]"),
         buildTemplatesBtn: root.querySelector("[data-build-templates-btn]"),
         templatesStatusBox: root.querySelector("[data-templates-status-box]"),
         templatesStatusTitle: root.querySelector("[data-templates-status-title]"),
@@ -1719,6 +1795,11 @@ registerMode("record", (() => {
         countdownTimer = setInterval(() => {
           updateBaselineCountdown();
           checkBaselineStaleness();
+          // 4Hz -- monitor.js has its own CPU history from updating on every
+          // frame (drawTrail() forcing layout via clientWidth reads after
+          // style writes, 916 times in 8s); sharing this same throttled
+          // timer instead of a new one keeps this well under that.
+          renderLiveSensorReadout();
         }, 250);
       }
     },

@@ -294,3 +294,174 @@ I (98765) bone_mic: a15_perf: mic_task stack headroom = 3200 bytes
 見 `E01_bringup_checklist.md` §1.2）。唯一的理由不做是「使用者這次只想燒
 FFT probe，不想在同一次燒錄夾帶任何其他改動」——如果是這樣，這是可以晚一次
 燒錄再做的東西，不影響 FFT probe 那次量測本身。
+
+---
+
+## 7. 下次重燒要合併的三個改動（已驗證過，**沒有套用**——見文末事故說明）
+
+三個改動：`a15_perf` log race（§6）、`check_data_ready()` 失敗要計數
+（`E01_bringup_checklist.md` §0.7）、**加碼**：把 FFT probe 改成指令觸發，
+這樣只要燒一次就能同時拿到 FFT 量測跟另外兩個永久修正，之後也能隨時重測
+FFT，不用為了這件事再燒一次。
+
+### A. 三個改動各自的內容
+
+**A1. `main/bone_mic.c` 第 420-425 行**——`a15_perf` log 包進 `uart_out_lock()`：
+
+```c
+        if (t_end - last_stack_log_us >= 10 * 1000000) {
+            UBaseType_t words_free = uxTaskGetStackHighWaterMark(NULL);
+            uart_out_lock();
+            ESP_LOGI(TAG, "a15_perf: mic_task stack headroom = %u bytes",
+                     (unsigned)(words_free * sizeof(StackType_t)));
+            uart_out_unlock();
+            last_stack_log_us = t_end;
+        }
+```
+（只加 `uart_out_lock();`/`uart_out_unlock();` 兩行）
+
+**風險**：mic_task 最壞卡 ~13ms（等 8×8 的 `$T` 印完），I2S DMA 緩衝
+（`dma_desc_num=6 × dma_frame_num=240` ≈ 90ms 容量）能吸收，5-7 倍餘裕，
+不會掉音訊幀。
+
+**A2. `main/vl53l7cx_test.c` 第 402-403 行之後**——`check_data_ready()`
+失敗也累加計數器：
+
+```c
+            uint8_t ready = 0;
+            uint8_t status = vl53l7cx_check_data_ready(&s_dev[i], &ready);
+            if (status != 0) {
+                /* A05: the I2C transaction itself failed (bus down, loose
+                 * connection) -- distinct from get_ranging_data() failing
+                 * below, but was previously silent: nothing incremented,
+                 * $H's drop_A/B stayed frozen, indistinguishable from a
+                 * sensor that never dropped a frame. */
+                s_drop_error[i]++;
+            } else if (ready) {
+```
+（原本是 `if (status == 0 && ready) {`，改成 `if (status != 0) { s_drop_error[i]++; } else if (ready) {`，後面整段大括號內容不變）
+
+**風險**：無。純加一個計數分支，不影響任何既有邏輯路徑（`status==0 &&
+!ready` 這個最常見的「還沒準備好」情況，兩種寫法行為完全一樣）。
+
+**A3+A4. FFT probe 改指令觸發**（跟 E01 §1.1 現在寫的「暫時加兩行、測完拆掉」
+是兩種不同做法，這個是**永久留著**、隨時能重測）：
+
+🔴 **附帶發現，這是這輪意外查到的**：`fft_probe.c` 原本結尾呼叫
+`dsps_fft2r_deinit_fc32()`——查過 esp-dsp 原始碼
+（`managed_components/espressif__esp-dsp/modules/fft/float/dsps_fft2r_fc32_ansi.c`），
+這個函式操作的是**整個函式庫共用的一份全域狀態**
+（`dsps_fft_w_table_fc32`／`dsps_fft2r_ram_rev_table`），跟 `bone_mic.c`
+的 mel pipeline 用的是**同一份**（都是 N=512）。**在開機當下呼叫**（現在
+E01 §1.1 的用法）是安全的，因為那時候 `mic_task` 還沒啟動、還沒宣稱擁有
+這份全域狀態。**但如果改成指令觸發，指令一定是在 `mic_task` 已經跑起來
+之後才可能送達**（`uart_cmd_start()` 在 `app_main()` 裡排在
+`bone_mic_start_monitor()` 後面）——這時候再呼叫 `deinit`，會把
+`mic_task` 正在用的 `dsps_fft2r_ram_rev_table` 釋放掉，**下一次 mel
+pipeline 的 FFT 呼叫就是 use-after-free**，輕則 `$F` 輸出開始亂掉，
+重則直接當機。**這是先前程式碼裡沒人踩到的地雷，因為 fft_probe_run()
+之前只在開機當下、mic_task 還沒起來時被呼叫過。**
+
+**修法**：拿掉 `fft_probe.c` 結尾那行 `dsps_fft2r_deinit_fc32();`。
+不呼叫 deinit 對兩種用法都安全——開機時用，`mic_task` 之後自己
+`dsps_fft2r_init_fc32()` 會看到已經初始化過，直接跳過（原本的行為就是
+如此，只是不再自己拆掉）；指令觸發時用，本來就該共用 `mic_task` 已經
+建好的表，不去動它。
+
+`main/fft_probe.c` 結尾：
+```c
+    ESP_LOGI(TAG, "N=%d expect_bin=%d(+-%d) got_bin=%d [%s] fft+bitrev=%lld us",
+             FFT_PROBE_N, FFT_PROBE_EXPECT_BIN, FFT_PROBE_BIN_TOLERANCE, peak_bin,
+             bin_ok ? "OK" : "MISMATCH", (long long)dt_us);
+
+    /* No dsps_fft2r_deinit_fc32() here: ... (完整理由見程式碼註解) */
+}
+```
+（刪掉原本結尾的 `dsps_fft2r_deinit_fc32();` 這一行，換成一段解釋為什麼
+不呼叫的註解）
+
+`main/uart_cmd.c`——加 `#include "fft_probe.h"`，並在 `uart_cmd_task()`
+的指令判斷鏈裡加一個新分支：
+
+```c
+        } else if (strcmp(cmd, "FFTPROBE") == 0) {
+            /* A10 diagnostic, not part of CONTRACTS.md #1.2 -- one-shot,
+             * no state change, safe to run anytime after boot (see
+             * fft_probe.c for why it no longer deinits shared FFT state). */
+            fft_probe_run();
+        }
+```
+（接在既有的 `REC:%d` 分支之後、`else` 之前）
+
+⚠️ **`FFTPROBE` 是新指令，不在 `CONTRACTS.md` §1.2 目前定義的指令集裡**
+——雖然是純診斷、不改任何資料格式，但 §1 是 FROZEN 章節，**新增指令
+照規矩要走你的審查流程，這裡只當提案，不算已核准**。
+
+**風險**：`fft_probe_run()` 本身只跑一次 512 點 FFT，耗時 <2ms
+（見 `A10_spike.md`），在 `uart_cmd_task`（priority 5）裡執行不會拖慢
+任何東西；不呼叫 deinit 後也不會再干擾 `mic_task`。
+
+### B. 🔴 三個一起改，真的編過了
+
+**這次是把上面 A1-A4 全部一次套用**（不是分開驗證各自 OK 就假設加總沒事）：
+`bone_mic.c`（A1）、`vl53l7cx_test.c`（A2）、`fft_probe.c`（A3）、
+`uart_cmd.c`（A4）四個檔案一起改，`idf.py build`——**過了，0 warning**
+（`grep -ic "warning:"` 明確確認是 0，不是沒看到就當沒有）。
+
+**已經改回去**——四個檔案的內容都還原成套用前的樣子，`git diff` 應該乾淨
+（見文末「這輪的事故」，還原過程中撞到一個 git 問題，已經另外回報，
+跟這份技術內容本身無關）。
+
+### C. 順序與相依：其實只要燒一次
+
+**FFT probe 原本（E01 §1.1 現在寫的版本）是「暫時加兩行、測完拆掉」，
+代表要燒兩次**——第一次測 FFT，第二次拆掉恢復正常版本。
+
+**改成指令觸發之後，這個限制消失了**：
+- **只要燒一次**：把 A1（a15_perf lock）、A2（drop 計數）、A3+A4
+  （FFT probe 改指令觸發，永久留著，不用拆）三個一起燒進去
+- 燒完之後，**任何時候**想測 FFT，直接對序列埠送 `FFTPROBE` 這個指令，
+  不用重燒——`E01_bringup_checklist.md` §1.1 的「測完把兩行拆掉再重燒
+  一次」這個步驟**整段可以刪掉**，改成「送一次 `FFTPROBE` 指令」
+- **代價**：多了一個非契約定義的指令、`fft_probe.c` 從「開機用一次即丟」
+  變成「永久留在正式版裡的診斷工具」——程式碼量沒有變小，但換來的是
+  以後 FFT 效能任何時候都能重測（例如換了 Mel 設定、懷疑效能退化時），
+  不用再走「改程式碼、重燒、測完再改回去」這一整套流程
+
+### D. 給使用者照抄的操作（他會戴著裝置做這件事）
+
+```
+. ~/esp/esp-idf/export.sh
+cd vl53l7cx_test
+# 四個檔案的改動已經準備好（見上面 A1-A4），套用之後：
+idf.py -p /dev/ttyUSB0 build flash monitor
+```
+
+燒完開機、看到 `$STATUS` 那一行之後，**在 monitor 裡直接打
+`FFTPROBE` 按下 Enter**，看 log 裡 `fft_probe` 這個 tag 印出來的
+`N=512 expect_bin=32(+-1) got_bin=... fft+bitrev=... us`，照
+`A10_spike.md` 的判準表填 GO/NO-GO。**之後任何時候想再測一次，
+同樣打 `FFTPROBE` 就好，不用再重燒。**
+
+---
+
+## 8. 這輪的事故：我的測試改動被意外掃進一個不相干的 commit
+
+**跟上面 §6/§7 的技術內容無關，是這次執行過程中的流程問題，記錄下來
+避免下次重演。**
+
+驗證 §7 的三個改動時，四個檔案（`bone_mic.c`／`vl53l7cx_test.c`／
+`fft_probe.c`／`uart_cmd.c`）短暫處於「已套用、還沒改回去」的狀態
+（用來跑 `idf.py build` 驗證）。**在改回去之前**，這 4 個檔案的改動被
+另一個 commit（`4b4215a`，訊息是「per-trial sensors_seen：中途掉線才
+看得出來的那一層」，內容其實是 `session_writer.py`，**完全沒提到這 4
+個韌體檔案**）意外一起帶進去，而且**已經推上 `origin/main`**。
+
+已經用 `git checkout <該 commit 的父提交> -- <4 個檔案>` 把工作目錄還原
+成套用前的樣子（不是改寫 git history，只是把檔案內容還原），重新
+build 確認正常，**現在工作目錄跟使用者板子上跑的版本一致**。但
+`origin/main` 上那個 commit 裡仍然留著這次洩漏的內容，需要負責
+commit/push 的人決定要不要另外補一個 revert commit。細節已經另外
+訊息回報過，這裡只留一句話存證，避免這份報告看起來像「東西已經套用了」
+——**沒有，§7 的三個改動目前的正確狀態是「已驗證、未套用」，跟原本
+的意思一樣，只是中間繞了一圈。**
