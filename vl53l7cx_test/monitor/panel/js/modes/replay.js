@@ -67,17 +67,16 @@ registerMode("replay", (() => {
     try {
       const res = await fetch("/replay/sessions");
       if (!res.ok) throw new Error("HTTP " + res.status);
-      const data = await res.json();
-      const files = Array.isArray(data.files) ? data.files : [];
+      // CONTRACTS.md §4.1.3: 回應是「陣列」，每個元素是
+      // {file, path, bytes, modified_at}，不是 {files:[...]}。value 要用
+      // path（/replay/start?file= 吃的是這個），label 用 file 給人看。
+      const files = await res.json();
       filesSelectEl.innerHTML =
         `<option value="">— 選擇 session（或下方手動輸入路徑）—</option>` +
-        files.map((f) => `<option value="${f}">${f}</option>`).join("");
+        files.map((f) => `<option value="${f.path}">${f.file}</option>`).join("");
       filesSelectEl.disabled = files.length === 0;
     } catch (err) {
-      // Expected right now (endpoint doesn't exist server-side yet) -- the
-      // manual path input below stays usable so controls remain testable
-      // ahead of B19 wiring, same as quiz.js's /recognize fallback.
-      filesSelectEl.innerHTML = `<option value="">（session 清單尚未串接，請用下方輸入路徑）</option>`;
+      filesSelectEl.innerHTML = `<option value="">（session 清單讀取失敗，請用下方輸入路徑）</option>`;
       filesSelectEl.disabled = true;
       console.warn("[replay] /replay/sessions unavailable:", err.message);
     }
@@ -118,15 +117,24 @@ registerMode("replay", (() => {
   }
 
   async function postControl(path) {
+    let res;
     try {
-      const res = await fetch(path, { method: "POST" });
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      return true;
+      res = await fetch(path, { method: "POST" });
     } catch (err) {
-      setStatus("尚未串接（" + path + " 還沒上線）", true);
-      console.warn("[replay] control endpoint unavailable:", path, err.message);
+      // Real network failure -- can't reach the bridge at all.
+      setStatus("連不上後端（" + err.message + "）", true);
+      console.warn("[replay] control endpoint network error:", path, err.message);
       return false;
     }
+    if (!res.ok) {
+      // Endpoint is live (B19 wired it); a non-ok status is a real backend
+      // error (e.g. bad seek target), not "not wired yet" -- show it.
+      const body = await res.json().catch(() => ({}));
+      setStatus(body.error || `操作失敗：HTTP ${res.status}（${path}）`, true);
+      console.warn("[replay] control endpoint error:", path, res.status, body.error);
+      return false;
+    }
+    return true;
   }
 
   async function onLoadClick() {
@@ -140,28 +148,42 @@ registerMode("replay", (() => {
     currentTrialIdx = null;
     renderTimeline();
 
+    let res;
     try {
-      const res = await fetch(`/replay/start?file=${encodeURIComponent(file)}`, { method: "POST" });
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      const data = await res.json().catch(() => null);
-      // Best-effort: a backend that already knows every trial up front can
-      // hand back the full list so the timeline doesn't start empty and
-      // fill in only as playback reaches each one.
-      if (data && Array.isArray(data.trials)) {
-        data.trials.forEach((t) => upsertTrial(t.idx, t.label, t.quality));
-      }
-      sessionLoaded = true;
-      paused = false;
-      playPauseBtn.textContent = "⏸ 暫停";
-      setPlaybackControlsEnabled(true);
-      setStatus(`回放中：${file}`);
-      renderTimeline();
+      res = await fetch(`/replay/start?file=${encodeURIComponent(file)}`, { method: "POST" });
     } catch (err) {
+      // Real network failure -- can't reach the bridge at all.
       sessionLoaded = false;
       setPlaybackControlsEnabled(false);
-      setStatus("尚未串接（/replay/start 還沒上線）— 已知：B17 後端邏輯完成，等 ed 接上 bridge_server.py", true);
-      console.warn("[replay] /replay/start unavailable:", err.message);
+      setStatus("連不上後端（" + err.message + "），請確認 bridge_server.py 是否還在跑", true);
+      console.warn("[replay] /replay/start network error:", err.message);
+      return;
     }
+
+    if (!res.ok) {
+      // CONTRACTS.md §4.1.3: file 不在 sessions 目錄內、或根本不存在，
+      // 都回同一個 404 -- 這是給使用者看的真實錯誤，不是「還沒上線」。
+      const body = await res.json().catch(() => ({}));
+      sessionLoaded = false;
+      setPlaybackControlsEnabled(false);
+      setStatus(body.error || `載入失敗：HTTP ${res.status}`, true);
+      console.warn("[replay] /replay/start error:", res.status, body.error);
+      return;
+    }
+
+    const data = await res.json().catch(() => null);
+    // Best-effort: a backend that already knows every trial up front can
+    // hand back the full list so the timeline doesn't start empty and
+    // fill in only as playback reaches each one.
+    if (data && Array.isArray(data.trials)) {
+      data.trials.forEach((t) => upsertTrial(t.idx, t.label, t.quality));
+    }
+    sessionLoaded = true;
+    paused = false;
+    playPauseBtn.textContent = "⏸ 暫停";
+    setPlaybackControlsEnabled(true);
+    setStatus(`回放中：${file}`);
+    renderTimeline();
   }
 
   async function onPlayPauseClick() {
@@ -281,6 +303,14 @@ registerMode("replay", (() => {
       fetchSessionList();
     },
 
+    onEnter() {
+      // shell.js's leaveMode() only fires onLeave when modeEntered[mode] was
+      // set true by enterMode() -- which requires onEnter to exist at all
+      // (shell.js line ~52). Without this, onLeave (and its /replay/stop
+      // call, CONTRACTS.md §4.1.3) silently never runs on any mode switch.
+      fetchSessionList(); // pick up a session recorded since we last looked
+    },
+
     onData(evt) {
       if (evt.replay === true) {
         lastReplayEventAt = performance.now();
@@ -291,6 +321,20 @@ registerMode("replay", (() => {
         upsertTrial(evt.idx, evt.label, evt.quality);
         renderTimeline();
       }
+    },
+
+    onLeave() {
+      // CONTRACTS.md §4.1.3: 前端「必須」在離開回放模式時呼叫 /replay/stop，
+      // 否則後端會持續處於回放狀態、繼續擋掉真實資料 -- 浮水印會照常在
+      // REPLAY_WATERMARK_LINGER_MS 後淡出，但送過來的其實還是舊錄音，
+      // 使用者會以為自己在看即時資料。
+      if (!sessionLoaded) return;
+      sessionLoaded = false;
+      paused = false;
+      setPlaybackControlsEnabled(false);
+      fetch("/replay/stop", { method: "POST" }).catch((err) => {
+        console.warn("[replay] /replay/stop failed on leave:", err.message);
+      });
     },
   };
 })());

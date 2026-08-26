@@ -544,6 +544,87 @@ def _frames_from_stored_trial(h5_path, trial_group):
     t_end = int(max(trial.tof_t_us[-1], trial.mel_t_us[-1]))
     return list(aligner.frames(t_start, t_end))
 
+
+# --- D08 (partial): POST /templates/build, GET /templates/build/state ---
+#
+# The "trial recording -> saved templates" step existed nowhere at all
+# until esp-mask-test-ad's audit (2026-08-26): the save/load mechanics
+# (analysis/similarity/enrollment.py) were built, the training-side
+# assembly (analysis/similarity/build_templates_from_session.py) exists,
+# but nothing let the user trigger it without opening a terminal --
+# unusable while wearing the device mid-recording. This wires that script
+# in as a background job, same 202+poll pattern as /verify/run below.
+templates_build_state = {
+    "running": False,
+    "started_at": None,
+    "started_monotonic": None,
+    # Not cleared when a new run starts -- same reasoning as verify_state:
+    # the panel should keep showing the last result while a new build is
+    # in flight, not go blank.
+    "last_result": None,
+    "last_error": None,
+}
+templates_build_lock = threading.Lock()
+
+
+def templates_build_status():
+    with templates_build_lock:
+        elapsed = None
+        if templates_build_state["running"] and templates_build_state["started_monotonic"] is not None:
+            elapsed = time.monotonic() - templates_build_state["started_monotonic"]
+        return {
+            "type": "templates_build_state",
+            "running": templates_build_state["running"],
+            "started_at": templates_build_state["started_at"],
+            "elapsed_s": round(elapsed, 1) if elapsed is not None else None,
+            "last_result": templates_build_state["last_result"],
+            "last_error": templates_build_state["last_error"],
+        }
+
+
+def run_templates_build(session_paths, out_path, subject, wear_id):
+    """Background thread. Direct import, not subprocess -- same reason as
+    run_verification() below: a raised exception should stay a real
+    exception object here, not turn into stderr text to re-parse.
+    """
+    from analysis.reporting.session_loader import load_session
+    from analysis.similarity.build_templates_from_session import build_and_save_templates
+
+    error = None
+    result = None
+    try:
+        sessions = [load_session(Path(p)) for p in session_paths]
+        result = build_and_save_templates(sessions, out_path, subject, wear_id)
+    except BlockingIOError:
+        # Confirmed live (2026-08-26): a session file still held open by
+        # SessionWriter cannot be opened for reading at the same time (no
+        # SWMR mode in use anywhere in this repo).
+        error = ("這個 session 還在錄製中（檔案被寫入中，無法同時讀取）——"
+                 "請先按「結束 session」再建樣板")
+    except Exception as exc:  # noqa: BLE001 -- background thread, nobody else catches this
+        error = f"{type(exc).__name__}: {exc}"
+        print(f"[bridge] /templates/build 失敗: {error}", file=sys.stderr)
+        traceback.print_exc()
+    finally:
+        with templates_build_lock:
+            templates_build_state["running"] = False
+            templates_build_state["started_monotonic"] = None
+            templates_build_state["last_error"] = error
+            if result is not None:
+                templates_build_state["last_result"] = result
+        if result is not None:
+            # Force a reload: the next /recognize or GET /templates must
+            # see the templates that were just built, not keep answering
+            # from whatever was cached before this ran -- "state changed
+            # underneath, cached answer didn't" is the exact shape today's
+            # other fixes were about; not repeating it here.
+            with recognition_service_lock:
+                recognition_service_state["service"] = None
+                recognition_service_state["error"] = None
+                recognition_service_state["path"] = None
+        broadcaster.publish(templates_build_status())
+
+
 # Newest device timestamp seen on any stream. The trial machine needs a
 # device-clock reading to mark capture boundaries (CONTRACTS #1.3 puts trial
 # edges on device time), and the baseline needs one to know where "the last
@@ -1659,6 +1740,98 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "latency_ms": latency_ms,
         })
 
+    # --- D08 (partial): /templates/build --------------------------------
+
+    def _handle_templates_build_start(self):
+        """POST /templates/build -- 202 立刻回，背景跑（跟 /verify/run 同一個
+        理由：建樣板要跑 Aligner + 特徵組裝，不能卡住 HTTP 執行緒）。
+
+        body 可選 {"session": "<path>"}；預設用目前這個 session
+        （session_runtime["h5_path"]）——使用者剛錄完，他要的就是這一個，
+        不該逼他選。subject/wear_id 一律從 session 自己的 /meta 讀，不吃
+        request 傳的（避免跟檔案裡實際的值兜不起來）。
+        """
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        with templates_build_lock:
+            if templates_build_state["running"]:
+                self._send_json(409, {"error": "已經有一輪建樣板在跑",
+                                      "started_at": templates_build_state["started_at"]})
+                return
+
+        raw_session = body.get("session")
+        if raw_session:
+            session_path = resolve_session_file(str(raw_session))
+            if session_path is None:
+                self._send_json(400, {"error": f"找不到或不允許的 session: {raw_session}"})
+                return
+        else:
+            h5_path = session_runtime.get("h5_path")
+            if not h5_path:
+                self._send_json(400, {"error": "沒有指定 session，也沒有進行中的 session"})
+                return
+            session_path = Path(h5_path)
+            if not session_path.is_file():
+                self._send_json(409, {"error": f"目前的 session 檔案還不存在（{session_path}）"
+                                               "——至少要先擷取過一次 baseline"})
+                return
+
+        # Confirmed live (2026-08-26): a session file still held open by
+        # SessionWriter cannot be opened for reading at the same time (no
+        # SWMR mode in use anywhere in this repo) -- check the common case
+        # (this is our own session's own writer) up front for a fast,
+        # specific message; the generic BlockingIOError catch below still
+        # covers any other reason the same file might be locked.
+        if session_runtime.get("writer") is not None and Path(session_runtime.get("h5_path") or "") == session_path:
+            self._send_json(409, {"error": "這個 session 還在錄製中（檔案被寫入中，無法同時讀取）"
+                                           "——請先按「結束 session」再建樣板"})
+            return
+
+        try:
+            from analysis.reporting.session_loader import load_session
+            peek = load_session(session_path)
+        except BlockingIOError:
+            self._send_json(409, {"error": "這個 session 還在錄製中（檔案被寫入中，無法同時讀取）"
+                                           "——請先按「結束 session」再建樣板"})
+            return
+        except Exception as exc:
+            self._send_json(400, {"error": f"讀不到這個 session: {exc}"})
+            return
+
+        subject = peek.meta.get("subject")
+        wear_id = peek.meta.get("wear_id")
+        if not subject or wear_id is None:
+            self._send_json(400, {"error": "這個 session 的 /meta 缺少 subject 或 wear_id，無法決定樣板檔名"})
+            return
+
+        from analysis.similarity.enrollment import template_path
+        out_path = template_path(runtime_paths["templates"], subject, wear_id)
+
+        with templates_build_lock:
+            templates_build_state.update({
+                "running": True,
+                "started_at": datetime.now().isoformat(),
+                "started_monotonic": time.monotonic(),
+                "last_error": None,
+            })
+
+        threading.Thread(
+            target=run_templates_build,
+            args=([str(session_path)], str(out_path), subject, int(wear_id)),
+            daemon=True,
+        ).start()
+
+        broadcaster.publish(templates_build_status())
+        self._send_json(202, {
+            "session": str(session_path), "subject": subject, "wear_id": int(wear_id),
+            "out_path": str(out_path),
+        })
+
+    def _handle_templates_build_state(self):
+        self._send_json(200, templates_build_status())
+
     def do_GET(self):
         if self.path.startswith("/session/current"):
             self._handle_session_current()
@@ -1670,6 +1843,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_pca()
         elif self.path.startswith("/config/"):
             self._handle_config()
+        # ⚠️ 順序有意義（跟 /verify/reports 那條同一個理由）：
+        # `/templates/build/state` 必須比 `/templates` 先比對，否則
+        # 後者的 prefix match 會把它吃掉。
+        elif self.path.startswith("/templates/build/state"):
+            self._handle_templates_build_state()
         elif self.path.startswith("/templates"):
             self._handle_templates()
         elif self.path.startswith("/replay/sessions"):
@@ -1711,6 +1889,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_trial()
         elif self.path.startswith("/recognize"):
             self._handle_recognize()
+        elif self.path.startswith("/templates/build"):
+            self._handle_templates_build_start()
         elif self.path.startswith("/replay/"):
             self._handle_replay()
         elif self.path.startswith("/verify/run"):

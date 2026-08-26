@@ -110,28 +110,60 @@ def build_templates(sessions, require_quality=("ok", "low")):
     return templates_by_class, provenance, skipped
 
 
-def _print_summary(templates_by_class, skipped):
-    if skipped:
-        print(f"[build_templates] 跳過 {len(skipped)} 筆（逐筆記錄原因，不是整批放棄）：")
-        for key, reason in skipped:
-            print(f"  - {key}: {reason}")
 
+
+def build_and_save_templates(sessions, out_path, subject, wear_id, require_quality=("ok", "low")):
+    """sessions: already-loaded `SessionData` list (caller loads them --
+    see the module docstring's note on bridge_server.py needing to handle
+    a locked-file read separately from "zero usable trials").
+
+    Builds `templates_by_class` via `build_templates()`, saves the `.npz` +
+    `.provenance.json` sidecar, returns a summary dict. Raises `ValueError`
+    if zero templates could be built at all (empty after quality filtering,
+    or every trial failed to assemble) -- that is the one case with nothing
+    useful to save; a *partial* build (some trials skipped, others fine)
+    is NOT an error, it is reported in the returned "skipped"/"warnings"
+    lists instead (same "逐筆容錯，記錄不是放棄" discipline as
+    `analysis/run_all.py`'s `build_feature_seqs()`, without reusing that
+    function itself -- see the module docstring for why).
+    """
+    templates_by_class, provenance, skipped = build_templates(sessions, require_quality)
+    if not templates_by_class:
+        detail = ("；" + "；".join(f"{key}（{reason}）" for key, reason in skipped)) if skipped else ""
+        raise ValueError(f"0 筆可用 trial（quality 篩選：{require_quality}）——沒有東西可以建樣板{detail}")
+
+    out_path = Path(out_path)
+    save_templates(templates_by_class, out_path, subject=subject, wear_id=wear_id)
+
+    provenance_path = out_path.with_suffix(".provenance.json")
+    provenance_path.write_text(json.dumps({
+        "subject": subject, "wear_id": wear_id,
+        "source_sessions": [str(s.path) for s in sessions],
+        "require_quality": list(require_quality),
+        "trials_by_class": provenance,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    warnings = []
     if "_reject" not in templates_by_class:
-        print("[build_templates] ⚠ 沒有任何 _reject（靜止／其他）樣板——"
-              "RecognitionService 需要它校準拒識門檻（D22 雙邊 ROC），"
-              "缺少的話這批樣板無法拿去建構 RecognitionService。", file=sys.stderr)
-
-    print("[build_templates] 各類別樣板數：")
+        warnings.append("沒有任何 _reject（靜止／其他）樣板——RecognitionService 需要它校準拒識門檻"
+                         "（D22 雙邊 ROC），缺少的話這批樣板無法拿去建構 RecognitionService。")
     for label, vecs in sorted(templates_by_class.items()):
         n = len(vecs)
-        note = ""
         if n < MIN_TEMPLATES_WARN:
-            note = (f"  ⚠ 只有 {n} 筆——這種「留一筆出來測」的統計在 n={n} 時不可靠："
-                    f"n=1 沒有東西可以留一筆出來測，算出來的準確率是 nan（不是 0%，"
-                    f"也不是「還不錯」）；n=2 只有兩種結果（0% 或 100%），噪聲極大。"
-                    f"至少 {MIN_TEMPLATES_WARN} 筆才有意義，正式 enrollment 建議每個詞"
-                    f"約 {RECOMMENDED_TEMPLATES} 筆（reports/HANDOFF.md §3.1）")
-        print(f"  {label}: {n}{note}")
+            warnings.append(
+                f"{label}: 只有 {n} 筆——這種「留一筆出來測」的統計在 n={n} 時不可靠："
+                f"n=1 沒有東西可以留一筆出來測，算出來的準確率是 nan（不是 0%，也不是「還不錯」）；"
+                f"n=2 只有兩種結果（0% 或 100%），噪聲極大。至少 {MIN_TEMPLATES_WARN} 筆才有意義，"
+                f"正式 enrollment 建議每個詞約 {RECOMMENDED_TEMPLATES} 筆（reports/HANDOFF.md §3.1）")
+
+    return {
+        "out_path": str(out_path),
+        "provenance_path": str(provenance_path),
+        "counts": {label: len(vecs) for label, vecs in templates_by_class.items()},
+        "skipped": [{"trial": key, "reason": reason} for key, reason in skipped],
+        "warnings": warnings,
+        "has_reject": "_reject" in templates_by_class,
+    }
 
 
 def main(argv=None):
@@ -147,31 +179,25 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     require_quality = tuple(q.strip() for q in args.require_quality.split(","))
-
     sessions = [load_session(Path(p)) for p in args.sessions]
-    templates_by_class, provenance, skipped = build_templates(sessions, require_quality)
 
-    if not templates_by_class:
-        print(f"[build_templates] 0 筆可用 trial（quality 篩選：{require_quality}）"
-              "——沒有東西可以建樣板", file=sys.stderr)
-        _print_summary(templates_by_class, skipped)
+    try:
+        summary = build_and_save_templates(sessions, args.out, args.subject, args.wear_id, require_quality)
+    except ValueError as exc:
+        print(f"[build_templates] {exc}", file=sys.stderr)
         return 1
 
-    _print_summary(templates_by_class, skipped)
-
-    out_path = Path(args.out)
-    save_templates(templates_by_class, out_path, subject=args.subject, wear_id=args.wear_id)
-
-    provenance_path = out_path.with_suffix(".provenance.json")
-    provenance_path.write_text(json.dumps({
-        "subject": args.subject, "wear_id": args.wear_id,
-        "source_sessions": [str(s.path) for s in sessions],
-        "require_quality": list(require_quality),
-        "trials_by_class": provenance,
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    print(f"[build_templates] 存好：{out_path}")
-    print(f"[build_templates] 樣板來源記錄：{provenance_path}")
+    if summary["skipped"]:
+        print(f"[build_templates] 跳過 {len(summary['skipped'])} 筆（逐筆記錄原因，不是整批放棄）：")
+        for item in summary["skipped"]:
+            print(f"  - {item['trial']}: {item['reason']}")
+    print("[build_templates] 各類別樣板數：")
+    for label, n in sorted(summary["counts"].items()):
+        print(f"  {label}: {n}")
+    for warning in summary["warnings"]:
+        print(f"  ⚠ {warning}")
+    print(f"[build_templates] 存好：{summary['out_path']}")
+    print(f"[build_templates] 樣板來源記錄：{summary['provenance_path']}")
     return 0
 
 

@@ -1,3 +1,38 @@
+## ✅ 已修（調度員核准後）
+
+`build_feature_seqs()` 已改成呼叫 `Aligner` +
+`live_pipeline.assemble_query_from_aligned_frames()`，跟線上路徑共用同一份
+對齊程式碼。驗證：
+
+- `analysis/reporting/test_run_all.py` 43 個測試全過（含 2 分鐘時間預算
+  那條），`analysis/`、`host/align/`、`host/features/` 整批 464 個測試
+  全過，沒有動 `host/features/live_pipeline.py`。
+- 用同一份合成 session（`test_run_all.py` 的 `write_session` fixture）
+  分別跑舊／新程式碼的 `python -m analysis.run_all`，測到的數字真的變了
+  （這份 fixture 本身沒有刻意放大落差，變動幅度不算誇張，但確認方向是
+  「真的在動」不是雜訊）：
+
+  | 實驗 | 舊（索引截斷） | 新（`Aligner`） |
+  |---|---|---|
+  | A 逐 zone SNR | 7.82 / 6.87（PASS） | 7.82 / 6.87（PASS，未變——這個實驗本身對這份 fixture 的落差不敏感） |
+  | B 跨次戴 CV | 最差 signal_rate 0.0%（PASS） | 最差 signal_rate 0.0%（PASS，未變） |
+  | C Silhouette | 0.106（ToF 0.063，FAIL） | **0.113（ToF 0.082，FAIL）**——數字動了，PASS/FAIL 結論這份 fixture 上沒變 |
+  | E Viseme 敏感度 | Mel 3.24 vs ToF 3.02（PASS） | **Mel 3.27 vs ToF 3.05（PASS）**——數字動了，結論沒變 |
+  | C0 串擾 | SKIPPED | SKIPPED（不吃 `build_feature_seqs()`，不受影響） |
+
+  **不要拿這份 fixture 的「變動不大」去推論 `E05` 真實資料也會變動不大**
+  ——這個 fixture 的 ToF/Mel 幀數剛好一樣多（都是 30），不是為了放大這個
+  bug 設計的；`reports/ALIGNMENT_MISMATCH.md`（本檔）上面用刻意構造的
+  合成資料量到的 Mel-only 落差（cosine 0.86–1.46、真的翻轉分類結果）
+  才是這個 bug 實際量級的代表。
+- `D06`/`D08`/`D09`/`D22` 這幾份報告的數字**沒有**重新產生——那幾支
+  腳本沒有直接呼叫 `build_feature_seqs()`（讀程式碼確認過，它們各自有
+  自己的合成資料/特徵產生邏輯），這輪的改動不會自動讓它們的數字跟著
+  變，但也代表**它們原本就沒有跟 `run_all.py` 共用這條對齊邏輯**——
+  它們是不是又是另一條第三種對齊方式，這份報告沒有查，值得另外指派。
+
+---
+
 # 訓練/分析路徑跟線上推論路徑，兩套跨模態對齊邏輯量出來的落差
 
 > 由來：`esp-mask-test-59` 做 Demo 乾跑時發現同一筆 trial 的 `tof_A` 是
