@@ -80,6 +80,63 @@ def test_add_session_multiple_sessions_accumulate(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# C14：manifest 預設排除 rejected
+
+
+def test_add_session_excludes_rejected_by_default(tmp_path):
+    h5_path = tmp_path / "session_001.h5"
+    _write_session(h5_path, n_trials=3, label="八", quality="rejected")
+    manifest_path = tmp_path / "manifest.csv"
+
+    df = add_session(h5_path, manifest_path, root=tmp_path)
+    assert len(df) == 0, "quality=rejected 的 trial 預設不該進 manifest"
+
+    df_all = add_session(h5_path, manifest_path, root=tmp_path, include_rejected=True)
+    assert len(df_all) == 3, "include_rejected=True 應該拿回全部"
+
+
+def test_add_session_keeps_low_quality_by_default(tmp_path):
+    """`low` 不是 `rejected`：D08 刻意不預篩，不能被這個過濾誤傷。"""
+    h5_path = tmp_path / "session_001.h5"
+    _write_session(h5_path, n_trials=2, label="八", quality="low")
+    manifest_path = tmp_path / "manifest.csv"
+
+    df = add_session(h5_path, manifest_path, root=tmp_path)
+    assert len(df) == 2
+    assert (df["quality"] == "low").all()
+
+
+def test_rebuild_excludes_rejected_by_default_and_matches_incremental(tmp_path):
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    manifest_path = tmp_path / "manifest.csv"
+
+    rng = np.random.default_rng(7)
+    qualities = ["ok", "low", "rejected", "ok"]
+    for idx, quality in enumerate(qualities):
+        h5_path = sessions_dir / f"session_{idx:03d}.h5"
+        _write_session(h5_path, n_trials=2, wear_id=idx, quality=quality, rng=rng)
+        add_session(h5_path, manifest_path, root=sessions_dir)
+
+    incremental_df = read_manifest(manifest_path)
+    assert "rejected" not in set(incremental_df["quality"])
+    assert len(incremental_df) == 3 * 2  # 4 個 session，1 個被排除
+
+    rebuilt_path = tmp_path / "manifest_rebuilt.csv"
+    rebuilt_df = rebuild_manifest(sessions_dir, rebuilt_path)
+    pd.testing.assert_frame_equal(
+        incremental_df.reset_index(drop=True), rebuilt_df.reset_index(drop=True)
+    )
+    assert manifest_path.read_text() == rebuilt_path.read_text()
+
+    # include_rejected=True 兩條路徑也要繼續互相一致，不是只有預設路徑
+    rebuilt_all_path = tmp_path / "manifest_rebuilt_all.csv"
+    rebuilt_all_df = rebuild_manifest(sessions_dir, rebuilt_all_path, include_rejected=True)
+    assert len(rebuilt_all_df) == 4 * 2
+    assert "rejected" in set(rebuilt_all_df["quality"])
+
+
+# ---------------------------------------------------------------------------
 # 驗收條件：rebuild 與增量必須完全一致
 
 
@@ -147,7 +204,10 @@ def test_summary_counts_by_label_mode_quality(tmp_path):
     ]):
         h5_path = tmp_path / f"s{i}.h5"
         _write_session(h5_path, n_trials=1, label=label, mode=mode, quality=quality)
-        add_session(h5_path, manifest_path, root=tmp_path)
+        # C14: manifest 預設排除 rejected -- 這個測試要看到全部（包含
+        # rejected）才能驗證 summarize() 的「依 quality」欄位，所以顯式要
+        # 「全部給我」。預設行為本身由下面 test_add_session_excludes_rejected_by_default 驗。
+        add_session(h5_path, manifest_path, root=tmp_path, include_rejected=True)
 
     text = summarize(manifest_path)
     assert "總計 5 筆 trial" in text

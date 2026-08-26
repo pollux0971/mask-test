@@ -219,13 +219,24 @@ ST 的 ULD 標頭**沒有文件化** zone 的物理佈局。目前全鏈路假�
 
 已知的兩項待確認：
 
-- [ ] 🔴 **`monitor` 模式的 CPU 是 30.65%**（headless 實測），
-      而 `C03` 的預算是 **15%**——超標約兩倍。
-      其他三個模式（`quiz`/`record`/`replay`）都在 11–13% 內。
-      成因：`monitor` 可見時三個 canvas（熱力圖 + PCA + Mel 瀑布）同時重繪。
-      **隱藏時沒有背景繼續燒**（已確認），問題只在它自己可見時。
-      → **在 Demo 用的那台筆電上重量一次**。若仍超標，
-      Demo 期間建議停在測驗模式而非監測模式。
+- [ ] **`monitor` 模式的 CPU**（`reports/C_monitor_perf.md` 有完整調查）
+      
+      | 指標 | 修復前 | 修復後 |
+      |---|---|---|
+      | `TaskDuration`（主執行緒忙碌） | 55.9% | **21.7%** |
+      | `LayoutDuration`（同步 reflow） | 28.8% | **7.6%** |
+      | `LayoutCount` | 916 次/8s | 517 次/8s |
+      
+      **根因不是猜測的那個**：不是熱力圖的 DOM style 寫入貴
+      （`RecalcStyleDuration` 只佔 0.8%），是 `drawTrail()` 在寫完樣式後
+      **立刻讀 `canvas.clientWidth`**，逼瀏覽器跑一次同步 reflow
+      才能回答——經典的 layout thrashing。修法是快取 CSS 尺寸。
+      
+      ⚠️ **`/proc` 的總 CPU 幾乎沒變**（54.4% → 51.6%），
+      因為 headless `--disable-gpu` 用軟體合成，那部分成本跟這次修復無關。
+      → **在 Demo 用的那台筆電上重量一次**（有 GPU、沒有別的 agent 搶 CPU）
+      才是乾淨的數字。若 `TaskDuration` 仍明顯超過 15%，
+      Demo 期間建議停在測驗模式（11–13%，而且 Demo 四步全在那裡）。
 - [ ] **`validate` 模式目前是空白**（`C22` 進行中）——
       Demo 前確認它已經有內容，或至少不會被誤點進去。
 

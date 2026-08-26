@@ -1,2 +1,190 @@
-/* validate mode styles — owned by the story that builds this mode
-   (see ssi-backlog/README.md track C). Empty shell from C01. */
+/* validate mode styles — C22: guided experiment runner. See js/modes/validate.js. */
+
+#mode-validate {
+  gap: 14px;
+  min-height: 0;
+}
+
+.validate-run-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.validate-control-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.validate-sessions-input {
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  resize: vertical;
+}
+.validate-run-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.validate-btn {
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  cursor: pointer;
+}
+.validate-run-btn {
+  margin-left: auto;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.validate-btn-abort {
+  background: var(--warn-soft);
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.validate-run-status {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.validate-run-error {
+  font-size: 12px;
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-radius: 6px;
+  padding: 4px 10px;
+  width: fit-content;
+}
+
+.validate-cards {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  align-content: start;
+}
+
+.validate-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px;
+}
+
+.validate-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.validate-card-key {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 999px;
+  padding: 1px 10px;
+}
+.validate-card-name {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.validate-card-purpose {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+.validate-card-criterion {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.validate-status {
+  display: inline-block;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 999px;
+}
+.validate-status-none {
+  color: var(--text-dim);
+  background: var(--surface-2);
+  font-weight: 500;
+}
+.validate-status-pass {
+  color: var(--good);
+  background: rgba(95, 191, 122, 0.14);
+}
+.validate-status-fail {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+/* SKIPPED and ERROR are deliberately visually distinct from each other and
+   from FAIL (D15's own design, C22.md must respect it): skipped = missing
+   data (not a result), error = a bug (not a conclusion), fail = a real
+   result. Collapsing any two of these into the same look would mislead. */
+.validate-status-skipped {
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px dashed var(--border);
+}
+.validate-status-error {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border: 1px solid var(--warn);
+}
+.validate-reason {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.validate-c0-wizard {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.validate-c0-controls {
+  display: flex;
+  gap: 8px;
+}
+.validate-c0-progress {
+  font-size: 12px;
+  color: var(--text);
+  min-height: 1.2em;
+}
+.validate-c0-result {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+.validate-c0-result-pending {
+  color: var(--warn);
+}

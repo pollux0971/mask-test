@@ -68,6 +68,7 @@ import numpy as np
 from scipy.special import ndtri
 
 from analysis.experiments.exp_c_silhouette import MODALITIES as _ALL_MODALITIES
+from analysis.reporting.plot_style import SEQUENTIAL_CMAP
 
 # 本實驗只比較三個**互斥**的模態。`tof_combined` / `all` 是 D13 的組合式
 # 比較，混進來會讓「哪個模態最強」的每一列出現重複計算。
@@ -433,7 +434,9 @@ def plot_viseme_sensitivity(report, dpi=DEFAULT_DPI):
     fig, ax = plt.subplots(figsize=(1.9 * len(modalities) + 2.4,
                                     0.85 * len(order) + 2.2), dpi=dpi)
     masked = np.ma.masked_invalid(grid)
-    cmap = plt.get_cmap("viridis").copy()
+    # 色表跟著 `D20` 的專案樣式走，**不寫死**——寫死的話這張圖就會是
+    # 「十種來源、十種配色」裡的一種，那正是 D20 要消除的東西。
+    cmap = plt.get_cmap(SEQUENTIAL_CMAP).copy()
     cmap = cmap.with_extremes(bad="0.9")
     image = ax.imshow(masked, cmap=cmap, aspect="auto")
 

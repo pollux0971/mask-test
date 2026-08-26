@@ -95,6 +95,24 @@ def _session_rows(h5_path, root: Path | None) -> list[dict]:
     return rows
 
 
+def _filter_quality(rows: list[dict], include_rejected: bool) -> list[dict]:
+    """C14：manifest 預設把 `quality="rejected"` 的 trial 排除在外（保留在
+    HDF5，只是不進這張索引表），因為 manifest 的用途就是「能拿去分析的
+    trial 清單」，而 `rejected` 明確定義為「棄用」。
+
+    `low` 刻意不排除（`D08` 的判斷，`esp-mask-test-59`）：quality 標籤反映
+    擷取當下的訊號完整度，不等於這筆樣本對辨識訓練沒有幫助，過濾掉會讓
+    `D12` 的 CV 實驗少看到一整類真實資料。
+
+    `include_rejected=True` 拿回完整資料，給 `D12` 需要知道「這次戴的時候
+    錄壞了幾次」用。`add_session()`／`rebuild_manifest()` 都經過這裡，
+    是兩者輸出一致這個保證延伸到「過濾」這一層的地方。
+    """
+    if include_rejected:
+        return rows
+    return [r for r in rows if r["quality"] != "rejected"]
+
+
 def _finalize(rows: list[dict]) -> pd.DataFrame:
     """把一堆 row dict 變成排序、型別固定的 DataFrame -- `add_session()` 跟
     `rebuild_manifest()` 的最後一步都經過這裡，是兩者輸出一致的關鍵。"""
@@ -120,25 +138,30 @@ def write_manifest(df: pd.DataFrame, manifest_path) -> None:
     df.to_csv(path, index=False)
 
 
-def add_session(h5_path, manifest_path, root: Path | None = None) -> pd.DataFrame:
+def add_session(h5_path, manifest_path, root: Path | None = None, include_rejected: bool = False) -> pd.DataFrame:
     """一個 session 寫完後呼叫：把它的 trial 併入既有 manifest 並存檔。
 
-    對同一個 `session_path` 重複呼叫是安全的（例如那個 session 被重錄過）：
-    先把舊有同名 session 的列全部丟掉，再放進新算出來的列，不會產生重複
-    或殘留舊資料的列。回傳更新後的完整 DataFrame，方便呼叫端立刻用。
+    對同一個 `session_path` 重複呼叫是安全的（例如那個 session 被重錄過，
+    或 `C14` 把某個 trial 事後標成 `rejected` 而重新呼叫）：先把舊有同名
+    session 的列全部丟掉，再放進新算出來的列，不會產生重複或殘留舊資料的
+    列。回傳更新後的完整 DataFrame，方便呼叫端立刻用。
+
+    `include_rejected` 見 `_filter_quality()`——只影響**這次新讀進來**的列，
+    `existing`（其他 session 先前寫入的列）維持它們自己當初寫入時的樣子，
+    不會被這次呼叫的參數回頭改變。
     """
     existing = read_manifest(manifest_path)
     session_path = _session_path_str(h5_path, root)
     existing = existing[existing["session_path"] != session_path]
 
-    new_rows = _session_rows(h5_path, root)
+    new_rows = _filter_quality(_session_rows(h5_path, root), include_rejected)
     merged = pd.concat([existing, pd.DataFrame(new_rows, columns=MANIFEST_COLUMNS)], ignore_index=True)
     merged = _finalize(merged.to_dict("records"))
     write_manifest(merged, manifest_path)
     return merged
 
 
-def rebuild_manifest(sessions_dir, manifest_path, root: Path | None = None) -> pd.DataFrame:
+def rebuild_manifest(sessions_dir, manifest_path, root: Path | None = None, include_rejected: bool = False) -> pd.DataFrame:
     """從 `sessions_dir` 底下所有 `.h5` 完整重建 manifest（遞迴搜尋）。
 
     manifest 是衍生資料的設計决定就是為了這個函式存在：manifest.csv 壞了、
@@ -147,6 +170,10 @@ def rebuild_manifest(sessions_dir, manifest_path, root: Path | None = None) -> p
     單一 `.h5` 檔案損毀（`h5py` 打不開、缺必要的 attrs）不會讓整次重建失敗
     --這是掃磁碟這種系統邊界輸入該有的容錯，錯誤與被跳過的檔案會印出來，
     不會靜默吞掉。
+
+    `include_rejected` 見 `_filter_quality()`——跟 `add_session()` 用同一個
+    參數名、同一個預設值、同一個過濾函式，這是
+    `test_incremental_matches_rebuild` 在釘的一致性保證的一部分。
     """
     sessions_dir = Path(sessions_dir)
     h5_paths = sorted(glob.glob(os.path.join(str(sessions_dir), "**", "*.h5"), recursive=True))
@@ -154,9 +181,11 @@ def rebuild_manifest(sessions_dir, manifest_path, root: Path | None = None) -> p
     all_rows: list[dict] = []
     for h5_path in h5_paths:
         try:
-            all_rows.extend(_session_rows(h5_path, root if root is not None else sessions_dir))
+            rows = _session_rows(h5_path, root if root is not None else sessions_dir)
         except (OSError, KeyError) as exc:
             print(f"警告：略過無法讀取的 session 檔案 {h5_path}: {exc}")
+            continue
+        all_rows.extend(_filter_quality(rows, include_rejected))
 
     df = _finalize(all_rows)
     write_manifest(df, manifest_path)

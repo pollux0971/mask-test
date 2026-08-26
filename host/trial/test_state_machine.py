@@ -336,8 +336,13 @@ def test_mark_saved_trial_quality_updates_h5_and_manifest(tmp_path):
 
     with h5py.File(h5_path, "r") as f:
         assert f["trial_000"].attrs["quality"] == "rejected"
+    # C14: mark_current_trial_saved_quality() re-runs add_session(), which
+    # defaults to excluding quality=rejected -- so the manifest should now
+    # show this trial as *gone*, not present-with-quality=rejected. The data
+    # itself stays in the HDF5 (asserted above); only the derived index
+    # drops it.
     df = read_manifest(manifest_path)
-    assert df.iloc[0]["quality"] == "rejected"
+    assert df.empty, "manifest 預設應排除 rejected 的 trial（資料仍在 HDF5，見上面的斷言）"
 
 
 def test_mark_saved_trial_quality_rejects_invalid_value(tmp_path):

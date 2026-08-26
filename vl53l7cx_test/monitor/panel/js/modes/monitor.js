@@ -468,10 +468,18 @@ const QUALITY_LEVEL_COLOR = {
 const QUALITY_SPARKLINE_MS = 60000; // C09.md: "60 秒趨勢迷你圖"
 const DEVICE_STATE_CHECK_MS = 2000;
 
-function drawSparkline(canvas, ctx, points) {
+// `size` is a cached { w, h } CSS-pixel box (see the ResizeObserver set up
+// in init() below), not a live canvas.clientWidth/clientHeight read --
+// reading those synchronously here forced a layout pass on every quality
+// event (~1Hz x 6 metrics) right after handleQualityEvent's own DOM writes
+// a few lines above it, same forced-synchronous-layout pattern found and
+// fixed in drawTrail() (see reports/C_monitor_perf.md). ResizeObserver
+// reports size changes asynchronously after layout, so reading its cached
+// result never forces one.
+function drawSparkline(canvas, ctx, points, size) {
   if (!canvas || !ctx) return;
   const dpr = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const w = size ? size.w : 0, h = size ? size.h : 0;
   if (w === 0 || h === 0) return;
   if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
     canvas.width = Math.round(w * dpr);
@@ -520,6 +528,8 @@ registerMode("monitor", (() => {
 
   // --- C09: quality dashboard state ---
   const qualityEls = { value: {}, dot: {}, hint: {}, sparkCanvas: {}, sparkCtx: {} };
+  const sparkSize = {}; // key -> { w, h } CSS px, kept current by sparkResizeObserver (init())
+  let sparkResizeObserver = null;
   const lastLevels = {}; // key -> "green"|"yellow"|"red"|"unknown", for the record-confirm gate
   let alarmBannerEl = null;
   let reflashNoteEl = null;
@@ -563,7 +573,7 @@ registerMode("monitor", (() => {
           return info && typeof info.value === "number" ? { value: info.value, level: info.level } : null;
         })
         .filter(Boolean);
-      drawSparkline(qualityEls.sparkCanvas[m.key], qualityEls.sparkCtx[m.key], points);
+      drawSparkline(qualityEls.sparkCanvas[m.key], qualityEls.sparkCtx[m.key], points, sparkSize[m.key]);
     }
 
     // alarms: seq-gap-vs-$H mismatch, a transport fault signal -- kept
@@ -748,6 +758,18 @@ registerMode("monitor", (() => {
     while (trail.length > PCA_TRAIL_MAX_POINTS) trail.shift();
   }
 
+  // Cached CSS size of the PCA canvas -- drawTrail() used to read
+  // pcaCanvas.clientWidth/clientHeight directly every rAF frame, which
+  // forces a synchronous layout if any DOM write earlier in the same frame
+  // (renderDistanceChannel/renderChannel's per-cell className/style writes)
+  // left layout dirty. Perf investigation (esp-mask-test-ad's CPU flag,
+  // 2026-08-26) found LayoutDuration eating ~29% of an 8s window at
+  // 916 forced layouts -- this read was the trigger. Only resizePcaCanvas
+  // (init / window resize / onEnter) needs the live value; drawTrail reads
+  // this cache instead. No visual change: the canvas's CSS size doesn't
+  // change mid-frame outside those three call sites.
+  let pcaCanvasCssSize = { w: 0, h: 0 };
+
   function resizePcaCanvas() {
     if (!pcaCanvas) return;
     const dpr = window.devicePixelRatio || 1;
@@ -756,11 +778,13 @@ registerMode("monitor", (() => {
     pcaCanvas.width = w * dpr;
     pcaCanvas.height = h * dpr;
     pcaCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    pcaCanvasCssSize = { w, h };
   }
 
   function drawTrail() {
     if (!pcaCtx) return;
-    const w = pcaCanvas.clientWidth, h = pcaCanvas.clientHeight;
+    const { w, h } = pcaCanvasCssSize;
+    if (w === 0 || h === 0) return;
     // Redraw from scratch every frame -- C10.md explicitly warns that
     // canvas globalAlpha stacking accumulates ghosting instead of a clean
     // fade, same lesson as the old mic waveform's per-frame clearRect.
@@ -1144,6 +1168,20 @@ registerMode("monitor", (() => {
       // re-run on window resize or onEnter.
       resizeMelCanvas();
 
+      // One shared observer for all 6 sparkline canvases: their CSS size
+      // depends on the quality-grid's own auto-fit column width (window
+      // resize, or the grid's scrollbar appearing/disappearing), not just
+      // window resize the way the single PCA canvas does -- ResizeObserver
+      // covers all of those triggers without having to enumerate them, and
+      // reports asynchronously (after layout), so it never itself forces
+      // the synchronous layout drawSparkline used to trigger on every read.
+      sparkResizeObserver = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          const key = entry.target.dataset.qualitySpark;
+          const box = entry.contentRect;
+          sparkSize[key] = { w: box.width, h: box.height };
+        }
+      });
       for (const m of QUALITY_METRICS) {
         qualityEls.value[m.key] = root.querySelector(`[data-quality-value="${m.key}"]`);
         qualityEls.dot[m.key] = root.querySelector(`[data-quality-dot="${m.key}"]`);
@@ -1151,6 +1189,7 @@ registerMode("monitor", (() => {
         const sparkCanvas = root.querySelector(`[data-quality-spark="${m.key}"]`);
         qualityEls.sparkCanvas[m.key] = sparkCanvas;
         qualityEls.sparkCtx[m.key] = sparkCanvas.getContext("2d");
+        sparkResizeObserver.observe(sparkCanvas);
       }
       alarmBannerEl = root.querySelector("[data-alarm-banner]");
       reflashNoteEl = root.querySelector("[data-reflash-note]");

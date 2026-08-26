@@ -68,10 +68,11 @@ FONT_STACK = [
 # `viridis` 的綠色段落對紅綠色盲的辨識度較低。論文與 Demo 投影都一定會有人
 # 看不清紅綠，所以預設選對他們較友善的那個。
 #
-# `viridis` 保留是因為既有的圖（`D14` 熱力圖等）已經用它，換掉會讓同一份
-# 報告裡新舊圖不一致——要換就一起換，那是另一個決定。
+# `viridis` 保留為別名：`analysis/experiments/` 底下其他 agent 的圖仍然寫死
+# 用它（我不能改那些檔案）。兩者灰階同樣安全，所以混用不會壞掉，只是配色
+# 不一致——要全部統一，那些檔案得由它們的擁有者改成引用 `SEQUENTIAL_CMAP`。
 SEQUENTIAL_CMAP = "cividis"
-SEQUENTIAL_ALT_CMAP = "viridis"  # 同樣灰階安全；既有圖沿用
+SEQUENTIAL_ALT_CMAP = "viridis"
 DIVERGING_CMAP = "RdBu_r"        # ⚠️ 灰階下正負不可辨，必須標數值
 
 # Okabe-Ito 色盲友善分類色盤（去掉純黑，留給文字與座標軸）。

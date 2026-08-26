@@ -472,3 +472,77 @@
 .quiz-matrix-canvas {
   display: block;
 }
+
+/* Same warning-banner language as .quiz-assigned-prompt/.quiz-disagree-banner --
+   deliberately not a blocking dialog (C21.md follow-up: "不用擋，提示就好"). */
+.quiz-mode-switch-warning {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-radius: 8px;
+  padding: 6px 12px;
+  width: fit-content;
+}
+
+/* --- C21: session stats row --- */
+.quiz-stats-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex-shrink: 0;
+  padding: 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.quiz-stats-baseline {
+  margin-left: auto;
+  font-size: 12px;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.quiz-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+}
+.quiz-stat-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  min-width: 0;
+}
+.quiz-stat-col.fused {
+  border-color: var(--accent);
+}
+.quiz-stat-head {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-dim);
+}
+.quiz-stat-col.fused .quiz-stat-head {
+  color: var(--accent);
+}
+
+.quiz-stat-acc {
+  font-size: 24px;
+  font-weight: 800;
+}
+.quiz-stat-ci {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.quiz-stat-sub,
+.quiz-stat-breakdown {
+  font-size: 12px;
+  color: var(--text-dim);
+}

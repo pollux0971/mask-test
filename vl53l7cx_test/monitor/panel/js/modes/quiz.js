@@ -277,6 +277,11 @@ registerMode("quiz", (() => {
   let assignedTarget = null; // { id, text } | null
   let matrixEntries = []; // { trueLabel, triResult }[]
   let currentEntryMarked = true; // true = nothing pending, so buttons/dropdown are inert until a fresh result arrives
+  let modeSwitchWarningEl = null;
+
+  // --- C21: session stats row ---
+  const statsBodyEl = { tof: null, mel: null, fused: null };
+  let statsBaselineEl = null;
 
   function renderColumn(el, classes, scores, rejected) {
     const entries = sortedEntries(classes, scores);
@@ -386,6 +391,7 @@ registerMode("quiz", (() => {
     matrixCountEl.textContent = `已記錄 ${matrixEntries.length} 筆`;
     posthocControlsEl.style.display = "none";
     renderMatrix();
+    renderStats();
   }
 
   // Shared by the on-screen canvas and the PNG export -- same drawing code
@@ -485,11 +491,113 @@ registerMode("quiz", (() => {
   }
 
   function setMarkingMode(mode) {
+    // esp-mask-test-ad's C20-review followup: switching modes while a
+    // result is still unmarked silently drops it (never counted in the
+    // matrix or in C21's stats below) -- "靜默" was the actual complaint,
+    // not the drop itself (E05 recording hundreds of trials, nobody would
+    // notice one missing). Not blocking the switch, just saying so once.
+    if (mode !== markingMode && !currentEntryMarked && modeSwitchWarningEl) {
+      modeSwitchWarningEl.textContent = "⚠ 上一筆尚未標記的紀錄已略過（不計入矩陣／統計）";
+      modeSwitchWarningEl.style.display = "block";
+    }
     markingMode = mode;
     markingModeEls.forEach((el) => el.classList.toggle("active", el.dataset.markingMode === mode));
     assignedPromptEl.style.display = mode === "assigned" ? "flex" : "none";
     posthocControlsEl.style.display = mode === "posthoc" && !currentEntryMarked ? "flex" : "none";
     if (mode === "assigned" && !assignedTarget) showNextAssignedTarget();
+  }
+
+  // --- C21: session stats row ---
+  //
+  // Wilson score interval, not the normal approximation (C21.md: normal
+  // approx gives nonsense (>100%/<0%) CIs at n<30). Verified against the
+  // story's own worked example: n=12, k=10 -> 83.3%, 95% CI [55.2%, 95.3%]
+  // reproduces exactly with this formula (checked by hand before wiring
+  // this in, since there's no JS test runner in this repo to pin it with).
+  const WILSON_Z95 = 1.959963985;
+
+  function wilsonInterval(k, n) {
+    if (n === 0) return { lower: 0, upper: 1 };
+    const z = WILSON_Z95;
+    const phat = k / n;
+    const z2 = z * z;
+    const denom = 1 + z2 / n;
+    const center = phat + z2 / (2 * n);
+    const margin = z * Math.sqrt((phat * (1 - phat)) / n + z2 / (4 * n * n));
+    return { lower: Math.max(0, (center - margin) / denom), upper: Math.min(1, (center + margin) / denom) };
+  }
+
+  // top-3: is trueLabel among the top 3 ranked classes at this w? Mirrors
+  // predictedLabelFor()'s own reject-first logic for k=1 consistency: if
+  // the track itself rejected, only a true _reject target counts as a hit
+  // (an AAC user reaching for their 2nd/3rd choice assumes the system at
+  // least attempted a word, per C21.md's "top-1 70% 但 top-3 95%" framing).
+  function topKHit(triResult, w, trueLabel, k) {
+    const reject = vocab.reject || FALLBACK_VOCAB.reject;
+    const rejectedNow = computeFusedReject(triResult, w);
+    if (trueLabel === reject.id) return rejectedNow;
+    if (rejectedNow) return false;
+    const scores = fuseScores(triResult, w);
+    const ranked = sortedEntries(triResult.classes, scores).slice(0, k).map((e) => e.cls);
+    return ranked.includes(trueLabel);
+  }
+
+  // esp-mask-test-ad's explicit split: 正確/答錯/拒識 are three different
+  // things, reject must never get folded into "wrong" -- D22 just pushed
+  // false-reject down to ~0%, and that number only reads as a result if
+  // "拒識" has its own bucket instead of being buried inside "答錯".
+  // Classified by PREDICTED label (not by trueLabel), so a false-accept
+  // during an assigned-silence trial (trueLabel=_reject, predicted=some
+  // word) correctly lands in 答錯, not 拒識 -- the system didn't say
+  // "unrecognized", it confidently picked the wrong thing.
+  function computeTrackStats(w) {
+    const reject = vocab.reject || FALLBACK_VOCAB.reject;
+    let correct = 0, wrong = 0, rejected = 0, top3 = 0;
+    matrixEntries.forEach(({ trueLabel, triResult }) => {
+      const predicted = predictedLabelFor(triResult, w);
+      if (predicted === trueLabel) correct++;
+      else if (predicted === reject.id) rejected++;
+      else wrong++;
+      if (topKHit(triResult, w, trueLabel, 3)) top3++;
+    });
+    const n = matrixEntries.length;
+    const ci = wilsonInterval(correct, n);
+    return {
+      n, correct, wrong, rejected,
+      accuracy: n ? correct / n : 0,
+      ciLower: ci.lower, ciUpper: ci.upper,
+      top3Accuracy: n ? top3 / n : 0,
+    };
+  }
+
+  // Same "reject isn't a candidate guess" convention as renderCards()'s
+  // baselineEl -- kept as its own function so C21's baseline number can
+  // never silently drift from C15's original one.
+  function randomBaselineFraction() {
+    const n = (vocab.words || []).length || 1;
+    return 1 / n;
+  }
+
+  function renderStatBlock(s) {
+    const pct = (x) => (x * 100).toFixed(1);
+    if (!s.n) return `<div class="quiz-stat-acc">--</div><div class="quiz-stat-sub mono">尚無資料</div>`;
+    return `
+      <div class="quiz-stat-acc">${pct(s.accuracy)}%<span class="quiz-stat-ci mono"> [${pct(s.ciLower)}–${pct(s.ciUpper)}%]</span></div>
+      <div class="quiz-stat-sub mono">top-3 ${pct(s.top3Accuracy)}%　n=${s.n}</div>
+      <div class="quiz-stat-breakdown mono">✓ ${s.correct}　✕ ${s.wrong}　⦸ ${s.rejected}</div>
+    `;
+  }
+
+  // Same recompute-the-whole-history idea as C20's renderMatrix(): a w
+  // change re-answers "what would the system have said" for every past
+  // trial, so accuracy/CI/top-3 all have to be recomputed from scratch
+  // too, not just the newest entry.
+  function renderStats() {
+    if (!statsBodyEl.tof) return;
+    if (statsBaselineEl) statsBaselineEl.textContent = `隨機基準 ${(randomBaselineFraction() * 100).toFixed(1)}%`;
+    [["tof", 1], ["mel", 0], ["fused", currentW]].forEach(([key, w]) => {
+      statsBodyEl[key].innerHTML = renderStatBlock(computeTrackStats(w));
+    });
   }
 
   // Recomputes and repaints ONLY the Fused column -- ToF-only/Mel-only
@@ -530,6 +638,7 @@ registerMode("quiz", (() => {
     updateDisagreement(fusedTop, rejectFused);
     updateResultCard(lastTriResult, currentW, fusedScores, rejectFused);
     renderMatrix(); // every entry's predicted label depends on w -- recompute the whole matrix, not just repaint
+    renderStats(); // C21: same reason -- accuracy/CI/top-3 are all a function of w too
 
     const elapsed = performance.now() - t0;
     if (elapsed > 50) {
@@ -587,6 +696,7 @@ registerMode("quiz", (() => {
     // that's the whole point of assigning it in advance. "posthoc" instead
     // waits for the "✓ 正確" button or the "其實是" dropdown below.
     currentEntryMarked = false;
+    if (modeSwitchWarningEl) modeSwitchWarningEl.style.display = "none";
     if (markingMode === "assigned" && assignedTarget) {
       recordMatrixEntry(assignedTarget.id);
       showNextAssignedTarget();
@@ -644,6 +754,7 @@ registerMode("quiz", (() => {
     // load resolves in the normal case, but not guaranteed to.
     if (posthocSelectEl) populateMatrixSelect();
     if (matrixCanvasEl) renderMatrix();
+    if (statsBodyEl.tof) renderStats();
   }
 
   async function loadVocab() {
@@ -761,6 +872,7 @@ registerMode("quiz", (() => {
             <button class="quiz-mode-btn" data-matrix-export-btn>匯出 PNG</button>
             <button class="quiz-mode-btn" data-matrix-clear-btn>清除矩陣</button>
           </div>
+          <div class="quiz-mode-switch-warning" data-mode-switch-warning style="display:none"></div>
           <div class="quiz-assigned-prompt" data-assigned-prompt style="display:none">
             系統指定：請念 <span class="quiz-assigned-word mono" data-assigned-word>—</span>
           </div>
@@ -771,6 +883,26 @@ registerMode("quiz", (() => {
           </div>
           <div class="quiz-matrix-wrap">
             <canvas class="quiz-matrix-canvas" data-matrix-canvas></canvas>
+          </div>
+        </div>
+
+        <div class="quiz-stats-section">
+          <div class="section-label">Session 統計
+            <span class="quiz-stats-baseline mono" data-stats-baseline>隨機基準 --</span>
+          </div>
+          <div class="quiz-stats-grid">
+            <div class="quiz-stat-col" data-stats-col="tof">
+              <div class="quiz-stat-head">ToF only</div>
+              <div class="quiz-stat-body" data-stats-body="tof"></div>
+            </div>
+            <div class="quiz-stat-col" data-stats-col="mel">
+              <div class="quiz-stat-head">Mel only</div>
+              <div class="quiz-stat-body" data-stats-body="mel"></div>
+            </div>
+            <div class="quiz-stat-col fused" data-stats-col="fused">
+              <div class="quiz-stat-head">Fused ★</div>
+              <div class="quiz-stat-body" data-stats-body="fused"></div>
+            </div>
           </div>
         </div>
       `;
@@ -834,10 +966,19 @@ registerMode("quiz", (() => {
         matrixEntries = [];
         matrixCountEl.textContent = "已記錄 0 筆";
         renderMatrix();
+        renderStats();
       });
+
+      // --- C21: session stats wiring ---
+      statsBodyEl.tof = root.querySelector('[data-stats-body="tof"]');
+      statsBodyEl.mel = root.querySelector('[data-stats-body="mel"]');
+      statsBodyEl.fused = root.querySelector('[data-stats-body="fused"]');
+      statsBaselineEl = root.querySelector("[data-stats-baseline]");
+      modeSwitchWarningEl = root.querySelector("[data-mode-switch-warning]");
 
       setMarkingMode("posthoc");
       renderMatrix();
+      renderStats();
     },
 
     onData(evt) {

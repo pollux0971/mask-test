@@ -84,6 +84,23 @@ VALID_SPEAKING_MODES = ("normal", "whisper", "silent")
 
 VALID_QUALITY_VALUES = ("ok", "low", "rejected")
 
+# `sensors_enabled` 解決 D15 診斷出的問題：§2 原本沒有記錄擷取當下另一顆
+# 感測器開不開，C0（串擾實驗）的 session_loader 就無法自動配對 solo/dual
+# 兩個 session。**選填，不是必填**：值來自 B18 的
+# host/control/device_state.py（sensor_a_enabled/sensor_b_enabled），但呼叫
+# 端（bridge_server.py）目前還沒把這條線接進 SessionWriter 建構——把它列進
+# REQUIRED_META_KEYS 會讓 mode="w" 立刻對現有呼叫端報 ValueError，等於這裡
+# 一個 commit 就讓所有 baseline capture 斷線。等呼叫端接上之後再升級成必填。
+#
+# `sensors_enabled_confirmed` 一定要跟著存在（沒給值就預設 False）：B18 自
+# 己在 §4.1.2 已經寫明 sensor_a_enabled/sensor_b_enabled 只是「主機最後一次
+# 下達的指令」，不是裝置確認過的狀態——`$STATUS` 沒有 sens_a=/sens_b= 可以
+# 核對。這裡不能讓下游（D15 的 session_loader）誤把指令當成裝置已經證實的
+# 事實，跟 `clock_sync_confirmed` 是同一種「值 vs 有沒有被獨立核實」的分法。
+OPTIONAL_META_KEYS = ("sensors_enabled", "sensors_enabled_confirmed")
+
+VALID_SENSORS_ENABLED = ("AB", "A", "B")
+
 
 class SessionWriter:
     """`with SessionWriter(path, meta) as w: w.write_trial(idx=0, label="五", ...)`
@@ -172,6 +189,19 @@ class SessionWriter:
         meta_group = self._file.create_group("meta")
         for key in REQUIRED_META_KEYS:
             meta_group.attrs[key] = self._meta[key]
+
+        if "sensors_enabled" in self._meta:
+            value = self._meta["sensors_enabled"]
+            if value not in VALID_SENSORS_ENABLED:
+                raise ValueError(
+                    f"sensors_enabled 必須是 {VALID_SENSORS_ENABLED} 之一，收到 {value!r}")
+            meta_group.attrs["sensors_enabled"] = value
+            # 沒給就是 False，不是「不知道」——見 OPTIONAL_META_KEYS 的說明，
+            # 這條線目前只能是「主機最後一次下達的指令」，還沒有裝置回報可以核對。
+            meta_group.attrs["sensors_enabled_confirmed"] = bool(
+                self._meta.get("sensors_enabled_confirmed", False))
+        elif "sensors_enabled_confirmed" in self._meta:
+            raise ValueError("sensors_enabled_confirmed 不能單獨給，沒有 sensors_enabled 就沒有東西可以確認")
 
         # B05（兩點法漂移）與 B04（回歸法 slope）是兩個獨立方法量同一件事
         # ——對得上，兩邊才都可信；差太多代表其中一邊（或兩邊都）有問題，

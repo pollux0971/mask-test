@@ -672,3 +672,70 @@ def test_invalid_speaking_mode_rejected(tmp_path):
         kwargs["speaking_mode"] = "shouting"
         with pytest.raises(ValueError):
             w.write_trial(0, **kwargs)
+
+
+# -- sensors_enabled (D15's C0 pairing fix) --------------------------------
+
+
+def test_sensors_enabled_omitted_by_default(tmp_path):
+    """_sample_meta() 不給這個欄位——現有呼叫端（bridge_server.py）還沒
+    接這條線，這條路徑必須繼續正常運作，不能因為新欄位變成必填而斷線。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        attrs = f["meta"].attrs
+        assert "sensors_enabled" not in attrs
+        assert "sensors_enabled_confirmed" not in attrs
+
+
+def test_sensors_enabled_written_when_given_defaults_unconfirmed(tmp_path):
+    """給了值但沒給 confirmed，預設 False——不能悄悄變成「已確認」。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta(sensors_enabled="AB")) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        attrs = f["meta"].attrs
+        assert attrs["sensors_enabled"] == "AB"
+        assert bool(attrs["sensors_enabled_confirmed"]) is False
+
+
+def test_sensors_enabled_confirmed_can_be_set_true(tmp_path):
+    path = tmp_path / "session.h5"
+    meta = _sample_meta(sensors_enabled="A", sensors_enabled_confirmed=True)
+    with SessionWriter(path, meta) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        assert f["meta"].attrs["sensors_enabled"] == "A"
+        assert bool(f["meta"].attrs["sensors_enabled_confirmed"]) is True
+
+
+def test_invalid_sensors_enabled_rejected(tmp_path):
+    with pytest.raises(ValueError, match="sensors_enabled"):
+        with SessionWriter(tmp_path / "session.h5", _sample_meta(sensors_enabled="C")):
+            pass
+
+
+def test_sensors_enabled_confirmed_alone_is_rejected(tmp_path):
+    """沒有 sensors_enabled，「確認」這件事無所依附。"""
+    with pytest.raises(ValueError, match="sensors_enabled"):
+        with SessionWriter(tmp_path / "session.h5", _sample_meta(sensors_enabled_confirmed=True)):
+            pass
+
+
+def test_old_files_without_sensors_enabled_still_reopen_in_append_mode(tmp_path):
+    """這是選填而非必填的重點：既有 session 檔（這個欄位加進來之前建的）
+    重開繼續寫 trial 不能因為缺這個新欄位就報錯。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:  # 沒給 sensors_enabled，模擬舊檔
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with SessionWriter(path, mode="a") as w:
+        w.write_trial(1, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        assert "sensors_enabled" not in f["meta"].attrs
+        assert "trial_001" in f
