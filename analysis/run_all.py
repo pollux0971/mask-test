@@ -102,13 +102,15 @@ def build_feature_seqs(trials, session_by_trial):
 
     任何一筆組裝失敗（幀數對不上、缺 mel、baseline 缺漏）就**跳過那一筆並
     記錄**，不是整批放棄——一次 session 幾十筆，為了一筆壞掉的丟掉全部太貴。
-    回傳的第三個值是被跳過的清單，會寫進報告。
+    回傳 `(feature_seqs, labels, skipped, by_trial)`——`skipped` 是被跳過的
+    清單（會寫進報告），`by_trial` 是 `id(trial) -> 特徵`，給 `D12` 的距離比
+    用（它要知道哪一筆特徵屬於哪一次戴）。
     """
     from analysis.features.audio_features import mel_features
     from analysis.features.feature_assembly import assemble_feature_seq
     from analysis.features.tof_features import tof_features
 
-    feature_seqs, labels, skipped = [], [], []
+    feature_seqs, labels, skipped, by_trial = [], [], [], {}
     for trial in trials:
         session = session_by_trial[id(trial)]
         mu_a, sigma_a = session.baseline("A")
@@ -134,7 +136,8 @@ def build_feature_seqs(trials, session_by_trial):
             continue
         feature_seqs.append(seq.data)
         labels.append(trial.label)
-    return feature_seqs, labels, skipped
+        by_trial[id(trial)] = seq.data
+    return feature_seqs, labels, skipped, by_trial
 
 
 # ------------------------------------------------------------------ 各實驗
@@ -266,8 +269,13 @@ def run_snr(sessions, trials, *, is_synthetic):
     )
 
 
-def run_wear_cv(trials, *, is_synthetic):
-    """實驗 B：同次戴 vs 跨次戴的 CV。"""
+def run_wear_cv(trials, feature_by_trial, *, is_synthetic):
+    """實驗 B：同次戴 vs 跨次戴的 CV。
+
+    兩個層面各算一次（`D12` 兩者都要）：純量特徵的 CV，以及**同一個詞**在
+    同次戴／跨次戴之間的兩兩距離比。後者需要特徵序列，拿不到就只回報 CV
+    的部分——**不是整個實驗放棄**，CV 本身已經回答了驗收條件的門檻。
+    """
     import pandas as pd
 
     from analysis.experiments import exp_d12_wear_cv as mod
@@ -292,19 +300,55 @@ def run_wear_cv(trials, *, is_synthetic):
         cv = mod.scalar_cv_within_between(frame, "wear_id", column)
         verdicts[column] = mod.wear_verdict(cv["cv_within"], cv["cv_between"])
 
+    distance_result, distance_note = _wear_distance_ratio(trials, feature_by_trial)
+
     worst = max(verdicts.items(), key=lambda kv: kv[1]["cv_between"])
     passed = all(v["passed"] for v in verdicts.values())
     name, metric, criterion = EXPERIMENT_META["B"]
+    diagnosis = None
+    if not passed:
+        diagnosis = "\n".join(f"* {item}" for item in mod.IMPROVEMENT_SUGGESTIONS)
     return ExperimentOutcome(
         key="B", name=name, metric=metric,
         measured=f"最差 {worst[0]} {worst[1]['cv_between']:.1%}",
         criterion=criterion,
         status=STATUS_PASS if passed else STATUS_FAIL,
-        detail={"verdicts": verdicts, "worst_feature": worst[0]},
-        diagnosis=None if passed else "\n".join(
-            f"* {item}" for item in mod.IMPROVEMENT_SUGGESTIONS),
-        report_md=mod.format_report(verdicts, None, is_synthetic),
+        detail={"verdicts": verdicts, "worst_feature": worst[0],
+                "distance_ratio": (distance_result or {}).get("ratio"),
+                "distance_note": distance_note},
+        diagnosis=diagnosis,
+        report_md=(mod.format_report(verdicts, distance_result, is_synthetic)
+                   if distance_result is not None else None),
     )
+
+
+def _wear_distance_ratio(trials, feature_by_trial):
+    """同一個詞在同次戴／跨次戴之間的兩兩距離比。
+
+    需要「至少兩個 wear_id、且每個 wear_id 至少兩筆同一個詞」。條件不足時
+    回 `(None, 原因)`——**不猜、不用別的詞湊數**：跨詞的距離量的是「不同的
+    詞長得不一樣」，跟戴法重複性無關，混進來會讓比值完全失去意義。
+    """
+    from analysis.experiments import exp_d12_wear_cv as mod
+    from analysis.similarity.cosine_baseline import cosine_dist
+
+    by_label = {}
+    for trial in trials:
+        data = feature_by_trial.get(id(trial))
+        if data is None:
+            continue
+        by_label.setdefault(trial.label, {}).setdefault(trial.wear_id, []).append(data)
+
+    for label, by_wear in sorted(by_label.items()):
+        usable = {wid: seqs for wid, seqs in by_wear.items() if len(seqs) >= 2}
+        if len(usable) >= 2:
+            try:
+                return mod.distance_based_wear_ratio(usable, cosine_dist), None
+            except ValueError as exc:
+                return None, f"距離比算不出來（{exc}）"
+    return None, ("距離比需要同一個詞在至少 2 個 wear_id、每個 wear_id 至少 2 筆；"
+                  "目前沒有任何一個詞滿足。**不用別的詞湊數**——跨詞的距離量的是"
+                  "「不同的詞長得不一樣」，跟戴法重複性無關。")
 
 
 # ------------------------------------------------------------------ 主流程
@@ -318,9 +362,10 @@ def run_experiments(sessions, *, fast=False, is_synthetic=True):
     session_by_trial = {id(trial): session for session, trial in pairs}
 
     outcomes, notes = [], []
-    feature_seqs, labels = [], []
-    if available["C"] is None or available["E"] is None:
-        feature_seqs, labels, skipped = build_feature_seqs(trials, session_by_trial)
+    feature_seqs, labels, feature_by_trial = [], [], {}
+    if available["C"] is None or available["E"] is None or available["B"] is None:
+        feature_seqs, labels, skipped, feature_by_trial = build_feature_seqs(
+            trials, session_by_trial)
         if skipped:
             notes.append(f"{len(skipped)} 筆 trial 未能組裝成特徵："
                          + "、".join(f"{k}（{why}）" for k, why in skipped[:5])
@@ -329,7 +374,7 @@ def run_experiments(sessions, *, fast=False, is_synthetic=True):
     runners = {
         "C0": lambda: _skipped("C0", available["C0"]),
         "A": lambda: run_snr(sessions, trials, is_synthetic=is_synthetic),
-        "B": lambda: run_wear_cv(trials, is_synthetic=is_synthetic),
+        "B": lambda: run_wear_cv(trials, feature_by_trial, is_synthetic=is_synthetic),
         "C": lambda: run_silhouette(feature_seqs, labels, fast=fast,
                                     is_synthetic=is_synthetic),
         "E": lambda: run_viseme(feature_seqs, labels, is_synthetic=is_synthetic),

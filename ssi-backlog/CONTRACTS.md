@@ -25,6 +25,8 @@
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 定義 `session` 事件在 `state:"baseline"` 時的 `progress` 形狀（`elapsed_s`/`remaining_s`/`duration_s`/`live_sigma_A|B`，完成時帶 `outcome`），並新增 `POST /session/baseline/retry`。原本 `progress` 只是佔位符沒有形狀，`C11` 實作時提案。前端須用 `elapsed_s` 重新對時；`live_sigma_*` 為 null 時必須明示「倒數是本地估計」不可假裝正常 | `B10`, `B19`, `C11`, `C12` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件補上 `CONFIRM` 狀態（`B12` Hold-to-Record 專用：按住時間超出 0.3–5 s 範圍時，資料算好但**不落盤**，等使用者決定保留或跳過）。與 `B11` 「放棄的 trial 完全不落盤」一致 | `B12`, `B19`, `C12`, `C14` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件補上 `IDLE` 狀態與 `seed` 欄位；明訂 `abort`（跳過此詞）與 `redo`（保留同詞重試）語意不同，兩者都不寫入 HDF5 與 manifest；明訂 `quality` 值域凍結為 `{ok, low, rejected}`（棄用＝`rejected`，不新增第四個值）與 `B11` 的暫定門檻 0.7／0.3，並標註該門檻無實測依據、待 `E01`/`E03` 校準 | `B11`, `B12`, `B19`, `C12`, `C14`, `D12` | 是 |
+| 2026-08-26 | 6. 詞彙集 | 明訂實驗 A（逐 zone SNR）的對照詞為 `五`（round）vs `一`（spread）。`D11` 的公式用了 round／spread 但契約沒規定是哪兩個詞，`D15` 的 `run_all` 只能自己對應 | `D11`, `D15`, `E03` | 是 |
+| 2026-08-26 | 2. HDF5 Session Schema | `/meta` 新增 `sensors_enabled`（`"AB"`/`"A"`/`"B"`）。原因：`D10`（C₀ 串擾）要比較單顆開 vs 兩顆開，但 schema 沒記錄擷取當下的感測器開關狀態——`D15` 的 `run_all` 因此**永遠無法自動配對 solo/dual**，`C0` 恆為 SKIPPED。值來自 `SENS:` 指令，但要照實記錄「那是主機端記的指令、非裝置確認狀態」的限制（§4.1.2） | `B07`, `B18`, `D10`, `D15`, `E02` | 是 |
 | 2026-08-26 | 6. 詞彙集 | 裁決：**接受 viseme E（舌音）為空列，不加詞**。`D14` 的預期表有 E 但 `vocab.json` 沒有任何舌音詞、且有預期表沒列的 G 應用（三個詞）。加詞會連鎖影響 `C15`–`C21`、`D22` 的樣板數、`E05` 的錄音量，收益只是驗證一個預期本來就是「三模態都弱」的類別。「本系統不涵蓋舌音」本身是可寫進論文的誠實限制。G 標 `no_expectation` 不硬套猜的預期 | `D14`, `D15`, `E05` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.3 更正融合拒識公式：必須用**原始（未正規化）距離** `d_tof_raw`/`d_mel_raw`，並把這兩個列為 JSON 的必要欄位。原因：`normalize_distances()` 強制減去最小值，`d_tof.min()` 恆為 0，任何正門檻都不會被超過 → **`reject_fused` 永遠回 False 且無任何錯誤訊息**，只會表現成「這個系統從不拒識」。用原始距離也正是兩端退化性質成立的原因（`D07` 實作時發現） | `D07`, `D09`, `C16`, `C17`, `C18` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.3 定義**融合軌的拒識**：`theta_reject_fused(w) = w·theta_tof + (1-w)·theta_mel`，由前端即時算不存進 `TriResult`（它隨 `w` 改變，存下來會跟滑桿不同步）。線性內插的理由：融合距離本身就是同一組權重的線性組合，且在兩端恰好退化成單模態門檻——**拖滑桿到底時不會出現行為跳變**，那正是 Demo 第 2 步要做的事。另明訂「拒識不是分歧是沉默」：判斷三軌一致性時被拒識的那軌不列入比較（`C16` 實作時發現缺口） | `D06`, `D07`, `D09`, `C16`, `C17`, `C18` | 是 |
@@ -350,6 +352,7 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
     schema_version, subject, session_date, wear_id, mode,
     distance_mm, angle_deg, ambient, notes,
     fw_sha, proto_version, tof_dim,
+    sensors_enabled,        # "AB" | "A" | "B" —— 擷取當下哪幾顆在 ranging
     clock_slope, clock_offset, clock_residual_p95,
     clock_drift_us, clock_drift_ppm, clock_sync_span_us, clock_sync_confirmed,
     session_start_device_us, session_start_host_us, session_start_rtt_min_us,
@@ -444,6 +447,17 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
 > 下游該知道」的訊號，不是「這筆資料一定是錯的」，是否要因此下修
 > quality 由讀取端（`D` 軌／`B19` 儀表板）決定。
 
+> **`sensors_enabled` 記錄擷取當下哪幾顆感測器在 ranging**（`"AB"`／`"A"`／`"B"`）。
+>
+> `D10`（實驗 C₀ 串擾）要比較「單顆開」與「兩顆開」的兩次錄製，
+> 但 schema 原本**沒有記錄這件事**——所以 `D15` 的 `run_all` 從 session 檔
+> **永遠無法自動配對 solo/dual**，`C0` 恆為 `SKIPPED`（`D15` 實作時發現）。
+>
+> 值的來源：`B` 軌的 `SENS:<A|B>=<0|1>` 指令本來就知道這個狀態
+> （`host/control/device_state.py` 的 `sensor_a_enabled`/`sensor_b_enabled`）。
+> ⚠️ 但 §4.1.2 註明那兩個是「主機端記的上次指令」不是裝置確認狀態
+> （`$STATUS` 沒有 `sens_a=`/`sens_b=`）——**寫進 `/meta` 時要照實記錄這個限制**。
+>
 > **`mode` 與 `speaking_mode` 是兩條不同的軸，不可共用一個欄位。**
 > - `mode`：**session／面板模式**（`quiz`、`record`…），關於**流程**
 > - `speaking_mode`：**說話模式**（`normal` / `whisper` / `silent`），關於**受試者**
@@ -1038,6 +1052,15 @@ bridge 每秒比一次 mtime，**改完存檔即時生效，不需重啟**。
 ---
 
 ## 6. 詞彙集（`config/vocab.json`）
+
+> **實驗 A（逐 zone SNR）的對照詞：`五`（`wu`，B 圓唇）vs `一`（`yi`，C 展唇）。**
+>
+> `D11` 的公式是 `|Δ_round − Δ_spread| / σ_baseline`，但**契約原本沒有規定
+> 哪兩個詞是 round／spread 的對照組**（`D15` 實作時只能自己對應）。
+> 明訂於此，`D15` 的 `run_all` 才能自動配對；用別的詞錄的話它會 `SKIPPED`
+> 並列出實際看到的標籤。
+
+
 
 > 🔴 **已知限制：本詞彙集不涵蓋舌音（viseme E）。**
 >

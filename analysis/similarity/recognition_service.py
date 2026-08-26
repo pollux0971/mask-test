@@ -31,6 +31,21 @@ D04 批次餘弦實測 **0.147 ms**，D05 DTW **8-12 ms**——量級差了兩�
 參數，這是本 story 為了這個目的替 D07 加的擴充，向後相容、不影響
 既有呼叫端）。整個服務只是一個 Python 物件，換屬性不需要重啟任何東西，
 中間沒有需要特別處理的「服務中斷」窗口。
+
+## 拒識校準預設 `"roc"`（D22），`"loo_single"` 保留為對照
+
+**這裡原本呼叫的是 D06/D08 的單邊 LOO 校準（`enrollment
+.calibrate_tri_reject_thresholds`）**——`D09` 完成時 `D22` 還不存在。
+`D22` 後來證明單邊 LOO 在真實規模（104 維、T=24）下有結構性缺陷：
+誤拒率完全不隨樣板數改善（32%~37%，n=10 到 100 幾乎打平），雙邊 ROC
+校準把同樣情境壓到 0%~1%。調度員已把雙邊 ROC 定為系統預設並寫進
+CONTRACTS §4.3，這裡的 `reject_calibration_method` 預設改成 `"roc"`
+——這是**極值統計量稽核**時發現的落差，不是這次稽核順手做的優化：
+即時辨識服務原本仍在用已知有結構性缺陷的舊校準方法，跟系統其餘部分
+（`D08`/`D22` 的完成報告、CONTRACTS 的決議）不一致。
+
+`"loo_single"` 沒有刪除，因為 `D22` 自己的原則就是「舊方法保留當對照，
+不刪除」——真實資料上的結論可能不同，需要能切換回去比較。
 """
 import time
 
@@ -38,11 +53,19 @@ from analysis.similarity.cosine_baseline import cosine_dist
 from analysis.similarity.dtw_baseline import dtw_dist
 from analysis.similarity.enrollment import calibrate_tri_reject_thresholds
 from analysis.similarity.fusion import compute_tri_result
+from analysis.similarity.reject_calibration_roc import STRATEGY_EER, calibrate_tri_threshold_roc
 from analysis.similarity.scoring import DEFAULT_TAU
 
 DIST_FN_BY_NAME = {"cosine": cosine_dist, "dtw": dtw_dist}
 DEFAULT_DIST_METHOD = "cosine"
-DEFAULT_REJECT_PERCENTILE = 95.0
+DEFAULT_REJECT_PERCENTILE = 95.0  # 只有 reject_calibration_method="loo_single" 時使用
+
+REJECT_CALIBRATION_ROC = "roc"
+REJECT_CALIBRATION_LOO_SINGLE = "loo_single"
+VALID_REJECT_CALIBRATION_METHODS = {REJECT_CALIBRATION_ROC, REJECT_CALIBRATION_LOO_SINGLE}
+DEFAULT_REJECT_CALIBRATION_METHOD = REJECT_CALIBRATION_ROC  # D22：系統預設
+DEFAULT_ROC_STRATEGY = STRATEGY_EER
+DEFAULT_ROC_TARGET = 0.05
 
 
 class RecognitionService:
@@ -57,10 +80,21 @@ class RecognitionService:
 
     def __init__(self, templates_by_class, reject_templates, slices,
                  subject=None, wear_id=None, dist_method=DEFAULT_DIST_METHOD,
-                 tau=DEFAULT_TAU, reject_percentile=DEFAULT_REJECT_PERCENTILE):
+                 tau=DEFAULT_TAU,
+                 reject_calibration_method=DEFAULT_REJECT_CALIBRATION_METHOD,
+                 reject_percentile=DEFAULT_REJECT_PERCENTILE,
+                 roc_strategy=DEFAULT_ROC_STRATEGY, roc_target=DEFAULT_ROC_TARGET):
+        if reject_calibration_method not in VALID_REJECT_CALIBRATION_METHODS:
+            raise ValueError(
+                f"reject_calibration_method 必須是 {VALID_REJECT_CALIBRATION_METHODS} 之一，"
+                f"收到 {reject_calibration_method!r}"
+            )
         self._slices = slices
         self._tau = tau
-        self._reject_percentile = reject_percentile
+        self._reject_calibration_method = reject_calibration_method
+        self._reject_percentile = reject_percentile  # 只有 "loo_single" 用
+        self._roc_strategy = roc_strategy            # 只有 "roc" 用
+        self._roc_target = roc_target                # 只有 "roc" 用
         self._dist_method = None
         self._dist_fn = None
         self.set_dist_method(dist_method, _skip_recalibrate=True)
@@ -88,18 +122,32 @@ class RecognitionService:
         self._recalibrate_thresholds()
 
     def _recalibrate_thresholds(self):
-        thresholds = calibrate_tri_reject_thresholds(
-            self._templates_by_class, self._reject_templates, self._slices, self._dist_fn,
-            percentile=self._reject_percentile,
-        )
+        """校準方法由 `reject_calibration_method` 決定（見模組 docstring
+        「拒識校準預設 roc」）：`"roc"`（D22，系統預設）或 `"loo_single"`
+        （D06/D08，保留為對照，不刪除）。兩者回傳形狀不同，這裡統一成
+        `_precomputed_thresholds`（餵給 `fusion.compute_tri_result`）與
+        `_threshold_warnings`（`loo_single` 才有樣板數失衡警告；`roc`
+        對此問題本身更穩健，沒有對應的警告機制，見 D22 完成報告）。
+        """
+        if self._reject_calibration_method == REJECT_CALIBRATION_ROC:
+            thresholds = calibrate_tri_threshold_roc(
+                self._templates_by_class, self._reject_templates, self._slices, self._dist_fn,
+                strategy=self._roc_strategy, target=self._roc_target,
+            )
+            warnings = {"tof": None, "mel": None}
+        else:
+            thresholds = calibrate_tri_reject_thresholds(
+                self._templates_by_class, self._reject_templates, self._slices, self._dist_fn,
+                percentile=self._reject_percentile,
+            )
+            warnings = {"tof": thresholds["tof"]["warning"], "mel": thresholds["mel"]["warning"]}
+
         self._precomputed_thresholds = {
             "tof": thresholds["tof"]["theta"],
             "mel": thresholds["mel"]["theta"],
         }
-        self._threshold_warnings = {
-            "tof": thresholds["tof"]["warning"],
-            "mel": thresholds["mel"]["warning"],
-        }
+        self._threshold_warnings = warnings
+        self._calibration_stats = thresholds  # 完整資訊（frr/far/calibration_ms 等），供除錯/報告用
 
     def list_templates(self):
         """對應 `GET /templates`：列出已載入的樣板組。"""
@@ -107,6 +155,7 @@ class RecognitionService:
             "subject": self._subject,
             "wear_id": self._wear_id,
             "dist_method": self._dist_method,
+            "reject_calibration_method": self._reject_calibration_method,
             "classes": {label: len(ts) for label, ts in self._templates_by_class.items()},
             "n_reject_templates": len(self._reject_templates),
             "theta_reject_tof": self._precomputed_thresholds["tof"],

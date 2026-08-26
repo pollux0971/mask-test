@@ -513,10 +513,20 @@ class TrialStateMachine:
             mel=mel, mel_t_us=mel_t_us,
             wear_id=self._wear_id, mode=self._mode,
             valid_zone_ratio=valid_zone_ratio, drop_count=drop_count,
-            # B13（Auto-VAD）尚未實作，暫時用整個 capture 視窗邊界當佔位值——
-            # 完成回報裡已標成需要 B13 完成後回頭補正確數字的項目。
-            vad_start_us=self._capture_start_t_us, vad_end_us=self._capture_end_t_us,
-            lip_onset_us=self._capture_start_t_us, voice_onset_us=self._capture_start_t_us,
+            # B15/B16（host/vad/tof_vad.py, audio_vad.py, onset.py）都已完成，
+            # 但 TrialStateMachine 還沒有 wiring 到它們：這裡需要的是原始
+            # ProtocolParser 事件串（detect_from_events() 的輸入），
+            # 不是 _aligner.frames() 產生的 AlignedFrame；還需要建構時就有
+            # baseline_mu/sigma 可用（目前建構子完全沒有這個參數）。這是比
+            # 「補一個佔位值」更大的介面變更，且 TrialStateMachine 的建構子
+            # 正是 esp-mask-test-ed 現在在 bridge_server.py 上 wiring
+            # /trial/* 的呼叫點，貿然改簽章有跟他當下工作衝突的風險——
+            # 已在完成回報裡標成需要調度員排一個獨立 story/協調時機的項目。
+            # 這裡先做 CONTRACTS 明確要求的最小修正：不再填 capture 視窗邊界
+            # （那會讓「完全沒偵測到」看起來像「整段都在動」），改填 None，
+            # 讓 write_trial() 整個 attr 不寫入，而不是寫一個假數字。
+            vad_start_us=None, vad_end_us=None,
+            lip_onset_us=None, voice_onset_us=None,
             quality=quality,
         )
         add_session(self._session_h5_path, self._manifest_path, root=self._manifest_root)

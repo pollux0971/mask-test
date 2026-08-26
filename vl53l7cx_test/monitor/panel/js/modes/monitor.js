@@ -252,14 +252,23 @@ function renderDistanceChannel(cells, dValues, validArr, sensor, displayMode, ba
 
 // --- C08: Mel spectrogram waterfall -----------------------------------
 //
-// Value range is FIXED, not auto-normalized: CONTRACTS.md §3.1 wire format
-// is int16 = round(log_mel * 100); measured live against the mock's
-// formant model, silence sits around -606 and speech around -122. A
-// fixed scale is the whole point of the story -- auto-normalizing to
-// whatever's currently on screen would make "the sound stopped" look
-// identical to "the sound is just quiet", which is exactly the contrast
-// Demo step 3 (氣音「四」→ Mel 崩潰、ToF 仍對) needs to be visible.
-const MEL_MIN = -1000, MEL_MAX = 0;
+// Value range is FIXED, not auto-normalized: auto-normalizing to whatever's
+// currently on screen would make "the sound stopped" look identical to
+// "the sound is just quiet", which is exactly the contrast Demo step 3
+// (氣音「四」→ Mel 崩潰、ToF 仍對) needs to be visible.
+//
+// ⚠️ The SSE `bands` values are NOT the wire's int16 = round(log_mel*100)
+// scale -- confirmed by reading the live event stream directly (`/events`)
+// rather than assuming: bridge_server.py's to_sse_event() forwards
+// `event["log_mel"]`, and protocol.py's parser already divides the wire
+// int16 back down to the float log_mel before that -- so a JS panel sees
+// e.g. -6.06, not -606. First draft of this file used the wire's ×100
+// scale directly and rendered a solid, uninformative color (everything
+// clamped to one end); this is what live-testing this way is for. The
+// fixed range below is log_mel itself: -10 matches reference_mel.py's own
+// LOG_FLOOR (`log10(1e-10)`), 0 is `log10(power)` at power=1, comfortably
+// above the loudest values seen live (~-1.2).
+const MEL_MIN = -10, MEL_MAX = 0;
 const MEL_BANDS = 40;
 const MEL_HISTORY_COLUMNS = 320; // backing canvas width; ~5s at 62.5Hz, ~10s at 31.25Hz either way "至少幾秒"
 const RMS_MAX = 32767; // CONTRACTS.md §1.1 $M's rms range (16-bit PCM amplitude)
@@ -921,6 +930,51 @@ registerMode("monitor", (() => {
       melBadgeEl.className = "mel-waterfall-badge mono" + (enabled ? "" : " degraded");
     }
     if (melHzEl) melHzEl.textContent = enabled ? melRateLabel() : "";
+
+    drawPendingVadMarks();
+  }
+
+  // --- C08: VAD start/end overlay (B15/B16) ---------------------------
+  //
+  // No live producer exists for this yet: grepped bridge_server.py and
+  // protocol.py, and listened to a live mock session -- neither publishes
+  // vad_start_us/vad_end_us today. CONTRACTS.md §4.2 only documents
+  // {type:"trial", state, label, idx, seed, next_label}, no VAD timestamps
+  // on it or on any other event. quiz.js hit the exact same gap for this
+  // same "trial" event ("confirmed empty by listening live") and shipped
+  // the listener anyway so it activates automatically once a producer
+  // exists -- same approach here: noteVadMark() below is wired to fire on
+  // vad_start_us/vad_end_us appearing on ANY event (the eventual shape
+  // isn't decided), but with today's system it's simply never called.
+  // "起訖線正確對齊" is therefore unverifiable end-to-end right now -- see
+  // completion report.
+  //
+  // Marks are drawn onto the canvas's current rightmost column at paint
+  // time and then scroll left for free along with everything else via the
+  // normal putImageData shift -- no separate overlay layer or per-frame
+  // redraw needed. Simplification: a mark queued mid-way through a
+  // multi-column catch-up batch (mode was hidden when it happened) lands
+  // on the newest column of that batch rather than its exact historical
+  // one -- accepted because there's no live data to make that distinction
+  // observable, and it's a one-column error at most 60 times/sec.
+  let pendingVadMarks = []; // "start" | "end", queued in noteVadMark, drawn in paint()
+
+  function noteVadMark(kind) {
+    pendingVadMarks.push(kind);
+  }
+
+  function drawPendingVadMarks() {
+    if (!pendingVadMarks.length || !melCanvasReady) return;
+    const x = MEL_HISTORY_COLUMNS - 1;
+    for (const kind of pendingVadMarks) {
+      melCtx.strokeStyle = kind === "start" ? "#5fbf7a" : "#e2574c"; // --good / --warn
+      melCtx.lineWidth = 1;
+      melCtx.beginPath();
+      melCtx.moveTo(x + 0.5, 0);
+      melCtx.lineTo(x + 0.5, MEL_BANDS);
+      melCtx.stroke();
+    }
+    pendingVadMarks = [];
   }
 
   function ensureGrids(sensor, dim) {
@@ -1097,7 +1151,12 @@ registerMode("monitor", (() => {
       tryFetchServerPcaModel("tof_only").then((model) => { if (model) setModel(model); });
 
       melCanvas = root.querySelector("[data-mel-canvas]");
-      melCtx = melCanvas.getContext("2d");
+      // willReadFrequently: every drawn column calls getImageData (the
+      // putImageData-shift technique C08.md specifies), up to 62.5x/sec --
+      // without this hint the browser optimizes for write-heavy canvases
+      // and getImageData falls back to a slow path (confirmed live: Chrome
+      // logs exactly this warning without the hint).
+      melCtx = melCanvas.getContext("2d", { willReadFrequently: true });
       melBadgeEl = root.querySelector("[data-mel-badge]");
       melHzEl = root.querySelector("[data-mel-hz]");
       // Fixed logical pixel grid (MEL_HISTORY_COLUMNS x MEL_BANDS), stretched
@@ -1135,6 +1194,13 @@ registerMode("monitor", (() => {
     },
 
     onData(evt) {
+      // C08: VAD marks, checked on every event type (not tied to one
+      // specific type -- the eventual producer/shape isn't decided, see
+      // the noteVadMark() comment). Doesn't return; falls through to the
+      // type-specific handling below same as any other event.
+      if (typeof evt.vad_start_us === "number") noteVadMark("start");
+      if (typeof evt.vad_end_us === "number") noteVadMark("end");
+
       if (evt.type === "quality") {
         // 1Hz, cheap DOM text/canvas updates -- runs directly here rather
         // than being deferred to the rAF paint loop (unlike the heatmap/

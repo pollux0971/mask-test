@@ -1,0 +1,120 @@
+<!doctype html>
+<!--
+  Regression test for bus.js's forEachRegisteredMode() fault isolation.
+
+  Found live via C24: a plain `MODES.forEach(...)` meant one mode's onData
+  throwing stopped the loop, so every mode *after* it in MODES silently
+  never got that event. `replay` sits last in MODES, so it was the most
+  exposed -- but the bug wasn't replay-specific, any mode can trip it.
+
+  This page exists because there's no JS test runner in this project
+  ("零建置" -- no npm/webpack/vite) and shell.js does `document.getElementById`
+  at module load time, so it can't be imported outside a real DOM shaped
+  like index.html's. Rather than add a new dependency (bun test, jsdom,
+  etc.) to pin down a five-line loop, this is a real page: open it (it's
+  servable at /panel/js/test_fault_isolation.html the same way any other
+  panel/ file is -- bridge_server.py's static serving is generic under
+  /panel/, no route needed), and #result turns green/red with the assertion.
+
+  It intentionally does NOT import monitor.js/quiz.js/etc: registerMode()
+  just needs *some* hooks object per mode name, and testing the isolation
+  behavior itself doesn't need any of those files' real content.
+-->
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>bus.js fault isolation test</title>
+<style>
+  body { font-family: monospace; background: #0b0e0c; color: #e7ece8; padding: 24px; }
+  #result { font-size: 20px; font-weight: bold; padding: 12px; border-radius: 8px; margin-bottom: 16px; }
+  #result.pass { background: #143a1e; color: #5fbf7a; }
+  #result.fail { background: #3a1414; color: #e2574c; }
+  pre { background: #141915; padding: 12px; border-radius: 6px; overflow: auto; }
+</style>
+</head>
+<body>
+
+<!-- Minimal skeleton shell.js's module-level document.getElementById calls
+     need to not throw on import -- same IDs/classes as index.html, content
+     doesn't matter since nothing here is actually rendered for real use. -->
+<div id="app" class="app-shell">
+  <nav id="sidebar" class="sidebar">
+    <div class="status-connection" data-status-connection>
+      <span id="linkDot" class="link-dot"></span>
+      <span class="status-conn-text" data-status-conn-text></span>
+    </div>
+    <div class="status-warning" data-status-warning style="display:none"></div>
+    <ul class="mode-nav">
+      <li><button class="mode-nav-item active" data-mode="monitor"></button></li>
+      <li><button class="mode-nav-item" data-mode="record"></button></li>
+      <li><button class="mode-nav-item" data-mode="quiz"></button></li>
+      <li><button class="mode-nav-item" data-mode="validate"></button></li>
+      <li><button class="mode-nav-item" data-mode="replay"></button></li>
+    </ul>
+    <button class="status-summary" data-status-summary>
+      <span data-status-drop></span><span data-status-symmetry></span><span data-status-fps></span>
+    </button>
+    <button id="collapseToggle" class="collapse-toggle"></button>
+  </nav>
+  <main id="mainContent" class="main-content">
+    <section id="mode-monitor" class="mode-section active" data-mode="monitor"></section>
+    <section id="mode-record" class="mode-section" data-mode="record"></section>
+    <section id="mode-quiz" class="mode-section" data-mode="quiz"></section>
+    <section id="mode-validate" class="mode-section" data-mode="validate"></section>
+    <section id="mode-replay" class="mode-section" data-mode="replay"></section>
+  </main>
+</div>
+
+<div id="result">running…</div>
+<pre id="log"></pre>
+
+<script type="module">
+  import { registerMode } from "./shell.js";
+  import { handleEvent } from "./bus.js";
+
+  const log = [];
+  const print = (...args) => { log.push(args.join(" ")); document.getElementById("log").textContent = log.join("\n"); };
+
+  // "monitor" is first in MODES -- if forEachRegisteredMode still used a
+  // plain forEach, this throw would stop iteration right here and no mode
+  // after it (record/quiz/validate/replay) would ever see the event.
+  registerMode("monitor", {
+    onData() { throw new Error("deliberate test exception from 'monitor'"); },
+  });
+
+  const receivedBy = [];
+  ["record", "quiz", "validate", "replay"].forEach((mode) => {
+    registerMode(mode, { onData: (evt) => receivedBy.push(mode) });
+  });
+
+  const originalConsoleError = console.error;
+  let sawIsolationLog = false;
+  console.error = (...args) => {
+    if (args.some((a) => typeof a === "string" && a.includes('mode "monitor"'))) sawIsolationLog = true;
+    originalConsoleError(...args);
+  };
+
+  handleEvent({ type: "test-fault-isolation", replay: true });
+
+  console.error = originalConsoleError;
+
+  const expected = ["record", "quiz", "validate", "replay"];
+  const gotAllExpected = expected.every((m) => receivedBy.includes(m));
+  const pass = gotAllExpected && sawIsolationLog;
+
+  print("received by:", JSON.stringify(receivedBy));
+  print("expected all of:", JSON.stringify(expected));
+  print("console.error mentioned the failing mode by name:", sawIsolationLog);
+
+  const resultEl = document.getElementById("result");
+  if (pass) {
+    resultEl.textContent = "PASS — 'monitor' 拋例外沒有擋住其他模式收到事件";
+    resultEl.className = "pass";
+  } else {
+    resultEl.textContent = "FAIL — 隔離失效或錯誤訊息沒有指名是哪個 mode，見下方 log";
+    resultEl.className = "fail";
+  }
+</script>
+
+</body>
+</html>

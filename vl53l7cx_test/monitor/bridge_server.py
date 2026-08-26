@@ -83,7 +83,6 @@ LAST_SESSION_PATH = ROOT_DIR / "config" / "last_session.json"
 #: reports "no model" rather than inventing one (see _handle_pca).
 MODELS_DIR = ROOT_DIR / "models"
 VOCAB_PATH = ROOT_DIR / "config" / "vocab.json"
-MANIFEST_PATH = ROOT_DIR / "sessions" / "manifest.csv"
 
 # Imported lazily: mel_pipeline pulls in librosa, which is a heavy optional
 # dependency. The bridge's core job -- serving the panel and relaying $-lines
@@ -360,6 +359,12 @@ session_lock = threading.Lock()
 # 30 seconds" ends. Host time will not do: the two clocks drift, which is
 # the whole reason B04 exists.
 device_clock = {"last_t_us": None}
+
+
+def manifest_path():
+    """The cross-session manifest lives beside the session files, so a test
+    run pointed at a temp directory does not append to the real one."""
+    return sessions_dir() / "manifest.csv"
 
 
 def sessions_dir():
@@ -676,7 +681,7 @@ def open_trial_machine(info):
         return None, f"無法開啟 session 檔案: {exc}"
 
     machine = TrialStateMachine(
-        words, session_aligner, writer, h5_path, MANIFEST_PATH,
+        words, session_aligner, writer, h5_path, manifest_path(),
         wear_id=info.wear_id, mode=info.mode,
         # trial_000 belongs to the baseline (B10); starting at 0 here would
         # collide with it.
@@ -874,11 +879,30 @@ def serial_reader(port, baud, allow_v1=False):
             except Exception as exc:
                 print(f"[bridge] initial PING failed: {exc}")
             try:
+                last_hello = 0.0
                 while not flashing.is_set():
                     label = ping_request["label"]
                     if label:
                         ping_request["label"] = None
                         run_ping_burst(ser, label)
+
+                    # Keep asking until the protocol is negotiated. One PING
+                    # on connect is not enough: the reply can be lost on a
+                    # noisy line, and on a loaded machine a panel can open
+                    # before the first one has been processed -- either way
+                    # the link would sit at proto_confirmed=False forever,
+                    # with the frame parameters from #1.1.2 never arriving.
+                    parser = protocol_state["parser"]
+                    if parser is not None and not parser.proto_confirmed:
+                        now = time.monotonic()
+                        if now - last_hello > 2.0:
+                            last_hello = now
+                            try:
+                                with serial_write_lock:
+                                    ser.write(b"PING\n")
+                            except Exception as exc:
+                                print(f"[bridge] hello PING failed: {exc}")
+
                     raw = ser.readline()
                     if not raw:
                         continue

@@ -137,6 +137,26 @@ function computeFusedReject(triResult, w) {
   return minDist > thetaFused;
 }
 
+// --- C18: result card + confidence ring ---
+//
+// C18.md: confidence is top1-vs-top2 MARGIN, not top1's raw score. A raw
+// softmax score is dominated by tau (D06: tau=0.05 -> top1 > 0.95 almost
+// regardless of how separable the classes actually are; tau=5.0 -> top1-top4
+// spread < 0.3 even when one class is a clean winner), so the same "85%"
+// means totally different things at different tau. Margin against the
+// runner-up is tau-invariant in a way the raw score isn't -- it's asking
+// "how much does the winner actually lead by", not "how peaked is softmax".
+function computeConfidence(classes, scores) {
+  const entries = sortedEntries(classes, scores);
+  const sTop1 = entries[0].score;
+  const sTop2 = entries[1] ? entries[1].score : 0;
+  const confidence = sTop1 > 0 ? (sTop1 - sTop2) / sTop1 : 0;
+  return { top1: entries[0], confidence };
+}
+
+const RING_R = 52;
+const RING_CIRC = 2 * Math.PI * RING_R;
+
 const SPEAKING_MODES = [
   { key: "normal", label: "正常" },
   { key: "whisper", label: "氣音" },
@@ -147,6 +167,68 @@ const TRIGGER_SOURCES = [
   { key: "either", label: "任一（ToF 或音訊）" },
 ];
 const EXPECT_LABEL = { "ToF": "ToF", "音訊": "音訊", "雙模態": "雙模態" };
+
+// --- C20: real-time confusion matrix ---
+//
+// C20.md's own three marking-mode options ("建議兩種都做，用一個切換"):
+// - "posthoc" (Demo-friendly): a result renders, "✓ 正確" assumes the fused
+//   prediction shown right now is what was actually said; the "其實是"
+//   dropdown corrects it when the system got it wrong. One click either way.
+// - "assigned" (research-grade, == record mode's own flow): the system
+//   names the target BEFORE recognition, so ground truth is known in
+//   advance instead of trusted after the fact. Includes the _reject label
+//   as a possible assigned target ("保持安靜"), matching E03/E05's
+//   baseline-silence trials -- reject needs its own row/column in the
+//   matrix, not just its own card in the quiz above.
+//
+// Each entry stores the trueLabel + the RAW TriResult, not a fixed
+// predicted label: esp-mask-test-ad's call is that dragging the fusion
+// slider should re-answer "what would the system have said" for the WHOLE
+// accumulated history, the same thing C17 already does for the score bars.
+// So renderMatrix() recomputes every cell from matrixEntries + currentW
+// from scratch on every call -- it hooks into renderFusedColumn(), the
+// same recompute chain the bars/result card use, not a second one.
+const MARKING_MODES = [
+  { key: "posthoc", label: "事後標記" },
+  { key: "assigned", label: "系統指定" },
+];
+const MATRIX_CELL_SIZE = 40;
+const MATRIX_LABEL_W_RATIO = 1.8; // room for two-character labels like 不要/靜止／其他
+const MATRIX_LABEL_H_RATIO = 1.3;
+const EXPORT_DPI = 300;
+const CSS_DPI = 96; // browsers' baseline px-per-inch assumption; scale = EXPORT_DPI/CSS_DPI
+
+function hexToRgb(hex) {
+  const h = hex.trim().replace("#", "");
+  const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
+  const n = parseInt(full, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+// Blends from the surface colour up to the full hue as `t` (0..1) grows,
+// floored at 15% so a single occurrence is still visible against an empty
+// (zero-count) cell rather than reading as "no data".
+function intensityColor(hex, surfaceHex, t) {
+  const a = hexToRgb(hex);
+  const b = hexToRgb(surfaceHex);
+  const k = Math.max(0.15, Math.min(1, t));
+  const mixed = a.map((v, i) => Math.round(b[i] + (v - b[i]) * k));
+  return `rgb(${mixed[0]}, ${mixed[1]}, ${mixed[2]})`;
+}
+
+function matrixTheme() {
+  const style = getComputedStyle(document.documentElement);
+  const get = (name, fallback) => style.getPropertyValue(name).trim() || fallback;
+  return {
+    diag: get("--good", "#5fbf7a"),
+    offdiag: get("--warn", "#e2574c"),
+    surface: get("--surface", "#141915"),
+    empty: get("--surface-2", "#1b211c"),
+    border: get("--border", "#262c27"),
+    text: get("--text", "#e7ece8"),
+    onFill: get("--bg", "#0b0e0c"),
+  };
+}
 
 // A focused range slider isn't "typing" -- unlike C02/C06/C07/C09's own
 // copies of this check, a range <input> must NOT block T/M/F, or dragging
@@ -184,6 +266,18 @@ registerMode("quiz", (() => {
   let currentW = DEFAULT_FUSED_W;
   let wSliderEl = null, wValueEl = null;
 
+  // --- C18: result card ---
+  let resultCardEl = null, resultWordEl = null, resultSubEl = null, resultPctEl = null, ringFillEl = null, retryBtn = null;
+
+  // --- C20: confusion matrix ---
+  let markingModeEls = [], markingMode = "posthoc";
+  let assignedPromptEl = null, assignedWordEl = null;
+  let posthocControlsEl = null, posthocCorrectBtn = null, posthocSelectEl = null;
+  let matrixCanvasEl = null, matrixCountEl = null, matrixExportBtn = null, matrixClearBtn = null;
+  let assignedTarget = null; // { id, text } | null
+  let matrixEntries = []; // { trueLabel, triResult }[]
+  let currentEntryMarked = true; // true = nothing pending, so buttons/dropdown are inert until a fresh result arrives
+
   function renderColumn(el, classes, scores, rejected) {
     const entries = sortedEntries(classes, scores);
     el.innerHTML = entries.map((e, i) => `
@@ -209,6 +303,39 @@ registerMode("quiz", (() => {
     const disagree = new Set(tops).size > 1;
     resultsAreaEl.classList.toggle("results-disagree", disagree);
     disagreeBannerEl.style.display = disagree ? "block" : "none";
+  }
+
+  function setRingProgress(fraction) {
+    const clamped = Math.max(0, Math.min(1, fraction));
+    ringFillEl.style.strokeDashoffset = String(RING_CIRC * (1 - clamped));
+  }
+
+  // C18.md: "未偵測到" 要跟正常結果同樣大方 -- same card, same font sizes,
+  // just a different (dashed/rejected) visual state, never a blank card or
+  // all-bars-dim with no headline. And per esp-mask-test-ad's ruling on C18
+  // (disagreement is real): the card always shows the FUSED track's answer
+  // (the system's actual output), never a silently-picked "looks more
+  // right" track -- disagreement is surfaced by C16's existing red banner,
+  // not by swapping which track the card quotes.
+  function updateResultCard(triResult, w, fusedScores, rejectFused) {
+    resultCardEl.style.display = "flex";
+    resultCardEl.classList.toggle("rejected", rejectFused);
+    if (rejectFused) {
+      resultWordEl.textContent = "未偵測到";
+      resultSubEl.textContent = "系統判定：不認得";
+      resultPctEl.textContent = "--";
+      setRingProgress(0);
+      return;
+    }
+    const { top1, confidence } = computeConfidence(triResult.classes, fusedScores);
+    resultWordEl.textContent = top1.cls;
+    // tau is shown alongside confidence, not just the bare percentage --
+    // esp-mask-test-ad flagged that the same confidence number means a
+    // different thing at different tau (D06), so the number without its
+    // tau is misleading on its own.
+    resultSubEl.textContent = `信心度 ${(confidence * 100).toFixed(0)}%　τ=${triResult.tau}　w=${w.toFixed(2)}`;
+    resultPctEl.textContent = `${(confidence * 100).toFixed(0)}%`;
+    setRingProgress(confidence);
   }
 
   // Recomputes and repaints ONLY the Fused column -- ToF-only/Mel-only
@@ -247,6 +374,7 @@ registerMode("quiz", (() => {
     });
     rejectBadgeEl.fused.style.display = rejectFused ? "inline-block" : "none";
     updateDisagreement(fusedTop, rejectFused);
+    updateResultCard(lastTriResult, currentW, fusedScores, rejectFused);
 
     const elapsed = performance.now() - t0;
     if (elapsed > 50) {
@@ -267,8 +395,10 @@ registerMode("quiz", (() => {
   }
 
   // T = 純 ToF (w=1), M = 純音訊 (w=0), F = 平衡 (w=0.5) -- C17.md's exact
-  // three shortcuts. Global (document-level, like C05/C07's S/D/B), so a
-  // presenter doesn't need the slider focused or even visible on screen.
+  // three shortcuts. Enter = 重試 (C18.md) -- same handler as the "重試"
+  // button and the original "觸發辨識" button, since a retry IS just
+  // triggering recognition again. Global (document-level, like C05/C07's
+  // S/D/B), so a presenter doesn't need any particular element focused.
   function onKeydown(e) {
     if (isTypingTarget(e.target) || e.altKey || e.ctrlKey || e.metaKey) return;
     if (!isQuizModeActive()) return;
@@ -276,6 +406,7 @@ registerMode("quiz", (() => {
     if (key === "t") { e.preventDefault(); setW(1); }
     else if (key === "m") { e.preventDefault(); setW(0); }
     else if (key === "f") { e.preventDefault(); setW(0.5); }
+    else if (key === "enter") { e.preventDefault(); onRecognizeClick(); }
   }
 
   function renderResult(triResult) {
@@ -403,6 +534,21 @@ registerMode("quiz", (() => {
         <div class="quiz-disagree-banner" data-disagree-banner style="display:none">
           ⚠ 三軌判斷不一致
         </div>
+        <div class="quiz-result-card" data-result-card style="display:none">
+          <div class="quiz-result-ring-wrap">
+            <svg class="quiz-result-ring" viewBox="0 0 120 120" width="120" height="120">
+              <circle class="quiz-result-ring-track" cx="60" cy="60" r="${RING_R}"></circle>
+              <circle class="quiz-result-ring-fill" data-ring-fill cx="60" cy="60" r="${RING_R}"
+                      style="stroke-dasharray:${RING_CIRC};stroke-dashoffset:${RING_CIRC}"></circle>
+            </svg>
+            <div class="quiz-result-ring-pct mono" data-result-pct>--</div>
+          </div>
+          <div class="quiz-result-card-main">
+            <div class="quiz-result-card-word" data-result-word>—</div>
+            <div class="quiz-result-card-sub mono" data-result-sub>尚無辨識結果</div>
+          </div>
+          <button class="quiz-mode-btn quiz-result-retry-btn" data-retry-btn>重試 (Enter)</button>
+        </div>
         <div class="quiz-w-slider-row">
           <span class="quiz-w-end-label">ToF</span>
           <input type="range" class="quiz-w-slider" data-w-slider min="0" max="1" step="0.01" value="${DEFAULT_FUSED_W}">
@@ -461,6 +607,14 @@ registerMode("quiz", (() => {
       wValueEl = root.querySelector("[data-w-value]");
       wSliderEl.addEventListener("input", onSliderInput);
       document.addEventListener("keydown", onKeydown);
+
+      resultCardEl = root.querySelector("[data-result-card]");
+      resultWordEl = root.querySelector("[data-result-word]");
+      resultSubEl = root.querySelector("[data-result-sub]");
+      resultPctEl = root.querySelector("[data-result-pct]");
+      ringFillEl = root.querySelector("[data-ring-fill]");
+      retryBtn = root.querySelector("[data-retry-btn]");
+      retryBtn.addEventListener("click", onRecognizeClick);
     },
 
     onData(evt) {

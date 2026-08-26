@@ -17,7 +17,7 @@ def _make_trial(rng, center, T=24, noise=0.15):
 
 
 def _build_service(rng, n_classes=8, n_templates=9, n_reject=20, dist_method=DEFAULT_DIST_METHOD,
-                    n_dims=FEATURE_DIM, T=24):
+                    n_dims=FEATURE_DIM, T=24, **service_kwargs):
     tof_dim = round(n_dims * 64 / FEATURE_DIM)  # 維持跟真實 64/104 一樣的 tof:mel 比例
     slices = {"tof": slice(0, tof_dim), "mel": slice(tof_dim, n_dims)}
     centers = {f"w{i}": _random_direction(rng, n_dims) for i in range(n_classes)}
@@ -31,6 +31,7 @@ def _build_service(rng, n_classes=8, n_templates=9, n_reject=20, dist_method=DEF
     service = RecognitionService(
         templates_by_class, reject_templates, slices,
         subject="alice", wear_id=1, dist_method=dist_method,
+        **service_kwargs,
     )
     return service, centers, reject_center
 
@@ -182,3 +183,60 @@ def test_w_change_does_not_recompute_distances():
         tri.top1(float(w))
     np.testing.assert_array_equal(tri.d_tof, d_tof_before)
     np.testing.assert_array_equal(tri.d_mel, d_mel_before)
+
+
+# ---------------------------------------------------------------------------
+# 極值統計量稽核（見 reports/D_extremum_audit.md）：這個服務原本仍呼叫
+# D06/D08 的單邊 LOO 校準——D09 完成時 D22 還不存在，但 D22 證明單邊 LOO
+# 在真實規模下有結構性缺陷（誤拒率不隨樣板數改善），且已被定為系統預設。
+# 這裡的測試釘死「預設值已經是 roc」，不是只測「roc 這個選項存在」。
+
+def test_default_reject_calibration_method_is_roc():
+    rng = np.random.default_rng(10)
+    service, _, _ = _build_service(rng, n_classes=4, n_templates=20, n_reject=20)
+    assert service.list_templates()["reject_calibration_method"] == "roc"
+
+
+def test_loo_single_still_selectable_as_a_fallback():
+    """D22 的原則：舊方法保留為對照，不刪除。"""
+    rng = np.random.default_rng(11)
+    service, _, _ = _build_service(
+        rng, n_classes=4, n_templates=20, n_reject=20,
+        reject_calibration_method="loo_single",
+    )
+    assert service.list_templates()["reject_calibration_method"] == "loo_single"
+
+
+def test_constructor_rejects_unknown_reject_calibration_method():
+    with pytest.raises(ValueError):
+        RecognitionService(
+            {}, [], {"tof": slice(0, 1), "mel": slice(1, 2)},
+            reject_calibration_method="not_a_method",
+        )
+
+
+def test_roc_calibration_gives_far_lower_false_reject_than_loo_single_at_real_scale():
+    """在真實規模（104 維、T=24、8 類）下，roc 校準的誤拒率應該遠低於
+    loo_single——這就是這次稽核發現「服務仍用舊方法」而動手修的理由，
+    不是空口說改了比較好。"""
+    n_trials = 60
+
+    def false_reject_rate(method):
+        rng_local = np.random.default_rng(1)
+        service, centers, _ = _build_service(
+            rng_local, n_classes=8, n_templates=10, n_reject=10,
+            reject_calibration_method=method,
+        )
+        rejects = []
+        for _ in range(n_trials):
+            q = _make_trial(rng_local, centers["w2"])
+            tri, _ = service.recognize(q)
+            rejects.append(tri.reject_tof)
+        return np.mean(rejects)
+
+    rate_roc = false_reject_rate("roc")
+    rate_loo = false_reject_rate("loo_single")
+
+    assert rate_roc < rate_loo - 0.10, (
+        f"roc 誤拒率 {rate_roc:.1%} 應該明顯低於 loo_single 的 {rate_loo:.1%}"
+    )

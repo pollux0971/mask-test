@@ -79,8 +79,24 @@ export function registerMode(mode, hooks) {
 // or not -- dataStore is the thing that's "always running"; this is how a
 // mode itself can also keep lightweight state alive while hidden without
 // polling dataStore every frame.
+//
+// Each mode's callback is isolated in its own try/catch (a plain forEach
+// would let one mode's thrown exception stop the loop, so every mode after
+// it in MODES silently never sees that event -- found live via C24: a
+// crash in record.js's onData was blocking replay.js, last in MODES, from
+// getting anything, and the person debugging would start looking in the
+// wrong mode entirely since the symptom shows up somewhere else). Console
+// logging every prefix with the mode name for exactly that reason; the
+// catch does not rethrow -- one broken mode isn't supposed to blind the
+// rest, only itself.
 export function forEachRegisteredMode(fn) {
-  MODES.forEach((mode) => fn(modeHooks[mode], mode));
+  MODES.forEach((mode) => {
+    try {
+      fn(modeHooks[mode], mode);
+    } catch (err) {
+      console.error(`[bus] mode "${mode}" 的 handler 拋出例外，已隔離，其餘模式不受影響：`, err);
+    }
+  });
 }
 
 let currentMode = MODES.find((m) => sections[m] && sections[m].classList.contains("active")) || MODES[0];

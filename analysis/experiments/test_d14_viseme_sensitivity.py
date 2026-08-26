@@ -406,24 +406,14 @@ def test_plot_marks_empty_cells_as_n_zero_not_zero():
 
 
 def test_plot_titles_and_labels_are_english_only():
-    """圖表文字一律英文（調度員規則）。"""
+    """圖表文字一律英文（調度員規則）。用 `analysis/reporting/text_checks.py`
+    的共用 helper——原本 D14/D17 各寫一份一模一樣的 `has_cjk`，兩份相同的
+    實作遲早漂掉一份，而漂掉的那份不會報錯，只會安靜地少檢查一些東西。"""
+    from analysis.reporting.text_checks import assert_english_only
+
     rng = np.random.RandomState(21)
     fig = plot_viseme_sensitivity(viseme_sensitivity_report(build_samples(rng)), dpi=100)
-
-    texts = [fig._suptitle.get_text()] if fig._suptitle else []
-    for ax in fig.axes:
-        texts.append(ax.get_title())
-        texts.append(ax.get_xlabel())
-        texts.append(ax.get_ylabel())
-        texts += [label.get_text() for label in ax.get_xticklabels()]
-        texts += [label.get_text() for label in ax.get_yticklabels()]
-        texts += [t.get_text() for t in ax.texts]
-
-    def has_cjk(s):
-        return any("一" <= ch <= "鿿" for ch in s)
-
-    for text in texts:
-        assert not has_cjk(text), f"圖表文字含 CJK 字元: {text!r}"
+    assert_english_only(fig)
 
 
 def test_plot_title_warns_when_synthetic():

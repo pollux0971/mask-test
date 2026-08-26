@@ -295,3 +295,49 @@ def test_exit_code_is_one_when_a_must_pass_experiment_fails(two_sessions, tmp_pa
                          "--out", str(tmp_path / "o")])
     assert code == run_all.EXIT_MUST_PASS_FAILED
     assert "必通過項目失敗" in (tmp_path / "o" / "summary.md").read_text(encoding="utf-8")
+
+
+def test_the_end_to_end_run_actually_executes_experiments(two_sessions, tmp_path):
+    """**這條測試防的是「端到端測試其實全部 SKIPPED」。**
+
+    如果 fixture 的資料不足以跑任何實驗，上面那些 e2e 測試會全綠但什麼都
+    沒驗到。這裡明確要求四個實驗真的跑出了判定（`C0` 除外——它從 session
+    檔本來就跑不了，見 `session_loader.availability`）。
+    """
+    from analysis.reporting.verification_report import STATUS_FAIL
+
+    sessions = [session_loader.load_session(p) for p in two_sessions]
+    outcomes, _, _ = run_all.run_experiments(sessions)
+    by_key = {o.key: o for o in outcomes}
+
+    assert by_key["C0"].status == STATUS_SKIPPED
+    for key in ("A", "B", "C", "E"):
+        assert by_key[key].status in (STATUS_PASS, STATUS_FAIL), by_key[key].to_dict()
+        assert by_key[key].measured != "—"
+
+
+def test_wear_distance_ratio_refuses_to_pad_with_other_words(two_sessions):
+    """跨詞的距離量的是「不同的詞長得不一樣」，跟戴法重複性無關。
+    條件不足時要回 `None` + 原因，**不能用別的詞湊數**。"""
+    sessions = [session_loader.load_session(two_sessions[0])]   # 只有一個 wear_id
+    pairs = session_loader.usable_trials(sessions)
+    trials = [t for _, t in pairs]
+    by_trial = {id(t): np.zeros((24, 104)) for t in trials}
+
+    result, note = run_all._wear_distance_ratio(trials, by_trial)
+    assert result is None
+    assert "湊數" in note
+
+
+def test_wear_distance_ratio_works_with_two_wears(two_sessions):
+    sessions = [session_loader.load_session(p) for p in two_sessions]
+    pairs = session_loader.usable_trials(sessions)
+    trials = [t for _, t in pairs]
+    session_by_trial = {id(t): s for s, t in pairs}
+    _, _, _, by_trial = run_all.build_feature_seqs(trials, session_by_trial)
+
+    result, note = run_all._wear_distance_ratio(trials, by_trial)
+    assert note is None
+    assert result is not None
+    assert result["ratio"] > 0
+    assert result["within_distances"].size and result["between_distances"].size
