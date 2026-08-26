@@ -295,6 +295,25 @@ class QualityAggregator:
         with self._lock:
             self._last_seen[stream] = self._clock() if now is None else now
 
+    def forget_streams(self) -> None:
+        """Drop all "last seen" memory and the sliding windows.
+
+        Called when the link moves to a different board. Without it the new
+        board inherits the old one's observations: a stream that was healthy
+        on the previous device would look healthy here too, and one that had
+        gone stale would keep raising an alarm about hardware that is no
+        longer plugged in.
+        """
+        with self._lock:
+            self._last_seen.clear()
+            self._zones.clear()
+            self._rms.clear()
+            self._bytes.clear()
+            self._sensor_mean["A"].clear()
+            self._sensor_mean["B"].clear()
+            self._device_drops = None
+            self._host_drops_at_heartbeat = {}
+
     def stale_streams(self, now: float | None = None):
         """Streams that have gone silent for longer than their timeout.
 
