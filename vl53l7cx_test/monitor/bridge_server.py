@@ -212,11 +212,12 @@ def to_sse_event(event):
         # any of it. `dim` is in there too, which keeps the event shape
         # backward-compatible with the panel's existing status handler.
         parser = protocol_state["parser"]
-        out = {"type": "status"}
+        out = {"type": "status", "source": link_source["value"]}
         if parser is not None:
             out.update(parser.state())
         else:
             out["dim"] = event.get("dim")
+        out["source"] = link_source["value"]
         return out
     elif kind == "record":
         return {"type": "record", "state": event["state"], "seconds": event["seconds"]}
@@ -339,6 +340,16 @@ def _json_safe(obj):
 # are real runtime artefacts, and a test that leaves them behind shows up as
 # repo changes nobody made on purpose.
 runtime_paths = {"sessions": ROOT_DIR / "sessions", "last_session": LAST_SESSION_PATH}
+
+# What this link is actually connected to (CONTRACTS #4.2). Declared on the
+# command line, never inferred: a pty from T04's synthetic device and a pty
+# from T05's log replay are indistinguishable from here, and so is a real
+# USB-UART. Guessing would be worse than useless -- E05 records for four
+# hours, and a session accidentally captured against the mock would produce
+# an HDF5 full of synthetic data labelled as real measurement, which every
+# downstream analysis would happily consume.
+VALID_SOURCES = ("live", "mock", "replay-log", "replay-session")
+link_source = {"value": "live"}
 session_registry = SessionRegistry(LAST_SESSION_PATH)
 
 # Fed from the serial reader for the whole life of the process, not just
@@ -606,6 +617,10 @@ def build_session_meta_base(info, tof_t_us):
         "fw_sha": state.get("fw") or "unknown",
         "proto_version": state.get("protocol_version") or 2,
         "tof_dim": current_resolution["dim"],
+        # Written into the file itself, not just announced over SSE: the
+        # HDF5 outlives the connection, and by analysis time nobody can tell
+        # what it was recorded against.
+        "source": link_source["value"],
     }
     meta.update(_clock_meta())
     if meta["session_start_device_us"] == -1:
@@ -1068,6 +1083,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_get_baseline()
         elif self.path.startswith("/pca"):
             self._handle_pca()
+        elif self.path.startswith("/config/"):
+            self._handle_config()
         elif self.path == "/" or self.path.startswith("/panel/"):
             self._serve_panel_asset()
         elif self.path == "/panel.html":
@@ -1288,6 +1305,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self._send_json(200, _baseline_payload(outcome, source="session"))
 
+    # -- shared config files ----------------------------------------------
+
+    CONFIG_FILES = {
+        "vocab": VOCAB_PATH,
+        "quality_thresholds": THRESHOLDS_PATH,
+        "session_targets": ROOT_DIR / "config" / "session_targets.json",
+    }
+
+    def _handle_config(self):
+        """Serve config/*.json so the panel does not keep its own copy.
+
+        A second copy is the failure this project has already paid for three
+        times (schema_example.py missing mel_t_us, REQUIRED_META_KEYS behind
+        the clock fields, the mock's v1 dialect drifting from the firmware).
+        Read fresh on every request, which is also what makes "edit the JSON
+        and the options change" true rather than true-until-restart.
+        """
+        name = self.path[len("/config/"):].split("?", 1)[0].strip("/")
+        path = self.CONFIG_FILES.get(name)
+        if path is None:
+            self._send_json(404, {"error": f"未知的設定檔: {name}",
+                                  "available": sorted(self.CONFIG_FILES)})
+            return
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except OSError as exc:
+            self._send_json(404, {"error": f"讀不到 {path.name}: {exc}"})
+            return
+        except ValueError as exc:
+            # Malformed rather than missing: say so instead of pretending it
+            # is absent, or someone will go looking for a file that is there.
+            self._send_json(500, {"error": f"{path.name} 不是合法的 JSON: {exc}"})
+            return
+        self._send_json(200, payload)
+
     # -- C10: PCA model ---------------------------------------------------
 
     def _handle_pca(self):
@@ -1386,6 +1438,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             initial = {"type": "status", "dim": current_resolution["dim"]}
             if parser is not None:
                 initial.update(parser.state())
+            initial["source"] = link_source["value"]
             opening = [initial, quality.snapshot()]
             # A tab opened mid-session has missed the `session` broadcast
             # that fired at start, and polling /session/current just to find
@@ -1486,6 +1539,12 @@ def main():
     parser.add_argument("--baud", type=int, default=460800, help="must match CONFIG_ESP_CONSOLE_UART_BAUDRATE")
     parser.add_argument("--http-port", type=int, default=8765)
     parser.add_argument(
+        "--source", choices=VALID_SOURCES, default="live",
+        help="這條連線接的是什麼：live（真板子）/ mock（T04 合成）/ "
+             "replay-log（T05 序列埠 log 重播）/ replay-session（HDF5 回放）。"
+             "**不會自動偵測**——bridge 分辨不出 pty 與真實 UART，而錄錯來源"
+             "會產生標記成真實量測的合成資料。")
+    parser.add_argument(
         "--sessions-dir", default=None,
         help="session HDF5 檔的輸出目錄（預設 <repo>/sessions）")
     parser.add_argument(
@@ -1504,6 +1563,11 @@ def main():
 
     if args.h5_session:
         mfcc_target["h5_path"] = Path(args.h5_session)
+
+    link_source["value"] = args.source
+    if args.source != "live":
+        print(f"[bridge] ⚠ source={args.source} —— 這條連線不是真板子，"
+              f"錄下來的資料不可當成真實量測")
 
     global session_registry
     if args.sessions_dir:

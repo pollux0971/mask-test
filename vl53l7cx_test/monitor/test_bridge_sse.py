@@ -56,6 +56,7 @@ class Rig:
         self.bridge = subprocess.Popen(
             [sys.executable, str(BRIDGE), "--port", self.pty,
              "--http-port", str(self.http_port),
+             "--source", "mock",
              "--sessions-dir", str(self.workdir / "sessions"),
              "--last-session", str(self.workdir / "last_session.json"),
              *bridge_args],
@@ -304,3 +305,28 @@ def test_v1_with_allow_flag_is_degraded_and_blocks_recording():
         # v1 has no seq/t_us on the wire and none is invented here.
         assert "seq" not in e and "t_us" not in e
         assert e["proto"] == 1 and e["has_timestamp"] is False
+
+
+# -- source labelling (CONTRACTS #4.2) -----------------------------------
+
+
+def test_status_declares_what_the_link_is_connected_to(v2_events):
+    """`source` is declared on the command line, never inferred.
+
+    A pty from T04 and a real USB-UART look identical from here. The rig
+    starts the bridge with --source mock, so anything recorded through it is
+    marked synthetic -- which is the whole point: E05 records for four hours,
+    and a session captured against the mock by accident would otherwise
+    produce an HDF5 full of synthetic data labelled as real measurement.
+    """
+    status = _of_type(v2_events, "status")
+    assert status
+    assert status[-1]["source"] == "mock"
+    assert status[0]["source"] == "mock"   # the opening snapshot too
+
+
+def test_status_is_negotiated_even_under_load(v2_events):
+    """The bridge keeps saying hello until the protocol is confirmed."""
+    last = _of_type(v2_events, "status")[-1]
+    assert last["proto_confirmed"] is True
+    assert last["sr"] == 16000

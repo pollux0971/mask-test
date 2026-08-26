@@ -338,6 +338,160 @@ registerMode("quiz", (() => {
     setRingProgress(confidence);
   }
 
+  // --- C20: confusion matrix ---
+
+  function matrixLabels() {
+    const words = vocab.words || [];
+    const reject = vocab.reject || FALLBACK_VOCAB.reject;
+    return [...words.map((w) => ({ id: w.id, text: w.text })), { id: reject.id, text: reject.text }];
+  }
+
+  // The one place "what did the fused track decide" is computed from a
+  // TriResult + w -- reused for every historical entry every time the
+  // matrix recomputes, so a w change re-answers this for the whole history
+  // exactly like it re-answers it for the live score bars above.
+  function predictedLabelFor(triResult, w) {
+    const reject = vocab.reject || FALLBACK_VOCAB.reject;
+    if (computeFusedReject(triResult, w)) return reject.id;
+    const scores = fuseScores(triResult, w);
+    return sortedEntries(triResult.classes, scores)[0].cls;
+  }
+
+  function pickRandomTarget() {
+    const labels = matrixLabels();
+    return labels[Math.floor(Math.random() * labels.length)];
+  }
+
+  function showNextAssignedTarget() {
+    assignedTarget = pickRandomTarget();
+    const reject = vocab.reject || FALLBACK_VOCAB.reject;
+    assignedWordEl.textContent =
+      assignedTarget.id === reject.id ? "保持安靜（不要念任何詞）" : assignedTarget.text;
+  }
+
+  function populateMatrixSelect() {
+    const labels = matrixLabels();
+    posthocSelectEl.innerHTML =
+      `<option value="">其實是…</option>` +
+      labels.map((l) => `<option value="${l.id}">${l.text}</option>`).join("");
+  }
+
+  // One recorded observation = one matrix entry. `currentEntryMarked` stops
+  // a second click (posthoc: "✓ 正確" then the dropdown, or the dropdown
+  // twice) from double-counting the same recognition.
+  function recordMatrixEntry(trueLabel) {
+    if (!lastTriResult || currentEntryMarked || !trueLabel) return;
+    matrixEntries.push({ trueLabel, triResult: lastTriResult });
+    currentEntryMarked = true;
+    matrixCountEl.textContent = `已記錄 ${matrixEntries.length} 筆`;
+    posthocControlsEl.style.display = "none";
+    renderMatrix();
+  }
+
+  // Shared by the on-screen canvas and the PNG export -- same drawing code
+  // at two different cellSize values (see EXPORT_DPI below), so the export
+  // is pixel-for-pixel the same layout, just rendered at print resolution
+  // instead of screen resolution.
+  // Pure size math, no canvas/context involved -- both renderMatrix() and
+  // exportMatrixPNG() need the pixel dimensions *before* they can size the
+  // canvas (setting .width/.height clears it), and neither the label
+  // column width nor the number of rows/columns depends on anything a
+  // context could tell us (label width is a fixed ratio of cellSize, not
+  // measured text width).
+  function matrixLayoutSize(cellSize) {
+    const n = matrixLabels().length;
+    const labelW = cellSize * MATRIX_LABEL_W_RATIO;
+    const labelH = cellSize * MATRIX_LABEL_H_RATIO;
+    return { width: labelW + n * cellSize, height: labelH + n * cellSize, labelW, labelH, n };
+  }
+
+  // Draws into an ALREADY-sized canvas context. Called at two different
+  // cellSize values (on-screen vs. export, see EXPORT_DPI below) with
+  // otherwise identical code, so the export is pixel-for-pixel the same
+  // layout, just at print resolution instead of screen resolution.
+  function drawMatrix(ctx, cellSize) {
+    const theme = matrixTheme();
+    const labels = matrixLabels();
+    const { width, height, labelW, labelH, n } = matrixLayoutSize(cellSize);
+
+    const counts = Array.from({ length: n }, () => new Array(n).fill(0));
+    matrixEntries.forEach((entry) => {
+      const trueIdx = labels.findIndex((l) => l.id === entry.trueLabel);
+      const predIdx = labels.findIndex((l) => l.id === predictedLabelFor(entry.triResult, currentW));
+      if (trueIdx >= 0 && predIdx >= 0) counts[trueIdx][predIdx] += 1;
+    });
+    const maxCount = Math.max(1, ...counts.map((row) => Math.max(...row)));
+
+    ctx.fillStyle = theme.surface;
+    ctx.fillRect(0, 0, width, height);
+    ctx.font = `${Math.round(cellSize * 0.24)}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    // Column headers (predicted axis) and row headers (true axis).
+    ctx.fillStyle = theme.text;
+    labels.forEach((l, j) => ctx.fillText(l.text, labelW + j * cellSize + cellSize / 2, labelH / 2));
+    labels.forEach((l, i) => ctx.fillText(l.text, labelW / 2, labelH + i * cellSize + cellSize / 2));
+
+    // Cells: diagonal and off-diagonal get different hues (not just
+    // different intensities of the same colour) so "the matrix is mostly
+    // one colour" reads as "mostly correct" at a glance, per C20.md's
+    // "對角線與非對角線視覺區隔明確".
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) {
+        const count = counts[i][j];
+        const x = labelW + j * cellSize;
+        const y = labelH + i * cellSize;
+        const base = i === j ? theme.diag : theme.offdiag;
+        ctx.fillStyle = count === 0 ? theme.empty : intensityColor(base, theme.surface, count / maxCount);
+        ctx.fillRect(x, y, cellSize, cellSize);
+        ctx.strokeStyle = theme.border;
+        ctx.strokeRect(x + 0.5, y + 0.5, cellSize - 1, cellSize - 1);
+        if (count > 0) {
+          ctx.fillStyle = count / maxCount > 0.55 ? theme.onFill : theme.text;
+          ctx.fillText(String(count), x + cellSize / 2, y + cellSize / 2);
+        }
+      }
+    }
+  }
+
+  function renderMatrix() {
+    if (!matrixCanvasEl) return;
+    const { width, height } = matrixLayoutSize(MATRIX_CELL_SIZE);
+    matrixCanvasEl.width = width;
+    matrixCanvasEl.height = height;
+    drawMatrix(matrixCanvasEl.getContext("2d"), MATRIX_CELL_SIZE);
+  }
+
+  // 300 dpi (C20.md's explicit acceptance criterion): browsers have no
+  // native notion of canvas DPI, so this renders the identical layout at
+  // EXPORT_DPI/CSS_DPI times the on-screen cell size onto an offscreen
+  // canvas instead -- a PNG's only DPI metadata is its pixel dimensions
+  // relative to an assumed physical size, and this is the standard way to
+  // get a print-resolution export from an on-screen-resolution canvas API.
+  function exportMatrixPNG() {
+    const scale = EXPORT_DPI / CSS_DPI;
+    const exportCellSize = MATRIX_CELL_SIZE * scale;
+    const { width, height } = matrixLayoutSize(exportCellSize);
+    const exportCanvas = document.createElement("canvas");
+    exportCanvas.width = width;
+    exportCanvas.height = height;
+    drawMatrix(exportCanvas.getContext("2d"), exportCellSize);
+
+    const a = document.createElement("a");
+    a.href = exportCanvas.toDataURL("image/png");
+    a.download = `confusion-matrix-${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
+    a.click();
+  }
+
+  function setMarkingMode(mode) {
+    markingMode = mode;
+    markingModeEls.forEach((el) => el.classList.toggle("active", el.dataset.markingMode === mode));
+    assignedPromptEl.style.display = mode === "assigned" ? "flex" : "none";
+    posthocControlsEl.style.display = mode === "posthoc" && !currentEntryMarked ? "flex" : "none";
+    if (mode === "assigned" && !assignedTarget) showNextAssignedTarget();
+  }
+
   // Recomputes and repaints ONLY the Fused column -- ToF-only/Mel-only
   // never change with w (they're fuse(1)/fuse(0) always), and this never
   // touches d_tof/d_mel or re-fetches: C17.md's "不需重念" and D07/D09's
@@ -375,6 +529,7 @@ registerMode("quiz", (() => {
     rejectBadgeEl.fused.style.display = rejectFused ? "inline-block" : "none";
     updateDisagreement(fusedTop, rejectFused);
     updateResultCard(lastTriResult, currentW, fusedScores, rejectFused);
+    renderMatrix(); // every entry's predicted label depends on w -- recompute the whole matrix, not just repaint
 
     const elapsed = performance.now() - t0;
     if (elapsed > 50) {
@@ -424,6 +579,21 @@ registerMode("quiz", (() => {
     renderFusedColumn(); // uses currentW (whatever the slider is already at) and the caches just set above
 
     resultStatusEl.textContent = "已顯示辨識結果";
+
+    // C20: every fresh result is one un-marked matrix observation. In
+    // "assigned" mode the ground truth was already fixed before recognition
+    // ran (the target shown in assignedPromptEl), so this records itself
+    // and moves straight to the next target -- no "was this right?" step,
+    // that's the whole point of assigning it in advance. "posthoc" instead
+    // waits for the "✓ 正確" button or the "其實是" dropdown below.
+    currentEntryMarked = false;
+    if (markingMode === "assigned" && assignedTarget) {
+      recordMatrixEntry(assignedTarget.id);
+      showNextAssignedTarget();
+    } else if (markingMode === "posthoc") {
+      posthocSelectEl.value = "";
+      posthocControlsEl.style.display = "flex";
+    }
   }
 
   async function onRecognizeClick() {

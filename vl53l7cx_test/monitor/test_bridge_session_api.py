@@ -366,3 +366,34 @@ def test_baseline_meta_carries_the_measured_clock_block(rig):
         assert meta["clock_residual_p95"] < 5000, (
             f"residual {meta['clock_residual_p95']} us exceeds B04's 5 ms bound"
         )
+
+
+# -- config passthrough (single source of truth) --------------------------
+
+
+def test_vocab_is_served_from_the_real_config_file(rig):
+    """C15 was keeping its own copy; a second copy always rots."""
+    status, body = _request(rig, "GET", "/config/vocab")
+    assert status == 200
+    words = [w["text"] for w in body["words"]]
+    on_disk = json.loads(
+        (Path(__file__).resolve().parents[2] / "config" / "vocab.json").read_text())
+    assert words == [w["text"] for w in on_disk["words"]]
+    assert body.get("reject")
+
+
+def test_quality_thresholds_are_served_too(rig):
+    status, body = _request(rig, "GET", "/config/quality_thresholds")
+    assert status == 200
+    assert "drop_rate" in body and "green" in body["drop_rate"]
+
+
+def test_session_targets_are_served_too(rig):
+    status, body = _request(rig, "GET", "/config/session_targets")
+    assert status == 200 and isinstance(body, dict)
+
+
+def test_unknown_config_file_is_404_and_lists_what_exists(rig):
+    status, body = _request(rig, "GET", "/config/nonsense")
+    assert status == 404
+    assert "vocab" in body["available"]
