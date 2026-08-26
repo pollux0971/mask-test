@@ -189,6 +189,7 @@ def build_and_save_templates(sessions, out_path, subject, wear_id, require_quali
                 f"n=1 沒有東西可以留一筆出來測，算出來的準確率是 nan（不是 0%，也不是「還不錯」）；"
                 f"n=2 只有兩種結果（0% 或 100%），噪聲極大。至少 {MIN_TEMPLATES_WARN} 筆才有意義，"
                 f"正式 enrollment 建議每個詞約 {RECOMMENDED_TEMPLATES} 筆（reports/HANDOFF.md §3.1）")
+    warnings.extend(coverage_warnings)
 
     return {
         "out_path": str(out_path),
