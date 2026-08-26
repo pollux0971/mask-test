@@ -333,6 +333,10 @@ registerMode("quiz", (() => {
   let currentW = DEFAULT_FUSED_W;
   let wSliderEl = null, wValueEl = null;
 
+  // --- D08 (partial): build templates from the current recording ---
+  let buildTemplatesBtn = null, buildTemplatesStatusEl = null, buildTemplatesWarningsEl = null;
+  let buildTemplatesPollId = null;
+
   // --- C18: result card ---
   let resultCardEl = null, resultWordEl = null, resultSubEl = null, resultPctEl = null, ringFillEl = null, retryBtn = null;
 
@@ -1020,27 +1024,47 @@ registerMode("quiz", (() => {
     renderPcaThumb(tofA, tofB); // async (may fetch /pca) -- fine, draws in place once it resolves without blocking the rest
   }
 
+  // Same split replay.js/record.js already use: a thrown fetch (can't
+  // reach the bridge at all) is genuinely "尚未串接"/連不上後端; a response
+  // that came back with !res.ok is the backend reachable and answering
+  // with a real reason (e.g. 503 "尚無 enrollment 樣板，無法辨識" -- see
+  // reports/RECOGNIZE_PIPELINE.md) -- that reason belongs on screen, not
+  // flattened into the same generic "not wired yet" text and left to rot
+  // in console.warn where only a developer would ever see it.
   async function onRecognizeClick() {
     resultStatusEl.textContent = "辨識中…";
     recognizeRequestSentAt = performance.now();
     startProgress();
+
+    let res;
     try {
-      const res = await fetch("/recognize", { method: "POST" });
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      const triResult = await res.json();
-      if (!triResult || !Array.isArray(triResult.classes) || !Array.isArray(triResult.d_tof) || !Array.isArray(triResult.d_mel)
-          || !Array.isArray(triResult.d_tof_raw) || !Array.isArray(triResult.d_mel_raw)) {
-        throw new Error("malformed TriResult");
-      }
-      finishProgress();
-      renderResult(triResult);
+      res = await fetch("/recognize", { method: "POST" });
     } catch (err) {
-      // D09's /recognize doesn't exist yet (confirmed live, 404) -- this
-      // is the expected state right now, not a real error to alarm over.
       hideProgress();
-      resultStatusEl.textContent = "尚未串接（/recognize 還沒上線）";
-      console.warn("[quiz] /recognize unavailable:", err.message);
+      resultStatusEl.textContent = "連不上後端（" + err.message + "）";
+      console.warn("[quiz] /recognize network error:", err.message);
+      return;
     }
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      hideProgress();
+      resultStatusEl.textContent = body.error || `辨識失敗：HTTP ${res.status}`;
+      console.warn("[quiz] /recognize error:", res.status, body.error);
+      return;
+    }
+
+    const triResult = await res.json().catch(() => null);
+    if (!triResult || !Array.isArray(triResult.classes) || !Array.isArray(triResult.d_tof) || !Array.isArray(triResult.d_mel)
+        || !Array.isArray(triResult.d_tof_raw) || !Array.isArray(triResult.d_mel_raw)) {
+      hideProgress();
+      resultStatusEl.textContent = "辨識結果格式不對（不是合法的 TriResult）";
+      console.warn("[quiz] /recognize returned malformed TriResult:", triResult);
+      return;
+    }
+
+    finishProgress();
+    renderResult(triResult);
   }
 
   function renderCards() {
@@ -1140,6 +1164,11 @@ registerMode("quiz", (() => {
           <button class="quiz-mode-btn" data-recognize-btn>觸發辨識</button>
           <span class="quiz-result-status mono" data-result-status>尚無辨識結果</span>
         </div>
+        <div class="quiz-result-controls">
+          <button class="quiz-mode-btn" data-build-templates-btn>用目前的錄音建樣板</button>
+          <span class="quiz-result-status mono" data-build-templates-status></span>
+        </div>
+        <ul class="mono" data-build-templates-warnings style="display:none; margin:0; padding-left:20px;"></ul>
         <div class="quiz-progress" data-quiz-progress style="display:none">
           <div class="quiz-progress-stages">
             <span class="quiz-progress-stage" data-progress-stage="recording">錄音中</span>

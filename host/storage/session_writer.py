@@ -125,23 +125,40 @@ VALID_QUALITY_VALUES = ("ok", "low", "rejected")
 # 寫入端沒接住），差別是這次還沒有人開始讀，抓到得早。
 #
 # `sensors_seen`（真板子上線當天發現，第三種、跟前兩個都不一樣）：
-# ESP32 韌體 A 顆感測器 `is_alive` 失敗，B 顆是活的，但 B 送出來的資料
-# 標籤成 `A`——`sensors_enabled`（指令設成什麼）跟
-# `sensors_enabled_confirmed`（裝置有沒有確認收到指令）兩個都測不出這種
-# 錯誤：`$H` 的 drop_A/drop_B 全是 0（A 根本沒在讀，不是讀取失敗），
-# `$STATUS` 沒有欄位能說哪幾顆真的在跑，韌體的錯誤訊息是 `ESP_LOGE`
-# 不是 `$` 開頭，bridge 的解析器完全看不到。`sensors_seen` 記的是**這個
-# session 期間，實際有資料流過來的感測器標籤**——來自 bridge_server.py
-# 對資料流本身的統計，跟前兩個欄位可以互相不一致，那個不一致本身就是
-# 診斷用的資訊（例如 enabled=AB 但 seen=A，代表韌體回報活著的那顆其實
-# 沒有真的送資料）。選填，理由跟 `sensors_enabled` 一樣：呼叫端才剛在接
-# 這條線。
+# `sensors_enabled`（指令設成什麼）跟 `sensors_enabled_confirmed`（裝置
+# 有沒有確認收到指令）都測不出「韌體回報活著、但資料流其實沒送過來」
+# 這類錯誤——`$H` 的 drop_A/drop_B 只統計讀取失敗，不是「根本沒在讀」；
+# `$STATUS` 沒有欄位能說哪幾顆真的在跑。`sensors_seen` 記的是
+# **bridge_server.py 對資料流本身的統計：這個 session 期間，線上實際
+# 出現過哪些感測器標籤**，跟前兩個欄位可以互相不一致，那個不一致本身
+# 就是診斷用的資訊。
+#
+# ⚠️ **`sensors_seen = "A"` 的意思是「線上出現過標著 A 的 `$T` 行」，
+# 不是「A 這顆實體感測器是好的」**——主機端只看得到協定裡的標籤，看不到
+# 韌體那一側是哪一顆晶片在送資料，兩者原則上該一致，但 `sensors_seen`
+# 誠實的語意只到「看到幾條資料流、它們自稱是誰」為止，不是「哪幾顆硬體
+# 有作用」的判定。
+#
+# ⚠️ **`""` 是合法值，跟「attr 不存在」意義相反，不能互相取代**：
+#   - `""`（值是空字串）＝ 監測過整個 session，**確實沒有任何感測器的
+#     資料流過來**——這是量出來的結論，而且是很糟的那種。
+#   - attr 不存在 ＝ 這是舊檔，這個欄位當時還不存在，**沒有量過**。
+# 把兩者攤平成同一個「沒有這個值」，下游會把「這批資料是廢的」誤讀成
+# 「這只是個沒接這條線之前的舊檔」，而且不會有任何東西變紅——這正是
+# `sensors_seen` 存在的理由，不能在寫入端自己先把它抹掉。跟其他選填欄位
+# 不同：呼叫端只要這個 session 真的跑過監測，就該無條件塞值進來
+# （包含空字串），不是「有東西才給」。
 OPTIONAL_META_KEYS = (
     "sensors_enabled", "sensors_enabled_confirmed", "energy_mu", "energy_sigma",
     "source", "sensors_seen",
 )
 
 VALID_SENSORS_ENABLED = ("AB", "A", "B")
+
+# `sensors_seen` 專用值域——刻意不共用 VALID_SENSORS_ENABLED：多了 ""
+# 這個合法值（見上方說明），跟 sensors_enabled「沒有感測器就不寫這個
+# attr」的規則不是同一套。
+VALID_SENSORS_SEEN = ("", "A", "B", "AB")
 
 # 跟 bridge_server.py 的 VALID_SOURCES 同一份值域（§4.2/§2 兩處契約已經
 # 凍結這四個值），不是各自維護一份容易漂移的清單，只是 SessionWriter 不
@@ -252,9 +269,9 @@ class SessionWriter:
 
         if "sensors_seen" in self._meta:
             value = self._meta["sensors_seen"]
-            if value not in VALID_SENSORS_ENABLED:
+            if value not in VALID_SENSORS_SEEN:
                 raise ValueError(
-                    f"sensors_seen 必須是 {VALID_SENSORS_ENABLED} 之一，收到 {value!r}")
+                    f"sensors_seen 必須是 {VALID_SENSORS_SEEN} 之一，收到 {value!r}")
             meta_group.attrs["sensors_seen"] = value
 
         has_energy_mu = "energy_mu" in self._meta

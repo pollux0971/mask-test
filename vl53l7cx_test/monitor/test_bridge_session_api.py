@@ -408,3 +408,113 @@ def test_unknown_config_file_is_404_and_lists_what_exists(rig):
     status, body = _request(rig, "GET", "/config/nonsense")
     assert status == 404
     assert "vocab" in body["available"]
+
+
+# -- sensors_seen: what actually arrived ----------------------------------
+
+
+def test_sensors_seen_reports_both_on_a_healthy_board(rig):
+    rig.read_events(2.0)
+    status = _of_type(rig.read_events(1.5), "status")
+    assert status
+    assert status[-1]["sensors_seen"] == "AB"
+
+
+def test_sensors_seen_catches_a_board_with_one_silent_sensor():
+    """The first real board's failure, reproduced at the derivation.
+
+    Sensor A failed is_alive and never streamed; sensor B did -- but the
+    frames it emitted were labelled `A`. From the host's side the difference
+    is invisible by every other route: the failure is announced over
+    ESP_LOGE (not a $ line, never parsed), and $H's drop_A/drop_B both stay
+    at zero because a sensor nobody reads never fails a read. Counting
+    labels on the wire is the only signal there is.
+
+    Driven directly rather than through the mock, because silencing one of
+    the mock's sensors needs the /sensor endpoint (B18), which is not wired
+    yet -- and the thing worth pinning down is the derivation, not the
+    device's ability to play dead.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "bs_seen", Path(__file__).resolve().parent / "bridge_server.py")
+    bs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bs)
+
+    assert bs.sensors_seen_string() == "", "nothing received yet"
+
+    for seq in range(5):
+        bs.drop_tracker.observe("tof_A", seq)
+    assert bs.sensors_seen_string() == "A", (
+        "one stream arrived, labelled A -- note this does NOT mean the "
+        "physical sensor A is alive; on the real board it was B emitting "
+        "frames labelled A"
+    )
+
+    for seq in range(5):
+        bs.drop_tracker.observe("tof_B", seq)
+    assert bs.sensors_seen_string() == "AB"
+
+
+def test_sensors_seen_only_counts_the_current_session():
+    """A previous session's frames must not make a dead sensor look alive."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "bs_session", Path(__file__).resolve().parent / "bridge_server.py")
+    bs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bs)
+
+    for seq in range(5):
+        bs.drop_tracker.observe("tof_A", seq)
+        bs.drop_tracker.observe("tof_B", seq)
+    assert bs.sensors_seen_string() == "AB"
+
+    # A new session starts here; only A streams from now on.
+    baseline = bs.snapshot_frame_counts()
+    for seq in range(5, 10):
+        bs.drop_tracker.observe("tof_A", seq)
+
+    assert bs.sensors_seen_string(baseline) == "A", (
+        "frames from before the session started leaked into the count"
+    )
+    assert bs.sensors_seen_string() == "AB"   # since-boot view is unchanged
+
+
+def test_sensors_seen_is_empty_not_missing_when_nothing_arrives(rig):
+    """Nothing on the wire yet must read as "", not as an absent field.
+
+    An absent field means "we never recorded this"; "" means "we recorded
+    it, and the answer was none". A session where no ToF data arrived at
+    all is the single most alarming case, so it must not be spelled the
+    same way as an old file that predates the field.
+    """
+    status = _of_type(rig.read_events(0.3), "status")
+    assert status
+    assert "sensors_seen" in status[0], "the field must always be present"
+    assert isinstance(status[0]["sensors_seen"], str)
+
+
+def test_quality_event_carries_sensors_seen(rig):
+    rig.read_events(2.0)
+    quality = _of_type(rig.read_events(1.5), "quality")
+    assert quality
+    assert quality[-1]["sensors_seen"] == "AB"
+
+
+def test_sensors_seen_is_recorded_in_the_session_meta(rig):
+    import h5py
+    rig.read_events(3.5)
+    _request(rig, "POST", "/session/start", VALID_METADATA)
+    status, body = _request(rig, "POST", "/session/baseline?seconds=2")
+    if status != 200:
+        pytest.skip(f"baseline gate rejected the synthetic scene: {body.get('reason')}")
+    assert _request(rig, "POST", "/session/end")[0] == 200
+    time.sleep(0.5)
+
+    files = list((rig.workdir / "sessions").glob("*.h5"))
+    with h5py.File(files[0], "r") as f:
+        meta = dict(f["/meta"].attrs)
+    seen = meta.get("sensors_seen")
+    if seen is None:
+        pytest.skip("sensors_seen is not in the schema yet (esp-mask-test-18)")
+    assert seen in ("AB", b"AB")

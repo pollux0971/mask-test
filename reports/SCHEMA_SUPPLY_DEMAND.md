@@ -11,10 +11,15 @@
 ## 結論先講（第二輪更新後）
 
 - 掃過的直接 h5py 存取有 **6 處**，其中 5 處是刻意、窄範圍、風險低；
-  **1 處是死碼**（`host/storage/mel_writer.py`）——這輪已經把精確的偵察
+  **1 處原本是死碼**（`host/storage/mel_writer.py`）——這輪把精確的偵察
   清單（誰引用、哪一行呼叫、`--h5-session` 還有沒有人用、刪掉會不會連累
-  無關的 `.npy` 路徑）交出去，**沒有動手刪**，因為呼叫點在 `bridge_server.py`，
-  現在有三個人同時在裡面。
+  無關的 `.npy` 路徑）交出去，沒有動手刪，因為呼叫點在 `bridge_server.py`，
+  當時有三個人同時在裡面。**第三輪更新：`ed` 已經清掉了**——
+  `host/storage/mel_writer.py`／`test_mel_writer.py` 兩個檔案都已刪除，
+  `--h5-session` 旗標也一併移除，`bridge_server.py` 裡確認過偵察清單標的
+  那個風險（`wav_to_log_mel_timed` 跟 `write_mel_to_trial` 綁在同一個
+  `try/except ImportError`）有被處理，不是單純刪檔留下地雷——這一項現在
+  結案，不再是待辦。
 - 🔴 第三類（有人讀、沒人寫）目前是 0 筆，`energy_mu`/`energy_sigma`
   當時的那個案例已經修掉（細節見下，留著是證明這張表抓得到這一類 bug）。
 - 情況四（契約定義、兩邊都沒實作）**這輪也清空了**：`source` 原本卡在
@@ -42,7 +47,7 @@
 | `host/storage/manifest.py` | 讀 | attrs：`session_date`、`trial_idx`、`label`、`wear_id`、`mode`、`quality`、`valid_zone_ratio`、`drop_count`；dataset：`tof_A.shape[0]` | ✅ 刻意——manifest 是輕量索引表，載入整個 `Trial`（含所有陣列）太浪費 | 低。讀的全部是 `REQUIRED_META_KEYS`/`REQUIRED_TRIAL_ATTRS`，用 `[...]` 直接索引（不是 `.get()`）在邏輯上是對的——這些欄位本來就保證存在。都是 str/int/float，沒有 bool |
 | `vl53l7cx_test/monitor/bridge_server.py`（`read_baseline_thresholds()`） | 讀 | `/meta` 的 `baseline_mu_*`/`sigma_*`、`noise_floor_mu`/`sigma`、`energy_mu`/`sigma` | ✅ 刻意——這是**擷取當下**要餵給 VAD 偵測器的門檻值，跟`analysis/`的離線分析是不同的消費者、不同的時機，本來就不該依賴 D-track 的 `session_loader.py` | 低，而且這處寫法本身就是示範：全部用 `.get()`、缺席印警告訊息，**不是**直接索引——見下方 `energy_mu` 那筆歷史 |
 | `host/trial/state_machine.py`（`_mark_trial_quality()`） | 寫 | attrs：`quality`（單一欄位，事後訂正用，`reject` 動作） | ✅ 刻意——訂正一個已落盤 trial 的品質標記，不需要重跑整個 `write_trial()` | 低，只寫一個保證存在的必填字串欄位 |
-| `host/storage/mel_writer.py` | 寫 | dataset：`mel`（**沒有** `mel_t_us`） | 🔴 **不是**——見下方 | 🔴 **高，但目前無害**，因為死碼（見下） |
+| `host/storage/mel_writer.py` | ~~寫~~ **已刪除** | ~~dataset：`mel`（沒有 `mel_t_us`）~~ | ~~🔴 不是~~ | ✅ **第三輪更新：`ed` 已經刪掉這個檔案跟 `--h5-session` 旗標，風險已解除，見下方** |
 | `ssi-backlog/tools/schema_example.py` | 寫 | 透過 `SessionWriter`，不是直接開檔 | 不算繞過 | 無 |
 
 ### 🔴 死碼：`host/storage/mel_writer.py`（偵察清單，沒有動手）

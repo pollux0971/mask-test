@@ -939,3 +939,45 @@ def test_baseline_age_s_written_when_given(tmp_path):
 
     with h5py.File(path, "r") as f:
         assert f["trial_000"].attrs["baseline_age_s"] == pytest.approx(1834.5, abs=1e-2)
+
+
+# -- sensors_seen (真板子上線發現的第三種訊號，"" 是合法值) -----------------
+
+
+def test_sensors_seen_omitted_by_default(tmp_path):
+    """沒給就是舊檔那種「沒量過」，不是 sensors_enabled 那種「沒有感測器」
+    ——這裡驗證的是「呼叫端沒給這個鍵」的情況，不是 ""。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        assert "sensors_seen" not in f["meta"].attrs
+
+
+@pytest.mark.parametrize("value", ["AB", "A", "B"])
+def test_sensors_seen_accepts_normal_values(tmp_path, value):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta(sensors_seen=value)) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+    with h5py.File(path, "r") as f:
+        assert f["meta"].attrs["sensors_seen"] == value
+
+
+def test_sensors_seen_empty_string_is_written_not_dropped(tmp_path):
+    """"" 是「監測過整個 session，確實沒有任何感測器資料」這個結論本身，
+    跟「這個 attr 沒給」（舊檔／沒量過）意義相反，兩者不能互相取代——
+    給 "" 就要真的寫進 /meta，不能因為它是 falsy 就被當成沒給。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta(sensors_seen="")) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        assert "sensors_seen" in f["meta"].attrs
+        assert f["meta"].attrs["sensors_seen"] == ""
+
+
+def test_invalid_sensors_seen_rejected(tmp_path):
+    with pytest.raises(ValueError, match="sensors_seen"):
+        with SessionWriter(tmp_path / "session.h5", _sample_meta(sensors_seen="C")):
+            pass

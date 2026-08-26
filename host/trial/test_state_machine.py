@@ -493,6 +493,54 @@ def test_mel_omitted_when_no_mel_events_in_window(tmp_path):
 # B12 -- hold-to-record
 
 
+def test_hold_to_record_advances_word_across_consecutive_trials(tmp_path):
+    """E05 排練時 ca 真的卡住的 bug：連續多筆 hold-to-record，詞永遠不換
+    （`_next_trial_idx` 有前進、`_order_pos` 沒有）——`hold_stop()` 的直接
+    存檔路徑漏了 `tick()`／`confirm_keep()` 都有的 `_order_pos += 1`，
+    單元測試之前沒抓到是因為既有測試只測時長/資料，沒有斷言連續兩筆
+    hold-to-record 之間詞真的換了。這裡鎖住：seed 固定、連續存 3 筆，
+    三個 label 必須兩兩不同。
+    """
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(
+        tmp_path, words=("五", "四", "八"), seed=1, clock=clock,
+    )
+    _feed_tof(aligner, "A", 900_000, 20_000_000)
+    _feed_tof(aligner, "B", 900_000, 20_000_000)
+    _feed_mic(sm, 900_000, 20_000_000)
+
+    labels = []
+    t = 1_000_000
+    for _ in range(3):
+        sm.hold_start(device_t_us=t)
+        events = sm.hold_stop(device_t_us=t + 1_000_000)
+        save_event = events[0]
+        assert save_event["state"] == "SAVE"
+        labels.append(save_event["label"])
+        t += 2_000_000
+        clock.advance(REST_S + 0.001)
+        sm.tick()  # REST -> IDLE, matching the real trial_ticker()'s job
+
+    assert len(set(labels)) == 3, f"三筆應該是三個不同的詞，實際是 {labels}"
+
+
+def test_hold_stop_save_event_carries_next_label(tmp_path):
+    """跟上面同一個漏洞的另一半：`hold_stop()` 存檔成功時進的 REST 事件
+    原本沒有帶 `next_label`（`tick()`／`confirm_keep()` 的等價路徑都有），
+    前端因此永遠讀不到新的下一個詞提示。"""
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path)
+    _feed_tof(aligner, "A", 900_000, 1_300_000)
+    _feed_tof(aligner, "B", 900_000, 1_300_000)
+    _feed_mic(sm, 900_000, 1_300_000)
+
+    sm.hold_start(device_t_us=1_000_000)
+    events = sm.hold_stop(device_t_us=2_000_000)
+    rest_event = events[1]
+    assert rest_event["state"] == "REST"
+    assert "next_label" in rest_event
+    assert rest_event["next_label"] == sm.peek_next_label()
+
+
 def test_hold_one_second_covers_about_1_5s_with_padding(tmp_path):
     """驗收條件：按住 1 秒放開，存下的資料涵蓋約 1.5 秒（含前後 padding）。"""
     from host.trial.state_machine import HOLD_POST_ROLL_US, HOLD_PRE_ROLL_US
