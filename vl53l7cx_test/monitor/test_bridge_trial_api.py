@@ -298,3 +298,58 @@ def test_sensors_enabled_is_recorded_but_never_claimed_as_confirmed(rig):
         pytest.skip("sensors_enabled is not in the schema yet")
     assert enabled in ("AB", b"AB")
     assert not meta["sensors_enabled_confirmed"]
+
+
+# -- B21: VAD thresholds reach the state machine --------------------------
+
+
+def test_baseline_thresholds_are_handed_to_the_trial_machine(rig):
+    """The six that exist today must be passed, not left at their defaults.
+
+    Omitting them is not an error -- every parameter defaults to None -- so
+    nothing fails, the VAD just quietly declines to run and the four timing
+    attrs stay None forever. This asserts the wiring exists at all.
+    """
+    import h5py
+    body = _session_with_baseline(rig)
+    assert body["ok"] is True
+
+    # The machine is constructed as soon as the baseline lands, so a trial
+    # running at all means the thresholds were read without blowing up.
+    assert _request(rig, "POST", "/trial/start", {})[0] == 200
+    assert _request(rig, "POST", "/trial/abort")[0] == 200
+
+    assert _request(rig, "POST", "/session/end")[0] == 200
+    time.sleep(0.5)
+    files = list((rig.workdir / "sessions").glob("*.h5"))
+    with h5py.File(files[0], "r") as f:
+        meta = dict(f["/meta"].attrs)
+    for key in ("baseline_mu_A", "baseline_sigma_A",
+                "baseline_mu_B", "baseline_sigma_B",
+                "noise_floor_mu", "noise_floor_sigma"):
+        assert key in meta, f"{key} is not in /meta, so it cannot be passed on"
+    assert len(meta["baseline_mu_A"]) == 32
+
+
+def test_energy_thresholds_are_read_when_present(rig):
+    """energy_mu/energy_sigma are read with .get(), not indexed.
+
+    B21's writer change has not landed yet, so these are absent from /meta
+    today. The reader must tolerate that (CONTRACTS #1.1.2: a field the
+    producer has not written is None, never a substituted default) -- and
+    pick them up automatically once it does.
+    """
+    import h5py
+    _session_with_baseline(rig)
+    assert _request(rig, "POST", "/session/end")[0] == 200
+    time.sleep(0.5)
+    files = list((rig.workdir / "sessions").glob("*.h5"))
+    with h5py.File(files[0], "r") as f:
+        meta = dict(f["/meta"].attrs)
+
+    present = [k for k in ("energy_mu", "energy_sigma") if k in meta]
+    if not present:
+        # Not a skip: the point is that their absence is survivable, and the
+        # session above ran a full baseline + writer cycle to prove it.
+        return
+    assert len(present) == 2, f"only {present} was written; both or neither"

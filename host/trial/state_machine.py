@@ -161,12 +161,20 @@ class TrialStateMachine:
         baseline_sigma_B: Optional[np.ndarray] = None,
         noise_floor_mu: Optional[float] = None,
         noise_floor_sigma: Optional[float] = None,
+        energy_mu: Optional[float] = None,
+        energy_sigma: Optional[float] = None,
     ):
-        """B21：`baseline_mu_*`/`baseline_sigma_*`（ToF，各 32 值）與
-        `noise_floor_mu`/`sigma`（麥克風）都來自 `B10` 的
-        `capture_baseline_trial()`，已經寫進 `/meta`（呼叫端 -- 目前是
-        `bridge_server.py` -- 從 session 的 `/meta` 讀出來傳進來，這裡不
-        自己開 HDF5 讀）。
+        """B21：`baseline_mu_*`/`baseline_sigma_*`（ToF，各 32 值）、
+        `noise_floor_mu`/`sigma`（麥克風）與 `energy_mu`/`sigma`（ToF 唇動
+        偵測的能量門檻，見 `host/storage/baseline.py` 的
+        `evaluate_baseline()`）都來自 `B10` 的 `capture_baseline_trial()`，
+        已經寫進 `/meta`（呼叫端 -- 目前是 `bridge_server.py` -- 從 session
+        的 `/meta` 讀出來傳進來，這裡不自己開 HDF5 讀）。
+
+        `energy_mu`/`sigma` 不給就讓 `detect_lip_activity()` 自己從這筆
+        trial 的資料估（`estimate_energy_floor()`，B16 量過會偏嚴約
+        23%）——baseline 期間算好的比較準，因為那段保證沒有動作，但沒有
+        也不是不能動（只是精度差一點，不是壞掉）。
 
         全部設 `Optional[None]` 而不是必填：`host.vad.tof_vad`/`audio_vad`
         自己在缺 baseline/底噪時就會回 `applicable=False`（不拋例外），
@@ -193,6 +201,8 @@ class TrialStateMachine:
         self._baseline_sigma_B = baseline_sigma_B
         self._noise_floor_mu = noise_floor_mu
         self._noise_floor_sigma = noise_floor_sigma
+        self._energy_mu = energy_mu
+        self._energy_sigma = energy_sigma
 
         self._seed = seed if seed is not None else random.SystemRandom().randrange(2**31 - 1)
         self._order = list(self._words)
@@ -592,12 +602,12 @@ class TrialStateMachine:
         # 偵測——B21.md 自己給的介面範例只示範了單一感測器，沒有提兩顆怎麼
         # 融合，這裡照給的範例做，不是自己發明一個融合策略。
         #
-        # energy_mu/energy_sigma 沒有從 baseline 期間算好傳進去（B16 建議這樣
-        # 做，量出來的門檻比較準）——那需要 baseline 當時的原始幀，但
-        # TrialStateMachine 現在只拿得到 baseline 算完的 mu/sigma 摘要，沒有
-        # 原始幀可以重算能量。留 None 讓 detect_lip_activity() 自己用
-        # estimate_energy_floor() 估（B16 量過，這樣量出來的門檻偏嚴約
-        # 23%），已在完成回報裡標成已知限制，不是忘記做。
+        # energy_mu/energy_sigma 從 baseline 期間算好傳進來（host/storage/
+        # baseline.py 的 evaluate_baseline()，跟這裡用同一組
+        # zone_energy()/estimate_energy_floor()，不是抄一份）——沒給
+        # （例如舊測試沒傳）就讓 detect_lip_activity() 自己用
+        # estimate_energy_floor() 從這筆 trial 的資料估，精度差一點但不會
+        # 壞掉（B16 量過：自估比 baseline 算好的偏嚴約 23%）。
         #
         # excluded_zones 也沒有帶 ZoneQualityReport 進來排除已知壞掉的
         # zone——B21.md 的建構子簽章範圍只列了 baseline_mu/sigma，沒有列
@@ -605,6 +615,7 @@ class TrialStateMachine:
         raw_window = self._raw_events_window(self._capture_start_t_us, self._capture_end_t_us)
         lips = detect_lips(
             raw_window, self._baseline_mu_A, self._baseline_sigma_A, sensor="A",
+            energy_mu=self._energy_mu, energy_sigma=self._energy_sigma,
         )
         voice = detect_voice(
             raw_window, self._noise_floor_mu, self._noise_floor_sigma,

@@ -63,6 +63,7 @@
 | 2026-08-26 | 2. HDF5 Session Schema | `host/storage/session_writer.py` 同步到最新 schema（B05/B11 追加的欄位落地）：①`REQUIRED_META_KEYS` 補時鐘漂移七欄位，`session_end_*` 三欄位改由新方法 `SessionWriter.finalize_session_end()` 於 session 結束時補寫，不列入建構必填；②`write_trial()` 移除「`mel` 幀數必須等於 `mic_t_us` 長度」的錯誤檢查，改收 `mel_t_us` 參數、與 `mel` 成對驗證；③新增 `tof_ambient_A`/`tof_ambient_B`/`tof_ambient_t_us` 三選填參數，全有或全無，各自時間軸，無效填 NaN；④新增 `/meta` 的 `clock_cross_check_ppm_diff`/`clock_cross_check_ok`（本輪新增的欄位名，見上方 §2 說明），實作 B05 交叉檢查建議，門檻沿用 `host/clock/align.py` 的 `SLOPE_TOLERANCE_PPM`（±200ppm） | B05, B07, B11, B19, D, T02 | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | B18：補上 §4.1.2 裝置控制端點形狀（`SENS`/`MEL`/`AMB` 執行期指令 vs `/switch` 重燒狀態機的區分、`flashing` 中三者一致回 409、`/device/state` 回應形狀）；端點表新增 `POST /ambient?on=0`（`A16` 對應，原表沒有）。明訂 `sensor_a_enabled`/`sensor_b_enabled` 是主機端記錄的上次指令而非裝置確認狀態（`$STATUS` 沒有 `sens_a=`/`sens_b=` 自我描述欄位），`sensor_state_confirmed` 欄位標出這個落差 | B19, C04, C22 | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | D09：§4.3 的 JSON 範例補上前一輪（D07）已在文字說明但沒改到範例本身的 `theta_reject_tof`/`theta_reject_mel`（範例仍寫舊的單一 `theta_reject`，跟上面的文字說明不一致）；新增 `dist_method` 欄位（記錄該次辨識實際用的距離函式，`D09` 預設 `"cosine"`——批次餘弦 0.147ms vs DTW 8-12ms，且 `D05` 合成資料 LOOCV 顯示 DTW 較差，`E05` 後應複驗）；`latency_ms` 的鍵從寫死的 `"dtw"` 改成 `"dist"`（距離函式可換，鍵名不該綁死一種） | D07, D09, C16, C17, C18 | 是 |
+| 2026-08-26 | 2. HDF5 Session Schema | `/meta` 新增選填、成對的 `energy_mu`/`energy_sigma`：唇動偵測的能量門檻若用估的，`B16` 量到偏嚴約 23%，會讓 `lip_onset_us` 系統性偏晚，進而讓 `D14` 唯一要量的 `measure_lip_lead()` 唇動領先量被低估——修法是在 baseline 當下用真實幀算好，算好的東西不落盤重跑分析就拿不到，所以要跟 `baseline_mu_*`/`noise_floor_*` 一樣進 `/meta`。`/trial_NNN` 新增選填的 `comparable`（bool）：`measure_lip_lead()` 算出來的 `lip_lead_us` 能不能拿去平均——沒算過就整個 attr 省略，不是填 `False`（那是「算過了、結論是不可比」，跟「沒有意見」是兩件事）。這是這個 schema 第一個 bool 型選填 attr，順帶驗過型別接縫：h5py 直接讀是 `numpy.bool_`（`numpy.bool_(True) is True` 為 `False`，`is True`/`is False` 這種寫法在那一層會靜默失效），但 `analysis/reporting/session_loader.py` 的 `_as_scalar()` 已經把它正規化成 Python `bool`，讀取端走 `load_session()` 是安全的 | B16, B21, D14, T02 | 是 |
 
 ---
 
@@ -364,7 +365,10 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
     clock_cross_check_ppm_diff, clock_cross_check_ok,
     baseline_mu_A (32,), baseline_sigma_A (32,),
     baseline_mu_B (32,), baseline_sigma_B (32,),
-    noise_floor_mu, noise_floor_sigma
+    noise_floor_mu, noise_floor_sigma,
+    energy_mu, energy_sigma  # 選填，成對；唇動偵測的能量門檻改用 baseline
+                             # 當下的真實幀算，不再用估的（B16：估的偏嚴
+                             # 約 23%，會讓 lip_onset_us 偏晚）
 
 /trial_NNN
     tof_A       (T, 32) float32    [0:16] 距離 mm, [16:32] signal/100
@@ -388,6 +392,9 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
     vad_confidence,         # f32，B15 的端點偵測信心度；silent 模式為 None
     valid_zone_ratio, drop_count,
     vad_start_us, vad_end_us, lip_onset_us, voice_onset_us,
+    comparable,             # bool，選填；lip_lead_us 能不能拿去平均——
+                            # 沒算過就整個省略，不是填 False（那是「算過了，
+                            # 結論是不可比」，兩者意思不同）
     quality ∈ {ok, low, rejected}
 ```
 

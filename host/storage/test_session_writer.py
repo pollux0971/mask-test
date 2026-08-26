@@ -739,3 +739,93 @@ def test_old_files_without_sensors_enabled_still_reopen_in_append_mode(tmp_path)
     with h5py.File(path, "r") as f:
         assert "sensors_enabled" not in f["meta"].attrs
         assert "trial_001" in f
+
+
+# -- energy_mu/energy_sigma (4f's B21 lip-lead bias fix) -------------------
+
+
+def test_energy_mu_sigma_omitted_by_default(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        assert "energy_mu" not in f["meta"].attrs
+        assert "energy_sigma" not in f["meta"].attrs
+
+
+def test_energy_mu_sigma_written_together(tmp_path):
+    path = tmp_path / "session.h5"
+    meta = _sample_meta(energy_mu=123.5, energy_sigma=17.25)
+    with SessionWriter(path, meta) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        assert f["meta"].attrs["energy_mu"] == pytest.approx(123.5)
+        assert f["meta"].attrs["energy_sigma"] == pytest.approx(17.25)
+
+
+def test_energy_mu_without_sigma_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="energy_mu"):
+        with SessionWriter(tmp_path / "session.h5", _sample_meta(energy_mu=123.5)):
+            pass
+
+
+def test_energy_sigma_without_mu_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="energy_mu"):
+        with SessionWriter(tmp_path / "session.h5", _sample_meta(energy_sigma=17.25)):
+            pass
+
+
+# -- comparable (4f's measure_lip_lead() flag) -----------------------------
+
+
+def test_comparable_omitted_when_none(tmp_path):
+    """沒算過就整個 attr 不寫入——跟 VAD 四個時間戳同一個原則，不能跟
+    「算過了、結論是不可比」（`False`）混在一起。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        assert "comparable" not in f["trial_000"].attrs
+        with pytest.raises(KeyError):
+            f["trial_000"].attrs["comparable"]  # noqa: B018 -- 故意觸發
+
+
+def test_comparable_true_and_false_both_written_when_given(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs_true = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs_true["comparable"] = True
+        w.write_trial(0, **kwargs_true)
+
+        kwargs_false = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs_false["comparable"] = False
+        w.write_trial(1, **kwargs_false)
+
+    with h5py.File(path, "r") as f:
+        assert bool(f["trial_000"].attrs["comparable"]) is True
+        assert bool(f["trial_001"].attrs["comparable"]) is False
+
+
+def test_comparable_raw_h5py_read_is_numpy_bool_not_python_bool(tmp_path):
+    """`comparable` 是這個 schema 第一個 bool 型的選填 trial attr。直接用
+    h5py 讀（不經過 session_loader.py 的 `_as_scalar()`）拿到的是
+    `numpy.bool_`，不是 Python `bool`——`numpy.bool_(True) is True` 是
+    `False`，任何下游程式碼如果寫 `if trial.attrs["comparable"] is True:`
+    會靜默失效，恆真恆假都測不出來，因為它從來不會拋例外。這裡把這個陷阱
+    釘住：直接讀 h5py 確實會踩到；session_loader.py 那邊的對應測試
+    （test_e2e_pipeline.py 的 type-seam 那節）確認 `_as_scalar()` 有接住它。
+    """
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs["comparable"] = True
+        w.write_trial(0, **kwargs)
+
+    with h5py.File(path, "r") as f:
+        raw = f["trial_000"].attrs["comparable"]
+        assert isinstance(raw, np.bool_)
+        assert raw == True  # noqa: E712 -- 值本身是對的
+        assert (raw is True) is False  # 陷阱本身：身分比較會静默失效

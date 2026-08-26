@@ -97,7 +97,17 @@ VALID_QUALITY_VALUES = ("ok", "low", "rejected")
 # 下達的指令」，不是裝置確認過的狀態——`$STATUS` 沒有 sens_a=/sens_b= 可以
 # 核對。這裡不能讓下游（D15 的 session_loader）誤把指令當成裝置已經證實的
 # 事實，跟 `clock_sync_confirmed` 是同一種「值 vs 有沒有被獨立核實」的分法。
-OPTIONAL_META_KEYS = ("sensors_enabled", "sensors_enabled_confirmed")
+#
+# `energy_mu`/`energy_sigma`（B16/4f）：唇動偵測用的能量門檻，若拿一個
+# 「大概估的」全域值，B16 量到偏嚴約 23%，會讓 lip_onset_us 系統性偏晚，
+# 進而讓 D14 唯一要量的東西（measure_lip_lead() 的唇動領先量）被低估。
+# 修法是在 baseline 當下用真實幀算好——算好的東西不落盤，重跑分析時就拿
+# 不到，所以要跟 baseline_mu_*/noise_floor_* 一樣進 /meta。跟它們同一組
+# 待遇：選填、成對（給一個就兩個都要給，沒有「只知道平均不知道離散度」
+# 這種狀態），不驗值域（能量的合理範圍由上游 B16 自己決定，這裡不重複假設）。
+OPTIONAL_META_KEYS = (
+    "sensors_enabled", "sensors_enabled_confirmed", "energy_mu", "energy_sigma",
+)
 
 VALID_SENSORS_ENABLED = ("AB", "A", "B")
 
@@ -203,6 +213,14 @@ class SessionWriter:
         elif "sensors_enabled_confirmed" in self._meta:
             raise ValueError("sensors_enabled_confirmed 不能單獨給，沒有 sensors_enabled 就沒有東西可以確認")
 
+        has_energy_mu = "energy_mu" in self._meta
+        has_energy_sigma = "energy_sigma" in self._meta
+        if has_energy_mu != has_energy_sigma:
+            raise ValueError("energy_mu 和 energy_sigma 必須同時提供或同時省略——只有平均值沒有離散度沒有意義")
+        if has_energy_mu:
+            meta_group.attrs["energy_mu"] = float(self._meta["energy_mu"])
+            meta_group.attrs["energy_sigma"] = float(self._meta["energy_sigma"])
+
         # B05（兩點法漂移）與 B04（回歸法 slope）是兩個獨立方法量同一件事
         # ——對得上，兩邊才都可信；差太多代表其中一邊（或兩邊都）有問題，
         # 不應該悄悄放過。門檻沿用 B04 驗收條件的 ±200ppm。
@@ -222,6 +240,7 @@ class SessionWriter:
         vad_start_us: Optional[int] = None, vad_end_us: Optional[int] = None,
         lip_onset_us: Optional[int] = None, voice_onset_us: Optional[int] = None,
         speaking_mode: Optional[str] = None, vad_confidence: Optional[float] = None,
+        comparable: Optional[bool] = None,
         quality: str,
     ) -> None:
         """寫一個完整的 trial，寫完立刻 flush。`idx` 重複寫會覆蓋掉舊的
@@ -236,6 +255,13 @@ class SessionWriter:
         0/-1/capture 視窗邊界（B17 的調度決議）——這四個時間戳不保證同時
         存在，`silent` 模式下 `voice_onset_us` 必然缺席，但 `lip_onset_us`
         仍應該有；呼叫端不要假設四個一起有、一起沒有。
+
+        `comparable`（4f 的 `measure_lip_lead()`）：這個 trial 的
+        `lip_lead_us`（唇動比出聲早多少）**能不能拿去平均**——`silent` 模式
+        沒有語音、或只偵測到唇動/發聲其中一邊，兩個時間戳就不可比。跟上面
+        四個時間戳同一個原則：`None` 就整個 attr 不寫入，**不是寫
+        `False`**——「沒算過」跟「算過了、結論是不可比」是兩件事，含混
+        起來會讓 D14 把「沒有意見」誤讀成「這筆不可比」的實際判斷。
         """
         if quality not in VALID_QUALITY_VALUES:
             raise ValueError(f"quality 必須是 {VALID_QUALITY_VALUES} 之一，收到 {quality!r}")
@@ -310,6 +336,8 @@ class SessionWriter:
             grp.attrs["speaking_mode"] = speaking_mode
         if vad_confidence is not None:
             grp.attrs["vad_confidence"] = np.float32(vad_confidence)
+        if comparable is not None:
+            grp.attrs["comparable"] = bool(comparable)
 
         self._trial_indices_written.add(idx)
         self._file.flush()

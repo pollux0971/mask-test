@@ -7,7 +7,7 @@
 }
 
 #mode-record .section-label {
-  font-size: 12px;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--text-dim);
@@ -34,7 +34,7 @@
 
 #mode-record .field > span {
   display: block;
-  font-size: 13px;
+  font-size: 0.8125rem;
   color: var(--text-dim);
   margin-bottom: 4px;
 }
@@ -51,7 +51,7 @@
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--text);
-  font-size: 14px;
+  font-size: 0.875rem;
 }
 
 #mode-record input:focus {
@@ -65,15 +65,17 @@
   margin-bottom: 6px;
 }
 
+/* C25: pill shape (999px), matching the button convention every other
+   mode CSS settled on. */
 #mode-record .wear-btn {
   flex: 1;
   padding: 10px;
   background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 999px;
   color: var(--text);
   cursor: pointer;
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 
 #mode-record .wear-btn.active {
@@ -84,16 +86,26 @@
 }
 
 #mode-record .wear-id-value {
-  font-size: 13px;
+  font-size: 0.8125rem;
   color: var(--text-dim);
 }
 
-/* B21: separate axis from `mode` -- same 3-button-toggle look as .wear-toggle
-   above, deliberately not sharing a class with it since the two mean
-   different things (wear repetition vs. speaking mode). */
+/* B21: `speaking_mode` (normal/whisper/silent) and `wear_id` (this toggle's
+   own field above) are two independent axes of the same session -- they
+   sit right next to each other with otherwise-identical button styling, so
+   nothing but a text label separated them before. C25: wrapping this group
+   in its own bordered box (same clustering language C15's quiz-speaking-mode
+   uses for its own controls) makes "these three buttons are one setting,
+   that field above is a different one" visible at a glance, not just
+   readable from the label text. */
 #mode-record .speaking-mode-toggle {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
 }
 
 #mode-record .speaking-mode-btn {
@@ -101,10 +113,10 @@
   padding: 10px;
   background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 999px;
   color: var(--text);
   cursor: pointer;
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 
 #mode-record .speaking-mode-btn.active {
@@ -115,7 +127,7 @@
 }
 
 #mode-record .wear-no-history-note {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
 }
 
@@ -124,7 +136,7 @@
   background: var(--warn-soft);
   border-radius: 6px;
   padding: 8px 10px;
-  font-size: 13px;
+  font-size: 0.8125rem;
   margin-bottom: 12px;
 }
 
@@ -132,10 +144,10 @@
   width: 100%;
   padding: 12px;
   background: var(--accent);
-  color: #10140f;
+  color: var(--on-accent-text);
   border: none;
-  border-radius: 6px;
-  font-size: 15px;
+  border-radius: 999px;
+  font-size: 0.9375rem;
   font-weight: 600;
   cursor: pointer;
 }
@@ -147,7 +159,7 @@
 
 #mode-record .target-check {
   margin-top: 16px;
-  font-size: 13px;
+  font-size: 0.8125rem;
   padding: 8px 10px;
   border-radius: 6px;
   background: var(--surface-2);
@@ -166,7 +178,7 @@
 }
 
 #mode-record .target-check-note {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
   margin-top: 4px;
 }
@@ -180,7 +192,7 @@
 
 #mode-record .warnings-title {
   color: var(--warn);
-  font-size: 12px;
+  font-size: 0.75rem;
   font-weight: 600;
   margin-bottom: 4px;
 }
@@ -188,13 +200,13 @@
 #mode-record .warnings-box ul {
   margin: 0;
   padding-left: 18px;
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 
 /* --- baseline screen --- */
 
 #mode-record .baseline-countdown {
-  font-size: 48px;
+  font-size: 3rem;
   font-weight: 600;
   text-align: center;
   margin: 20px 0 10px;
@@ -220,12 +232,12 @@
   background: var(--warn-soft);
   border-radius: 6px;
   padding: 8px 10px;
-  font-size: 12px;
+  font-size: 0.75rem;
   margin-bottom: 14px;
 }
 
 #mode-record .live-sigma {
-  font-size: 13px;
+  font-size: 0.8125rem;
   color: var(--text-dim);
   display: flex;
   flex-direction: column;
@@ -257,12 +269,12 @@
 
 #mode-record .baseline-sensor-name {
   font-weight: 600;
-  font-size: 13px;
+  font-size: 0.8125rem;
   margin-bottom: 2px;
 }
 
 #mode-record .zone-flag {
-  font-size: 12px;
+  font-size: 0.75rem;
   margin-bottom: 2px;
 }
 
@@ -283,9 +295,9 @@
   margin-top: 8px;
   padding: 10px 16px;
   background: var(--accent);
-  color: #10140f;
+  color: var(--on-accent-text);
   border: none;
-  border-radius: 6px;
+  border-radius: 999px;
   font-weight: 600;
   cursor: pointer;
 }
@@ -334,7 +346,7 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-size: 13px;
+  font-size: 0.8125rem;
   color: var(--text-dim);
 }
 
@@ -377,7 +389,9 @@
 }
 
 @keyframes trial-capture-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(226, 87, 76, 0.35); }
+  0%, 100% { box-shadow: 0 0 0 0 var(--status-bad-hatch); }
+  /* alpha 0 -- fully transparent end state, the RGB here is never visible,
+     not worth a token for a color that never renders. */
   50% { box-shadow: 0 0 0 18px rgba(226, 87, 76, 0); }
 }
 
@@ -408,7 +422,7 @@
 /* SAVE: brief confirmation checkmark tint (C12.md's "短暫的確認勾號"). */
 #mode-record .trial-card.state-save {
   border-color: var(--good);
-  background: rgba(95, 191, 122, 0.12);
+  background: var(--status-good-soft);
 }
 
 #mode-record .trial-card.state-save .trial-state-label::before {
@@ -425,7 +439,7 @@
 }
 
 #mode-record .trial-prev-label {
-  font-size: 20px;
+  font-size: 1.25rem;
   color: var(--text-dim);
 }
 
@@ -445,12 +459,12 @@
    be used to seeing. */
 #mode-record .trial-requeue-note {
   color: var(--accent);
-  font-size: 14px;
+  font-size: 0.875rem;
   font-weight: 600;
 }
 
 #mode-record .trial-state-label {
-  font-size: 24px;
+  font-size: 1.5rem;
   color: var(--text-dim);
 }
 
@@ -472,13 +486,13 @@
 }
 
 #mode-record .trial-confirm-title {
-  font-size: 18px;
+  font-size: 1.125rem;
   font-weight: 700;
   color: var(--warn);
 }
 
 #mode-record .trial-confirm-reason {
-  font-size: 14px;
+  font-size: 0.875rem;
   color: var(--text-dim);
 }
 
@@ -490,16 +504,16 @@
 #mode-record .confirm-keep-btn,
 #mode-record .confirm-discard-btn {
   padding: 10px 20px;
-  border-radius: 8px;
+  border-radius: 999px;
   border: none;
   font-weight: 600;
   cursor: pointer;
-  font-size: 15px;
+  font-size: 0.9375rem;
 }
 
 #mode-record .confirm-keep-btn {
   background: var(--good);
-  color: #10140f;
+  color: var(--on-accent-text);
 }
 
 #mode-record .confirm-discard-btn {
@@ -513,12 +527,12 @@
   background: var(--warn-soft);
   border-radius: 6px;
   padding: 8px 14px;
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 
 #mode-record .trial-hint {
   color: var(--text-dim);
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 
 /* --- C13: progress dashboard --------------------------------------------
@@ -534,7 +548,7 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 
 #mode-record .dash-subsection {
@@ -556,7 +570,7 @@
 }
 
 #mode-record .progress-summary {
-  font-size: 15px;
+  font-size: 0.9375rem;
   font-weight: 600;
 }
 
@@ -575,7 +589,7 @@
 
 #mode-record .progress-eta {
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 
 #mode-record .label-bars {
@@ -584,15 +598,21 @@
   gap: 4px;
 }
 
+/* C25: rem, not px -- the longest label ("靜止／其他") already clipped a
+   few px even before projector mode (found during the 130% audit), and a
+   fixed px column doesn't grow when the text inside it does, so the same
+   clipping got noticeably worse at 130% (60px -> 78px needed, same 56px
+   available). rem lets this column grow in step with the text instead of
+   falling further behind it. */
 #mode-record .label-bar {
   display: grid;
-  grid-template-columns: 56px 1fr 44px;
+  grid-template-columns: 3.5rem 1fr 2.75rem;
   align-items: center;
   gap: 6px;
 }
 
 #mode-record .label-bar-name {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -616,7 +636,7 @@
 }
 
 #mode-record .label-bar-count {
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--text-dim);
   text-align: right;
 }
@@ -631,7 +651,7 @@
 
 #mode-record .recent-empty {
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 
 #mode-record .recent-item {
@@ -656,7 +676,7 @@
 }
 
 #mode-record .quality-dot {
-  font-size: 14px;
+  font-size: 0.875rem;
   line-height: 1;
 }
 
@@ -665,7 +685,7 @@
 #mode-record .quality-dot.quality-rejected { color: var(--warn); }
 
 #mode-record .recent-label {
-  font-size: 13px;
+  font-size: 0.8125rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -674,12 +694,12 @@
 
 #mode-record .rejected-tag {
   color: var(--warn);
-  font-size: 11px;
+  font-size: 0.6875rem;
   font-weight: 600;
 }
 
 #mode-record .recent-meta {
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--text-dim);
 }
 
@@ -693,11 +713,11 @@
 
 #mode-record .recent-action-btn {
   flex: 1;
-  font-size: 11px;
+  font-size: 0.6875rem;
   padding: 3px 6px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: 999px;
   color: var(--text-dim);
   cursor: pointer;
 }
@@ -716,6 +736,9 @@
 #mode-record .trial-preview-overlay {
   position: fixed;
   inset: 0;
+  /* Not a themed token on purpose -- a plain black modal scrim, same
+     reasoning as validate.css's iframe #fff (a universal dim-behind-a-modal
+     backdrop, not a themed surface). */
   background: rgba(0, 0, 0, 0.6);
   display: flex;
   align-items: center;
@@ -738,13 +761,13 @@
   justify-content: space-between;
   align-items: center;
   margin-bottom: 16px;
-  font-size: 15px;
+  font-size: 0.9375rem;
 }
 
 #mode-record .preview-close-btn {
   background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 999px;
   color: var(--text);
   padding: 6px 12px;
   cursor: pointer;
@@ -763,7 +786,7 @@
 
 #mode-record .preview-heatmap-title,
 #mode-record .preview-waveform-title {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
   margin-bottom: 6px;
 }
@@ -778,7 +801,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 10px;
+  font-size: 0.625rem;
   background: var(--cell-invalid);
   border-radius: 2px;
   aspect-ratio: 1;
@@ -790,7 +813,7 @@
 
 #mode-record .preview-empty {
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 
 #mode-record .preview-waveform-bars {

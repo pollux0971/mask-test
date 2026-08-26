@@ -56,6 +56,7 @@
   --bg-scrim: rgba(11, 14, 12, 0.85); /* --bg at 85% opacity, for a translucent backdrop over other content (C06's baseline-note overlay) */
   --expect-audio: #f1b441; /* quiz.css's "音訊" expect badge -- a distinct amber from --accent on purpose (C15), not a drift to fix */
   --expect-audio-soft: rgba(255, 191, 64, 0.16);
+  --on-accent-text: #10140f; /* record.css's text color for buttons filled solid with --accent/--good (submit/retry/confirm-keep) -- near-black, close to but deliberately not identical to --bg for contrast against a bright fill */
 
 }
 

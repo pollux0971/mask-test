@@ -86,7 +86,7 @@ def _feed_mel(sm, t_start_us, t_end_us, rate_hz=62.5, n_bands=40):
 
 def _make_sm(tmp_path, *, words=("五", "四", "八"), seed=1, clock=None, wear_id=3, mode="quiz",
              baseline_mu_A=None, baseline_sigma_A=None, baseline_mu_B=None, baseline_sigma_B=None,
-             noise_floor_mu=None, noise_floor_sigma=None):
+             noise_floor_mu=None, noise_floor_sigma=None, energy_mu=None, energy_sigma=None):
     """每次呼叫都在 `tmp_path` 底下開一個獨立子目錄放 session/manifest，
     這樣同一個測試裡呼叫兩次（例如比較兩個不同 seed 的 order）不會撞同一個
     還開著的 HDF5 檔案。`clock` 沒給就用一個新的 `FakeClock()`——**呼叫端如果
@@ -110,6 +110,7 @@ def _make_sm(tmp_path, *, words=("五", "四", "八"), seed=1, clock=None, wear_
         baseline_mu_A=baseline_mu_A, baseline_sigma_A=baseline_sigma_A,
         baseline_mu_B=baseline_mu_B, baseline_sigma_B=baseline_sigma_B,
         noise_floor_mu=noise_floor_mu, noise_floor_sigma=noise_floor_sigma,
+        energy_mu=energy_mu, energy_sigma=energy_sigma,
     )
     return sm, writer, aligner, h5_path, manifest_path
 
@@ -768,6 +769,37 @@ def test_vad_fields_are_real_when_baseline_and_speech_present(tmp_path):
         attrs = f["trial_000"].attrs
         for key in ("vad_start_us", "vad_end_us", "lip_onset_us", "voice_onset_us"):
             assert key in attrs, f"{key} 應該是真值，不該整個 attr 缺席"
+
+
+def test_baseline_energy_floor_is_passed_through_to_detect_lips(tmp_path, monkeypatch):
+    """B21：`energy_mu`/`energy_sigma`（`host/storage/baseline.py` 的
+    `evaluate_baseline()` 算好的）要真的傳到 `detect_lips()`，不是收下來
+    沒用。白箱測——直接檢查呼叫時的 kwargs，比反推偵測結果的數值差異
+    可靠，不用湊出一段剛好會讓兩種估法產生可觀察差異的合成資料。
+    """
+    import host.trial.state_machine as sm_module
+
+    captured = {}
+    real_detect_lips = sm_module.detect_lips
+
+    def spy(*args, **kwargs):
+        captured["energy_mu"] = kwargs.get("energy_mu")
+        captured["energy_sigma"] = kwargs.get("energy_sigma")
+        return real_detect_lips(*args, **kwargs)
+
+    monkeypatch.setattr(sm_module, "detect_lips", spy)
+
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(
+        tmp_path, energy_mu=0.9, energy_sigma=0.2,
+    )
+    _feed_tof(aligner, "A", 900_000, 1_300_000)
+    _feed_tof(aligner, "B", 900_000, 1_300_000)
+    _feed_mic(sm, 900_000, 1_300_000)
+    sm.hold_start(device_t_us=1_000_000)
+    sm.hold_stop(device_t_us=2_000_000)
+
+    assert captured["energy_mu"] == 0.9
+    assert captured["energy_sigma"] == 0.2
 
 
 def test_silent_mode_has_lip_onset_but_no_voice_onset(tmp_path):

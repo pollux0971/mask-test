@@ -449,22 +449,9 @@ def test_session_loader_reads_speaking_mode_and_sensors_enabled_when_present(pip
     assert isinstance(data.meta["sensors_enabled_confirmed"], bool)
 
 
-def test_session_loader_invalid_tof_zones_stay_nan_and_validity_is_independent(tmp_path):
-    """不依賴 live rig 這次跑出來的合成場景剛好有沒有無效 zone -- 直接構造
-    一個保證有無效 zone 的 trial，確認：(1) 讀回來真的是 NaN，不是 0/-1；
-    (2) 有效性完全來自獨立的 `tof_valid_A`/`B` 陣列，不是靠
-    `value == value` 這種 NaN 比較法（`NaN != NaN`，這正是 §2.1 選擇獨立
-    valid 陣列、而不是「非 NaN 即有效」的原因——`session_loader.py` 目前
-    沒有這樣做，這裡把它釘住，不讓以後有人為了省一個欄位改回去）。
-    """
-    path = tmp_path / "session.h5"
-    T, Z = 3, 16
-    tof_A = np.zeros((T, 2 * Z), dtype=np.float32)
-    tof_valid_A = np.ones((T, Z), dtype=bool)
-    tof_valid_A[1, 5] = False  # 第 1 幀第 5 個 zone 標成無效
-    tof_A[1, 5] = np.nan       # 無效值本身寫 NaN（§2.1）
-
-    meta = {
+def _minimal_meta(Z):
+    """給不需要跑 live rig 的合成 trial 用的最小合法 /meta。"""
+    return {
         "schema_version": 1, "subject": "s01", "session_date": "2026-08-26",
         "wear_id": 1, "mode": "quiz", "distance_mm": 30.0, "angle_deg": 0.0,
         "ambient": "quiet room", "notes": "", "fw_sha": "0000000",
@@ -480,17 +467,42 @@ def test_session_loader_invalid_tof_zones_stay_nan_and_validity_is_independent(t
         "baseline_sigma_B": np.ones(2 * Z, dtype=np.float32),
         "noise_floor_mu": 0.0, "noise_floor_sigma": 1.0,
     }
-    with SessionWriter(path, meta) as w:
-        w.write_trial(
-            0, label="五",
-            tof_A=tof_A, tof_B=np.zeros((T, 2 * Z), dtype=np.float32),
-            tof_t_us=np.arange(T, dtype=np.int64) * 1000,
-            tof_valid_A=tof_valid_A, tof_valid_B=np.ones((T, Z), dtype=bool),
-            mic_rms=np.zeros(4, dtype=np.float32), mic_peak=np.zeros(4, dtype=np.int16),
-            mic_t_us=np.arange(4, dtype=np.int64) * 1000,
-            wear_id=1, mode="quiz", valid_zone_ratio=0.98, drop_count=0,
-            quality="ok",
-        )
+
+
+def _minimal_trial_kwargs(T, Z, **overrides):
+    kwargs = dict(
+        label="五",
+        tof_A=np.zeros((T, 2 * Z), dtype=np.float32),
+        tof_B=np.zeros((T, 2 * Z), dtype=np.float32),
+        tof_t_us=np.arange(T, dtype=np.int64) * 1000,
+        tof_valid_A=np.ones((T, Z), dtype=bool),
+        tof_valid_B=np.ones((T, Z), dtype=bool),
+        mic_rms=np.zeros(4, dtype=np.float32), mic_peak=np.zeros(4, dtype=np.int16),
+        mic_t_us=np.arange(4, dtype=np.int64) * 1000,
+        wear_id=1, mode="quiz", valid_zone_ratio=0.98, drop_count=0,
+        quality="ok",
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_session_loader_invalid_tof_zones_stay_nan_and_validity_is_independent(tmp_path):
+    """不依賴 live rig 這次跑出來的合成場景剛好有沒有無效 zone -- 直接構造
+    一個保證有無效 zone 的 trial，確認：(1) 讀回來真的是 NaN，不是 0/-1；
+    (2) 有效性完全來自獨立的 `tof_valid_A`/`B` 陣列，不是靠
+    `value == value` 這種 NaN 比較法（`NaN != NaN`，這正是 §2.1 選擇獨立
+    valid 陣列、而不是「非 NaN 即有效」的原因——`session_loader.py` 目前
+    沒有這樣做，這裡把它釘住，不讓以後有人為了省一個欄位改回去）。
+    """
+    path = tmp_path / "session.h5"
+    T, Z = 3, 16
+    tof_A = np.zeros((T, 2 * Z), dtype=np.float32)
+    tof_valid_A = np.ones((T, Z), dtype=bool)
+    tof_valid_A[1, 5] = False  # 第 1 幀第 5 個 zone 標成無效
+    tof_A[1, 5] = np.nan       # 無效值本身寫 NaN（§2.1）
+
+    with SessionWriter(path, _minimal_meta(Z)) as w:
+        w.write_trial(0, **_minimal_trial_kwargs(T, Z, tof_A=tof_A, tof_valid_A=tof_valid_A))
 
     data = load_session(path)
     trial = data.trials[0]
@@ -499,3 +511,35 @@ def test_session_loader_invalid_tof_zones_stay_nan_and_validity_is_independent(t
     # 有效的那些不能是 NaN，也不能被反過來當成「不是 NaN 就有效」的證據
     assert not np.isnan(trial.tof_a[0, 5])
     assert trial.tof_valid_a[0, 5] == True  # noqa: E712
+
+
+def test_session_loader_normalizes_comparable_to_python_bool(tmp_path):
+    """`comparable`（4f 的 B21）是這個 schema 第一個 bool 型選填 trial attr。
+    `host/storage/test_session_writer.py` 的
+    `test_comparable_raw_h5py_read_is_numpy_bool_not_python_bool` 已經證明
+    直接用 h5py 讀會拿到 `numpy.bool_`（`numpy.bool_(True) is True` 是
+    `False`，`if ... is True:` 這種寫法會靜默失效）。這裡確認走
+    `session_loader.load_session()` 這條路（`_as_scalar()` 的 `np.generic`
+    分支）**有**把它正規化成 Python `bool`，`is True`/`is False` 才能安全
+    使用 -- 不是「大概沒問題」，是對真的 SessionWriter 輸出直接斷言。
+
+    這條線目前還沒被 4f 接進 TrialStateMachine（它負責填值），所以獨立構造
+    一個合成 trial，不依賴 live rig。
+    """
+    path = tmp_path / "session.h5"
+    T, Z = 3, 16
+    with SessionWriter(path, _minimal_meta(Z)) as w:
+        w.write_trial(0, **_minimal_trial_kwargs(T, Z, comparable=True))
+        w.write_trial(1, **_minimal_trial_kwargs(T, Z, comparable=False))
+        w.write_trial(2, **_minimal_trial_kwargs(T, Z))  # comparable 沒給
+
+    data = load_session(path)
+    by_key = {t.key: t for t in data.trials}
+
+    comparable_true = by_key["trial_000"].attrs["comparable"]
+    assert comparable_true is True, f"預期正規化成 Python bool True，實際是 {comparable_true!r} ({type(comparable_true)})"
+
+    comparable_false = by_key["trial_001"].attrs["comparable"]
+    assert comparable_false is False, f"預期正規化成 Python bool False，實際是 {comparable_false!r} ({type(comparable_false)})"
+
+    assert "comparable" not in by_key["trial_002"].attrs, "沒給就該整個 attr 缺席，不是 None/False"

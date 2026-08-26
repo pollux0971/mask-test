@@ -738,6 +738,44 @@ def load_vocab():
     return words
 
 
+#: The VAD threshold fields B21 takes, as they are named in /meta. Read with
+#: .get(): esp-mask-test-18's writer change for energy_* has not landed yet,
+#: and per CONTRACTS #1.1.2 a field the producer has not written is None, not
+#: a default.
+BASELINE_THRESHOLD_KEYS = (
+    "baseline_mu_A", "baseline_sigma_A", "baseline_mu_B", "baseline_sigma_B",
+    "noise_floor_mu", "noise_floor_sigma", "energy_mu", "energy_sigma",
+)
+
+
+def read_baseline_thresholds(h5_path):
+    """Read B10's baseline statistics back out of the session's /meta.
+
+    Read from the file rather than kept in memory from the capture because
+    /meta is the record that outlives this process, and a value that
+    disagrees with what was written is worse than one that is missing.
+    """
+    try:
+        import h5py
+        with h5py.File(h5_path, "r") as f:
+            attrs = dict(f["/meta"].attrs) if "meta" in f else {}
+    except Exception as exc:
+        print(f"[bridge] could not read baseline thresholds from {h5_path}: {exc}")
+        return {}
+
+    out = {}
+    for key in BASELINE_THRESHOLD_KEYS:
+        value = attrs.get(key)
+        if value is None:
+            continue
+        out[key] = (np.asarray(value) if np.ndim(value) else float(value))
+    missing = [k for k in BASELINE_THRESHOLD_KEYS if k not in out]
+    if missing:
+        print(f"[bridge] ⚠ VAD thresholds missing from /meta: {missing} "
+              f"— lip/voice detection will degrade silently for these")
+    return out
+
+
 def open_trial_machine(info):
     """Build the trial machine, once the baseline has created the session file.
 
@@ -760,12 +798,29 @@ def open_trial_machine(info):
     except Exception as exc:
         return None, f"無法開啟 session 檔案: {exc}"
 
+    # B21: the VAD thresholds. Every one of these has a default of None, so
+    # omitting them is a silent behaviour change rather than an error -- and
+    # the two failure modes differ:
+    #
+    #   baseline_mu/sigma, noise_floor_*  missing -> detect_*_activity()
+    #       returns applicable=False, the four VAD attrs stay None. Useless,
+    #       but visibly so.
+    #   energy_mu/energy_sigma            missing -> lip detection estimates
+    #       them itself, about 23% too strict (measured in B16). Lip onset
+    #       lands systematically late, so D14's "how far ahead of the voice
+    #       do the lips move" comes out systematically small -- while
+    #       everything looks like it worked.
+    #
+    # The second is the dangerous one, so these are read from /meta, which
+    # capture_baseline_trial() has already written, rather than recomputed.
+    vad = read_baseline_thresholds(h5_path)
     machine = TrialStateMachine(
         words, session_aligner, writer, h5_path, manifest_path(),
         wear_id=info.wear_id, mode=info.mode,
         # trial_000 belongs to the baseline (B10); starting at 0 here would
         # collide with it.
         first_trial_idx=1,
+        **vad,
     )
     with session_lock:
         session_runtime["writer"] = writer

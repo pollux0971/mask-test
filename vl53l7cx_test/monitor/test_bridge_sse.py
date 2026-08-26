@@ -63,7 +63,15 @@ class Rig:
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=str(REPO_ROOT),
         )
-        self._wait_for_http()
+        try:
+            self._wait_for_http()
+        except BaseException:
+            # A rig that fails to come up must still take its processes with
+            # it. Without this, a bridge that exits early leaves its mock
+            # running forever -- and a few dozen orphaned mocks streaming at
+            # 30 Hz are enough to make every later test in the run flaky.
+            self.close()
+            raise
 
     def _wait_for_http(self, timeout=15.0):
         deadline = time.monotonic() + timeout
@@ -106,6 +114,9 @@ class Rig:
         return events
 
     def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         shutil.rmtree(self.workdir, ignore_errors=True)
         for proc in (self.bridge, self.mock):
             proc.terminate()
@@ -114,6 +125,18 @@ class Rig:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+            # Close the pipes explicitly. terminate()+wait() reaps the
+            # process but leaves these file objects open until GC gets to
+            # them, and a full run of this directory starts ~90 rigs: at
+            # four pipes each that is enough open descriptors to blow past
+            # the default limit, which showed up as the whole module-scoped
+            # fixture in test_e2e_pipeline.py erroring out.
+            for stream in (proc.stdout, proc.stderr, proc.stdin):  # noqa: E501
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
 
 
 @pytest.fixture(scope="module")

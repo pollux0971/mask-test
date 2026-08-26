@@ -389,6 +389,7 @@ registerMode("monitor", (() => {
   const latestFrame = { A: null, B: null }; // { dim, dValues, sValues }
   const rateCounters = { A: [], B: [] };
   let rafId = null;
+  let qualityThresholdsTimerId = null;
   let viewMode = "distance";
   let gridsContainer = null;
 
@@ -1098,12 +1099,6 @@ registerMode("monitor", (() => {
         qualityEls.sparkCtx[m.key] = sparkCanvas.getContext("2d");
         sparkResizeObserver.observe(sparkCanvas);
       }
-      // Once now (no reason to wait for the first periodic check if the
-      // endpoint already happens to exist) + periodically after, matching
-      // B19's server-side mtime hot reload: a threshold edited and saved
-      // during E01 tuning should show up here without a panel restart.
-      fetchQualityThresholds();
-      setInterval(fetchQualityThresholds, QUALITY_THRESHOLDS_CHECK_MS);
       alarmBannerEl = root.querySelector("[data-alarm-banner]");
       reflashNoteEl = root.querySelector("[data-reflash-note]");
       recBtn = root.querySelector("[data-rec-btn]");
@@ -1115,12 +1110,30 @@ registerMode("monitor", (() => {
     onEnter() {
       resizePcaCanvas(); // canvas may have had 0 size while this section was display:none
       if (rafId == null) rafId = requestAnimationFrame(paint);
+      // Unlike pcaBookkeeping() (runs from onData regardless of visibility,
+      // on purpose -- C10.md needs the trajectory/model to stay warm while
+      // hidden), the quality-threshold provenance badges are pure display:
+      // nothing reads their freshness while this section isn't visible, so
+      // there's no reason to keep polling /config/quality_thresholds every
+      // 10s in the background (found via reports/PANEL_LEAK_AUDIT.md --
+      // confirmed live it kept firing after leaving this mode). Fetch once
+      // immediately (so returning here doesn't wait up to 10s for a fresh
+      // value) + resume the periodic check, both gated the same way the
+      // rAF loop already is.
+      fetchQualityThresholds();
+      if (qualityThresholdsTimerId == null) {
+        qualityThresholdsTimerId = setInterval(fetchQualityThresholds, QUALITY_THRESHOLDS_CHECK_MS);
+      }
     },
 
     onLeave() {
       if (rafId != null) {
         cancelAnimationFrame(rafId);
         rafId = null;
+      }
+      if (qualityThresholdsTimerId != null) {
+        clearInterval(qualityThresholdsTimerId);
+        qualityThresholdsTimerId = null;
       }
     },
 
