@@ -215,6 +215,189 @@
   line-height: 1.4;
 }
 
+/* --- device scan & connect (js/shell.js) --- */
+.device-picker {
+  border-bottom: 1px solid var(--border);
+}
+.device-scan-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 16px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.device-scan-btn:hover { background: var(--surface-2); }
+.device-scan-btn[aria-expanded="true"] { color: var(--accent); background: var(--accent-soft); }
+.device-scan-btn .mode-icon { width: 1.4em; text-align: center; display: inline-block; }
+.device-scan-btn .mode-label { flex: 1; }
+
+/* 面板在側邊欄本來的文件流裡往下長（不是彈出層）-- 側邊欄本來就
+   overflow-y:auto，跟其餘狀態列一致，摺疊時 setCollapsed() 會直接關掉
+   這個面板（見 shell.js），不需要另外處理擠壓版面的問題。 */
+.device-picker-panel {
+  padding: 8px 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--surface-2);
+}
+.device-picker-hint {
+  font-size: 0.625rem;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+/* GET /device/ports 的 hint -- 只在沒有明顯候選時出現（例如這台機器實測
+   32 個沒有描述/VID 的 ttyS0..31）。esp-mask-test-ad 明確要求一定要顯示：
+   一整排「不確定」很容易被讀成「這些都不能用」，hint 是唯一在講「可能
+   只是還沒插上」的地方。 */
+.device-picker-hint-warn {
+  color: var(--status-warn);
+  background: var(--status-warn-soft);
+  border-radius: 6px;
+  padding: 4px 8px;
+  margin-bottom: 2px;
+}
+.device-picker-status {
+  font-size: 0.6875rem;
+  line-height: 1.5;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+/* 四態，四種待遇：down 素色（不是紅色 -- 頁面剛載入時預設就是這個狀態，
+   紅色會在使用者什麼都還沒做的時候就報警）、waiting 琥珀、connected
+   綠色、degraded 也是琥珀但文字不同 -- 「連上但缺一顆」不是「沒連上」，
+   不能跟 down 同一個顏色，但也不是「一切正常」，不能跟 connected 同一個
+   顏色 (esp-mask-test-ad 對第四態的明確要求)。 */
+.device-picker-status-down {
+  color: var(--text-dim);
+  background: var(--surface);
+}
+.device-picker-status-waiting,
+.device-picker-status-degraded {
+  color: var(--status-warn);
+  background: var(--status-warn-soft);
+}
+.device-picker-status-connected {
+  color: var(--status-good);
+  background: var(--status-good-soft);
+}
+
+.device-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* 實測這台機器一次掃到 32 個埠 -- 面板不能因此撐爆整個側邊欄。 */
+  max-height: 260px;
+  overflow-y: auto;
+}
+.device-picker-loading,
+.device-picker-empty {
+  font-size: 0.6875rem;
+  color: var(--text-dim);
+}
+.device-picker-error {
+  font-size: 0.6875rem;
+  color: var(--status-bad);
+  background: var(--status-bad-soft);
+  border-radius: 6px;
+  padding: 4px 8px;
+  line-height: 1.4;
+}
+
+.device-port-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+/* likely_esp32=true 排前面，但這不是「其餘都是錯的」-- 判斷不出來的
+   晶片也可能是使用者的板子（esp-mask-test-ad 的明確要求），所以
+   .likely 只加一點點強調（左邊框），不是把其他列變暗/禁用。 */
+.device-port-row.likely {
+  border-left: 3px solid var(--accent);
+}
+.device-port-row.connected {
+  border-color: var(--status-good);
+}
+.device-port-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.device-port-path {
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--text);
+}
+.device-port-desc {
+  font-size: 0.625rem;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.device-port-badge {
+  display: inline-block;
+  width: fit-content;
+  font-size: 0.5625rem;
+  padding: 1px 6px;
+  border-radius: 999px;
+  margin-top: 1px;
+}
+.device-port-badge-likely {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.device-port-badge-unknown {
+  color: var(--status-unknown);
+  background: var(--surface-2);
+}
+.device-port-badge-connected {
+  color: var(--status-good);
+  background: var(--status-good-soft);
+}
+.device-port-connect-btn {
+  flex-shrink: 0;
+  font-family: inherit;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  cursor: pointer;
+}
+/* 已經是這個埠在連線中的那一列，「連接」按鈕位置改放一個不可點的標籤，
+   不是灰掉的按鈕（沒有動作可做，不是動作被禁用）。 */
+span.device-port-connect-btn {
+  border-color: var(--status-good);
+  background: var(--status-good-soft);
+  color: var(--status-good);
+  cursor: default;
+}
+
+.sidebar.collapsed .device-scan-btn .mode-label,
+.sidebar.collapsed .device-picker-panel {
+  display: none;
+}
+.sidebar.collapsed .device-scan-btn {
+  justify-content: center;
+}
+
 .status-summary {
   display: flex;
   flex-direction: column;

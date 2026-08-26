@@ -431,6 +431,38 @@ registerMode("monitor", (() => {
   let recBtn = null, recSecondsEl = null, recStatusEl = null;
   let lastDeviceStateCheckAt = 0;
 
+  // --- per-stream stale indicator (ed's stale_streams/sensors_seen work,
+  // 4f already wired into record.js) --------------------------------------
+  //
+  // Deliberately separate from the whole-connection stale-data-banner above:
+  // that one answers "is the SSE link itself dead" (driven by #linkDot),
+  // this one answers "the link is fine, but this one stream stopped" --
+  // exactly the real-hardware failure mode found today (ToF-A's I2C wedging
+  // mid-session while B keeps sending). The two never need to fight for
+  // attention: when the whole link is down, quality events (and therefore
+  // these per-sensor notes) simply stop arriving and freeze at their last
+  // value -- same as every other number in this mode -- and the existing
+  // `#mode-monitor.stale-data > *` opacity:0.35 rule (monitor.css) already
+  // dims them along with everything else, so no extra suppression logic is
+  // needed here to avoid a double-warning.
+  let latestSensorsSeen = null;      // from {type:"status"} or {type:"quality"} -- "" | "A" | "B" | "AB"
+  let latestSensorsEnabled = null;   // from {type:"status"} only
+  const staleNoteEls = {}; // "A-dist" -> element
+  let melStaleNoteEl = null;
+  let sensorsMismatchEl = null;
+  let malformedNoteEl = null;
+
+  const STALE_STREAM_LABEL = { tof_A: "感測器 A", tof_B: "感測器 B", mel: "Mel 串流", mic: "麥克風" };
+
+  // message 直接印出來，不改寫（ed 的原話：「$H 看起來跟正常一樣，所以
+  // 請直接檢查該感測器的接線」這種先回答使用者反駁的措辭不是這裡該碰的
+  // 東西）——只把它自己用的 **粗體** markdown 轉成真的 <strong>，跟
+  // record.js（ca 加的處理，4f 已經在用）同一套，不要自己再寫一個
+  // markdown 解析器。
+  function renderAlarmMessage(message) {
+    return String(message || "").replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  }
+
   // Extracts the leading "[暫定]"/"[契約]" tag from a metric's `_source`
   // string (config/quality_thresholds.json's own convention, see that
   // file's _provenance note) -- falls back to the metric's own initial
@@ -499,20 +531,100 @@ registerMode("monitor", (() => {
       drawSparkline(qualityEls.sparkCanvas[m.key], qualityEls.sparkCtx[m.key], points, sparkSize[m.key]);
     }
 
-    // alarms: seq-gap-vs-$H mismatch, a transport fault signal -- kept
-    // visually separate from the drop_rate card per B19's explicit
-    // instruction, not folded into it.
+    // alarms: transport faults (seq-gap-vs-$H, B19) AND per-stream stale
+    // alarms (ed's new work) share this one array -- each item is an
+    // object with a `.message`, not a plain string (found live while
+    // wiring this up: the old `alarms.join("；")` below assumed strings
+    // and would have rendered "[object Object]" for every alarm once ed's
+    // dict-shaped alarms started flowing -- ed's own metrics.py has always
+    // sent dicts here, `{"metric":..., "message":...}`, this call site was
+    // just never updated to match). message 直接印出來，不改寫（ed 的
+    // 原話）——只把它自己用的 **粗體** 轉成 <strong>（renderAlarmMessage，
+    // 跟 record.js/ca 同一套）。
     const alarms = Array.isArray(evt.alarms) ? evt.alarms : [];
     if (alarmBannerEl) {
       if (alarms.length) {
-        alarmBannerEl.textContent = "⚠ 傳輸層警報：" + alarms.join("；");
+        alarmBannerEl.innerHTML = "⚠ " + alarms.map((a) => renderAlarmMessage(a && a.message)).join("；");
         alarmBannerEl.style.display = "block";
       } else {
         alarmBannerEl.style.display = "none";
       }
     }
 
+    // malformed：「收到了，但那行壞掉」——跟「完全沒收到」（stale_streams
+    // 之下）是不同的問題（ed 的 docstring 分了三類：malformed / seq gap /
+    // stale），跟 record.js 的 liveMalformed 同一套判斷。
+    if (malformedNoteEl) {
+      const malformed = evt.malformed;
+      if (malformed) {
+        const rate = evt.malformed_rate;
+        malformedNoteEl.style.display = "block";
+        malformedNoteEl.textContent =
+          `損壞行數：${malformed}${typeof rate === "number" ? `（${(rate * 100).toFixed(1)}%）` : ""}`;
+      } else {
+        malformedNoteEl.style.display = "none";
+      }
+    }
+
+    if (evt.sensors_seen != null) latestSensorsSeen = evt.sensors_seen;
+    renderSensorsMismatch();
+    applyStaleStreamNotes(Array.isArray(evt.stale_streams) ? evt.stale_streams : []);
+
     maybeCheckDeviceState(performance.now());
+  }
+
+  // sensors_enabled（設定要開哪幾顆）vs sensors_seen（實際收到哪幾顆）
+  // 不一致本身就是診斷——跟 record.js（4f 已經在用）同一個判斷。
+  function renderSensorsMismatch() {
+    if (!sensorsMismatchEl) return;
+    if (latestSensorsEnabled != null && latestSensorsSeen != null
+        && latestSensorsEnabled !== latestSensorsSeen) {
+      sensorsMismatchEl.style.display = "block";
+      sensorsMismatchEl.textContent =
+        `⚠ 設定：${latestSensorsEnabled || "（無）"}　實際：${latestSensorsSeen || "（無）"}`;
+    } else {
+      sensorsMismatchEl.style.display = "none";
+    }
+  }
+
+  // 只在斷線的那一顆感測器／串流的區塊標示，畫面其餘部分維持正常——
+  // 跟整條連線斷（#linkDot 驅動的整片變暗 + 紅色橫幅）刻意分層，見
+  // staleNoteEls 宣告處的說明。用 inline style 引用既有的 --warn/
+  // --warn-soft token（tokens.css，`monitor.css` 早就在用同一組），不新增
+  // CSS 規則——`monitor.css` 是 ca 的，能在 .js 解決就不碰它。
+  function applyStaleStreamNotes(staleStreams) {
+    const byStream = {};
+    for (const item of staleStreams) {
+      if (item && typeof item.stream === "string") byStream[item.stream] = item;
+    }
+
+    for (const sensor of SENSORS) {
+      for (const ch of CHANNELS) {
+        const el = staleNoteEls[`${sensor}-${ch}`];
+        if (!el) continue;
+        const item = byStream[`tof_${sensor}`];
+        if (item) {
+          el.textContent = `⚠ ${STALE_STREAM_LABEL[`tof_${sensor}`]} 已 ${item.silent_for_s.toFixed(1)}s 沒有新資料（timeout ${item.timeout_s}s）`;
+          el.style.display = "block";
+          el.style.color = "var(--warn)";
+          el.style.fontWeight = "600";
+        } else {
+          el.style.display = "none";
+        }
+      }
+    }
+
+    if (melStaleNoteEl) {
+      const item = byStream.mel;
+      if (item) {
+        melStaleNoteEl.textContent = `⚠ Mel 串流已 ${item.silent_for_s.toFixed(1)}s 沒有新資料（timeout ${item.timeout_s}s）`;
+        melStaleNoteEl.style.display = "block";
+        melStaleNoteEl.style.color = "var(--warn)";
+        melStaleNoteEl.style.fontWeight = "600";
+      } else {
+        melStaleNoteEl.style.display = "none";
+      }
+    }
   }
 
   // §4.1.2: a resolution switch resets seq (expected -- $STATUS is the
@@ -1005,6 +1117,7 @@ registerMode("monitor", (() => {
                 <span class="sensor-name">Sensor ${sensor} · ${PANEL_LABEL[ch]}${ch === "dist" ? ' <span class="display-mode-tag mono" data-display-mode-tag></span>' : ""}</span>
                 <span class="sensor-hz mono" data-rate="${sensor}">--</span>
               </div>
+              <span class="mono" data-stale-note="${sensor}-${ch}" style="display:none;"></span>
               <div class="grid" data-grid="${sensor}-${ch}"></div>
               ${ch === "dist" ? `<div class="baseline-note" data-baseline-note="${sensor}">尚無 baseline —— 按 B 現場擷取 2 秒</div>` : ""}
             </div>
@@ -1025,6 +1138,7 @@ registerMode("monitor", (() => {
             <span class="mel-waterfall-badge mono" data-mel-badge></span>
             <span class="mel-waterfall-hz mono" data-mel-hz></span>
           </div>
+          <span class="mono" data-mel-stale-note style="display:none;"></span>
           <div class="mel-waterfall-canvas-wrap">
             <canvas data-mel-canvas></canvas>
           </div>
@@ -1036,6 +1150,8 @@ registerMode("monitor", (() => {
           <div class="reflash-note" data-reflash-note style="display:none">
             ⚠ 解析度切換中（重燒進行中）——以下指標可能暫時異常，這是預期行為
           </div>
+          <div class="mono" data-sensors-mismatch style="display:none;"></div>
+          <div class="mono" data-malformed-note style="display:none;"></div>
           <div class="quality-grid">
             ${QUALITY_METRICS.map((m) => `
               <div class="quality-card">
@@ -1069,6 +1185,7 @@ registerMode("monitor", (() => {
         for (const ch of CHANNELS) {
           const key = `${sensor}-${ch}`;
           gridEls[key] = root.querySelector(`[data-grid="${key}"]`);
+          staleNoteEls[key] = root.querySelector(`[data-stale-note="${key}"]`);
           rateEls[sensor].push(root.querySelector(`[data-panel="${key}"] [data-rate="${sensor}"]`));
         }
       }
@@ -1136,6 +1253,9 @@ registerMode("monitor", (() => {
       linkDotEl = document.getElementById("linkDot"); // shell.js/C04's own element -- read-only, not ours to modify
       alarmBannerEl = root.querySelector("[data-alarm-banner]");
       reflashNoteEl = root.querySelector("[data-reflash-note]");
+      melStaleNoteEl = root.querySelector("[data-mel-stale-note]");
+      sensorsMismatchEl = root.querySelector("[data-sensors-mismatch]");
+      malformedNoteEl = root.querySelector("[data-malformed-note]");
       recBtn = root.querySelector("[data-rec-btn]");
       recSecondsEl = root.querySelector("[data-rec-seconds]");
       recStatusEl = root.querySelector("[data-rec-status]");
@@ -1180,6 +1300,16 @@ registerMode("monitor", (() => {
       if (typeof evt.vad_start_us === "number") noteVadMark("start");
       if (typeof evt.vad_end_us === "number") noteVadMark("end");
 
+      if (evt.type === "status") {
+        // sensors_enabled only ever arrives here, never on {type:"quality"}
+        // -- same split record.js already relies on. sensors_seen can show
+        // up on either, so only overwrite it when this event actually
+        // carries a value (mirrors handleQualityEvent's own check below).
+        if (evt.sensors_seen != null) latestSensorsSeen = evt.sensors_seen;
+        if (evt.sensors_enabled != null) latestSensorsEnabled = evt.sensors_enabled;
+        renderSensorsMismatch();
+        return;
+      }
       if (evt.type === "quality") {
         // 1Hz, cheap DOM text/canvas updates -- runs directly here rather
         // than being deferred to the rAF paint loop (unlike the heatmap/

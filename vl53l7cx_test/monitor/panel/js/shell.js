@@ -22,6 +22,20 @@ const PROJECTOR_STORAGE_KEY = "panel.projector"; // C25, same sessionStorage pat
 const sidebar = document.getElementById("sidebar");
 const collapseToggle = document.getElementById("collapseToggle");
 const projectorToggle = document.getElementById("projectorToggle");
+// setCollapsed() (below) can run during initial module load (sessionStorage
+// restore, before any click) and calls closeDevicePicker(), which touches
+// these -- declared up here with the rest of the DOM refs, not down by the
+// device-picker logic itself, so there's no temporal-dead-zone crash on
+// that early call path.
+const deviceScanBtn = document.querySelector("[data-device-scan-btn]");
+const devicePickerPanelEl = document.querySelector("[data-device-picker-panel]");
+const devicePickerStatusEl = document.querySelector("[data-device-picker-status]");
+const devicePickerListEl = document.querySelector("[data-device-picker-list]");
+const devicePickerErrorEl = document.querySelector("[data-device-picker-error]");
+// Same early-call reasoning as the consts above -- setCollapsed()'s
+// sessionStorage-restore path can assign this before the device-picker
+// section further down would otherwise declare it.
+let devicePickerOpen = false;
 const navItems = Array.from(document.querySelectorAll(".mode-nav-item"));
 const sections = Object.fromEntries(
   MODES.map((mode) => [mode, document.getElementById(`mode-${mode}`)])
@@ -193,6 +207,10 @@ window.addEventListener("hashchange", () => {
 function setCollapsed(collapsed) {
   sidebar.classList.toggle("collapsed", collapsed);
   collapseToggle.setAttribute("aria-label", collapsed ? "展開側邊欄" : "摺疊側邊欄");
+  // 摺疊側邊欄後裝置選單面板會被壓扁到不能用，直接收起來 -- closeDevicePicker
+  // 定義在檔案後段的 device scan & connect 區塊，函式宣告會被提升，這裡
+  // 引用沒問題。
+  if (collapsed) closeDevicePicker();
   try {
     sessionStorage.setItem(COLLAPSE_STORAGE_KEY, collapsed ? "1" : "0");
   } catch {
@@ -314,6 +332,8 @@ let everConnectedSse = false;
 // data is actually arriving.
 let explicitLinkState = null; // null | "up" | "down"
 let lastDataAt = -Infinity;   // last time ANY payload-carrying event (tof/quality/status/mic) arrived
+let linkDataSeen = false;     // ed's addition: port open (link:up) vs. board actually sending "$" lines
+let linkPort = null;          // last known {type:"link"} evt.port, if the backend sends one
 const LINK_DATA_FRESHNESS_MS = 3000;
 
 function computeLinkUp(now) {
@@ -347,6 +367,38 @@ function pollDeviceState(now) {
     .then((state) => {
       resolutionChangeInProgress = !!(state && state.resolution_change_in_progress);
       renderStatusBar();
+    })
+    .catch(() => {
+      // transient fetch failure -- leave the last known value, don't spam
+    });
+}
+
+// GET /device/status (ed's new device-picker endpoint): connected_port,
+// seconds_to_first_line, sensors_seen, and stale_streams -- the last one is
+// the 4th connection state esp-mask-test-ad called out: "connected but a
+// sensor died mid-stream" is NOT the same thing as "never connected", and
+// the UI must not conflate them. Same 404-tolerant not-wired-yet pattern as
+// every other endpoint in this file; a 404 here just means deviceStatusInfo
+// stays null and renderDevicePickerStatus() falls back to the SSE-derived
+// link/data_seen state alone.
+const DEVICE_STATUS_POLL_MS = 2000;
+let lastDeviceStatusPollAt = -Infinity;
+let deviceStatusInfo = null;
+// Declared here (not down by fetchDevicePorts() itself) for the same reason
+// as deviceStatusInfo above: renderDevicePickerStatus() reads it and is
+// called from renderStatusBar()'s very first, module-load-time invocation
+// below -- a declaration any later than this line would TDZ-crash that
+// call (found live: this exact mistake, caught by testing before shipping).
+let devicePortsData = null; // last full GET /device/ports response, or null if never fetched/unavailable
+
+function pollDeviceStatus(now) {
+  if (now - lastDeviceStatusPollAt < DEVICE_STATUS_POLL_MS) return;
+  lastDeviceStatusPollAt = now;
+  fetch("/device/status")
+    .then((r) => (r.ok ? r.json() : null))
+    .then((info) => {
+      deviceStatusInfo = info;
+      renderDevicePickerStatus(performance.now());
     })
     .catch(() => {
       // transient fetch failure -- leave the last known value, don't spam
@@ -406,6 +458,8 @@ function renderStatusBar() {
   while (tofTimestamps.length && now - tofTimestamps[0] > TOF_RATE_WINDOW_MS) tofTimestamps.shift();
   statusFpsEl.textContent = (tofTimestamps.length / (TOF_RATE_WINDOW_MS / 1000)).toFixed(1) + " Hz";
 
+  renderDevicePickerStatus(now);
+
   // unknown must never look like it passed (same rule as C09's hollow-ring
   // dot) -- here that means "not counted as red", not "counted as green".
   //
@@ -439,6 +493,15 @@ export function notifyGlobalStatus(evt) {
 
   if (evt.type === "link") {
     explicitLinkState = evt.state === "up" ? "up" : "down";
+    // ed's addition for the device-picker feature: the port can be "up"
+    // (pyserial opened it) well before the board actually sends a single
+    // "$" line -- data_seen distinguishes those two, fired once false on
+    // open and again true on the first real line, so this file doesn't
+    // need its own polling to tell them apart.
+    linkDataSeen = evt.data_seen === true;
+    if (evt.port) linkPort = evt.port;
+    if (explicitLinkState === "down") linkDataSeen = false;
+    renderDevicePickerStatus(now);
   } else if (evt.type === "status") {
     latestDeviceStatus = evt;
     lastDataAt = now;
@@ -455,6 +518,7 @@ export function notifyGlobalStatus(evt) {
   }
 
   pollDeviceState(now);
+  pollDeviceStatus(now);
   renderStatusBar();
 }
 
@@ -470,4 +534,221 @@ renderStatusBar(); // paint the initial "connecting..." state before any event a
 // already re-renders on its own; this tick is what makes the FPS readout
 // decay toward 0 and the data-freshness link inference actually expire
 // when nothing else is happening.
-setInterval(renderStatusBar, 500);
+setInterval(() => {
+  // Runs even when no SSE payload event is arriving at all (fully
+  // unplugged) -- pollDeviceStatus() inside notifyGlobalStatus() alone
+  // would never fire in that case, and "disconnected" is exactly the state
+  // the device-picker most needs to keep reflecting accurately.
+  pollDeviceStatus(performance.now());
+  renderStatusBar();
+}, 500);
+
+// --- device scan & connect ------------------------------------------------
+//
+// esp-mask-test-ad, 2026-08-26: 使用者直接提的需求（「我希望有個按鈕可以
+// 掃描與連接我的 esp32」）——今天板子的接頭會鬆，使用者會拔插很多次，
+// 每次都要自己開終端機猜 /dev/ttyUSB 是幾號。
+//
+// Backend surface（esp-mask-test-ed 在做）：
+//   GET  /device/ports  -> {"ports":[{device,description,manufacturer,
+//                            serial_number,vid,pid,likely_esp32,usb_vendor}],
+//                           "connected_port": "/dev/ttyUSB0" | null,
+//                           "likely": ["/dev/ttyUSB0", ...],
+//                           "hint": "…"（只在沒有明顯候選時出現）}
+//     實測這台機器：32 個 /dev/ttyS0..31，全部沒有 description/vid ->
+//     沒有一個過濾掉（用不認得的晶片的板子不該從清單裡消失，候選只是
+//     排前面），但沒有 hint 的話那份清單完全沒用，所以 hint 一定要顯示。
+//   GET  /device/status  -> {state, port, connected_for_s, data_seen,
+//                             seconds_to_first_line, sensors_seen,
+//                             stale_streams, user_disconnected}
+//   POST /device/connect body {"port": "..."} -> 202 {accepted, port, state}
+//   POST /device/disconnect -> 200 {disconnected, state}
+//     (讀 bridge_server.py 原始碼直接確認：_handle_device_connect/
+//     _handle_device_disconnect 都已經接上路由，不是還沒做的功能。)
+//
+// ⚠️ 這不是上面 pollDeviceState() 打的 /device/state（B18 的重燒偵測），
+// 兩個名字很像但完全不同的端點，別搞混。
+//
+// 連線狀態有四態，不是兩態，畫面要容得下全部四個。`/device/status` 自己
+// 的 state 欄位就是這四個字串之一（比這個檔案自己從 link SSE 的
+// up/down + data_seen 兜出來的更準，還分得出 "connecting" 跟 "opened"）：
+//   disconnected -- 未連線
+//   connecting / opened -- 已開啟，等待資料…（port 開得起來 != 板子真的
+//                          在送 $ 開頭的資料行，今天實測過：埠開著、
+//                          兩顆 ToF 都沒資料）
+//   receiving（且 stale_streams 空）-- 已連線（有資料）
+//   receiving（但 stale_streams 非空）-- 已連線，但有感測器沒資料
+//                          （esp-mask-test-ad 明確要求的第四態：「連上了
+//                          但一顆感測器死了」不是「沒連上」，不能畫成跟
+//                          未連線一樣的紅燈，也不能畫成一切正常的綠燈）
+//
+// renderDevicePickerStatus() 優先讀輪詢來的 /device/status；還沒輪到第
+// 一次之前，退回用 link SSE 事件已經給的 explicitLinkState/linkDataSeen
+// 撐著畫面，兩邊不會互相打架（同一組欄位、只是新鮮度不同）。
+
+const DEVICE_PORTS_URL = "/device/ports";
+
+function setDevicePickerError(text) {
+  if (!text) {
+    devicePickerErrorEl.style.display = "none";
+    devicePickerErrorEl.textContent = "";
+    return;
+  }
+  devicePickerErrorEl.textContent = text;
+  devicePickerErrorEl.style.display = "block";
+}
+
+async function fetchDevicePorts() {
+  devicePickerListEl.innerHTML = `<div class="device-picker-loading">掃描中…</div>`;
+  let res;
+  try {
+    res = await fetch(DEVICE_PORTS_URL);
+  } catch (err) {
+    devicePortsData = null;
+    devicePickerListEl.innerHTML = "";
+    setDevicePickerError("連不上後端（" + err.message + "）");
+    return;
+  }
+  if (!res.ok) {
+    devicePortsData = null;
+    devicePickerListEl.innerHTML = "";
+    if (res.status === 404) {
+      setDevicePickerError("尚未串接（/device/ports 還沒上線）");
+    } else {
+      const body = await res.json().catch(() => ({}));
+      setDevicePickerError(body.error || `掃描失敗：HTTP ${res.status}`);
+    }
+    return;
+  }
+  const data = await res.json().catch(() => null);
+  setDevicePickerError(null);
+  devicePortsData = data && Array.isArray(data.ports) ? data : { ports: [] };
+  renderDevicePortsList();
+}
+
+function renderDevicePortsList() {
+  if (!devicePortsData) return;
+  const ports = devicePortsData.ports;
+  const connectedPort = devicePortsData.connected_port;
+  if (!ports.length) {
+    devicePickerListEl.innerHTML = `<div class="device-picker-empty">沒有掃到任何序列埠</div>`;
+    return;
+  }
+  const hintHtml = devicePortsData.hint
+    ? `<div class="device-picker-hint device-picker-hint-warn">⚠ ${devicePortsData.hint}</div>` : "";
+  // likely_esp32 排前面，但「不太可能是」不是紅色/禁用 -- 判斷不出來的
+  // 晶片也可能是使用者的板子，只是排在後面 + 中性提示
+  // (esp-mask-test-ad 的明確要求：不要用顏色暗示「這是錯的」，一個都不
+  // 過濾掉)。
+  const sorted = [...ports].sort((a, b) => (b.likely_esp32 ? 1 : 0) - (a.likely_esp32 ? 1 : 0));
+  devicePickerListEl.innerHTML = hintHtml + sorted.map((p) => `
+    <div class="device-port-row${p.likely_esp32 ? " likely" : ""}${p.device === connectedPort ? " connected" : ""}">
+      <div class="device-port-info">
+        <span class="mono device-port-path">${p.device}</span>
+        <span class="device-port-desc">${fmtPortDesc(p)}</span>
+        ${p.device === connectedPort ? `<span class="device-port-badge device-port-badge-connected">目前連線中</span>` : ""}
+        ${p.likely_esp32
+          ? `<span class="device-port-badge device-port-badge-likely">可能是你的板子</span>`
+          : `<span class="device-port-badge device-port-badge-unknown">不確定（可能是主機板內建埠，也可能是沒認出來的板子）</span>`}
+      </div>
+      ${p.device === connectedPort
+        ? `<span class="device-port-connect-btn" aria-disabled="true">已連線</span>`
+        : `<button class="device-port-connect-btn" data-connect-port="${p.device}">連接</button>`}
+    </div>
+  `).join("");
+  Array.from(devicePickerListEl.querySelectorAll("[data-connect-port]")).forEach((btn) => {
+    btn.addEventListener("click", () => connectToPort(btn.dataset.connectPort));
+  });
+}
+
+function fmtPortDesc(p) {
+  // 後端沒有描述時回字串 "n/a"，不是 null/空字串 -- 整個面板是中文，
+  // 原樣顯示會很突兀。
+  if (p.description && p.description !== "n/a") return p.description;
+  if (p.manufacturer) return p.manufacturer;
+  return "（無描述）";
+}
+
+// POST /device/connect 已經是真的端點了（202 = 已受理，序列埠即將開啟，
+// 不代表板子已經在送資料 -- 跟本檔案其他 3xx/4xx 判斷同一套：res.ok 對
+// 202 也是 true，不用特判）。send 完之後不用自己再切狀態，/device/status
+// 的輪詢（見下）跟 link SSE 事件會把畫面帶到正確的下一態。
+async function connectToPort(port) {
+  setDevicePickerError(null);
+  let res;
+  try {
+    res = await fetch("/device/connect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ port }),
+    });
+  } catch (err) {
+    setDevicePickerError("連不上後端（" + err.message + "）");
+    return;
+  }
+  if (!res.ok) {
+    // ed 的 409 分好幾種真實原因（session 進行中／正在燒錄／探測失敗），
+    // 照 replay.js 今天的修法原樣顯示 body.error，不要蓋成同一句話。
+    const body = await res.json().catch(() => ({}));
+    setDevicePickerError(body.error || `連接失敗：HTTP ${res.status}`);
+    return;
+  }
+  // 202 受理成功 -- 立刻重抓一次 /device/status（不等 2 秒的輪詢間隔），
+  // 讓「已開啟，等待資料…」盡快出現，而不是停在舊狀態看起來像沒反應。
+  lastDeviceStatusPollAt = -Infinity;
+  pollDeviceStatus(performance.now());
+  fetchDevicePorts(); // connected_port 變了，清單上的「已連線」標記要跟上
+}
+
+function renderDevicePickerStatus(now) {
+  if (!devicePickerStatusEl) return;
+  const info = deviceStatusInfo;
+  // /device/status 有自己完整的四態字串（state），比這個檔案自己從
+  // link SSE 的 up/down + data_seen 兜出來的更準（它還分得出
+  // "connecting" 跟 "opened"）-- 端點還沒被輪詢到之前，才退回用
+  // explicitLinkState/linkDataSeen 這兩個 SSE 已經給的欄位撐著畫面。
+  const state = info ? info.state
+    : (explicitLinkState === "up" ? (linkDataSeen ? "receiving" : "opened") : "disconnected");
+  const currentPort = (info && info.port) || linkPort
+    || (devicePortsData && devicePortsData.connected_port) || null;
+  const staleStreams = info && Array.isArray(info.stale_streams) ? info.stale_streams : [];
+
+  if (state === "disconnected") {
+    devicePickerStatusEl.innerHTML = `未連線`;
+    devicePickerStatusEl.className = "device-picker-status device-picker-status-down";
+  } else if (state === "connecting" || state === "opened") {
+    devicePickerStatusEl.innerHTML =
+      `⏳ 已開啟，等待資料…${currentPort ? `：<span class="mono">${currentPort}</span>` : ""}`;
+    devicePickerStatusEl.className = "device-picker-status device-picker-status-waiting";
+  } else if (staleStreams.length) {
+    // 🔴 esp-mask-test-ad 明確要求的第四態：連上了、真的有資料在流，但
+    // 不是每顆感測器都有 -- 這不是「沒連上」（不能畫成紅燈跟未連線一樣），
+    // 也不是「一切正常」（不能畫成純綠燈），要有自己的第三種顏色。
+    devicePickerStatusEl.innerHTML =
+      `⚠ 已連線，但 ${staleStreams.join("、")} 沒有資料${currentPort ? `：<span class="mono">${currentPort}</span>` : ""}`;
+    devicePickerStatusEl.className = "device-picker-status device-picker-status-degraded";
+  } else {
+    devicePickerStatusEl.innerHTML =
+      `✅ 已連線（有資料）${currentPort ? `：<span class="mono">${currentPort}</span>` : ""}`;
+    devicePickerStatusEl.className = "device-picker-status device-picker-status-connected";
+  }
+}
+
+function closeDevicePicker() {
+  devicePickerOpen = false;
+  devicePickerPanelEl.style.display = "none";
+  deviceScanBtn.setAttribute("aria-expanded", "false");
+}
+
+function toggleDevicePicker() {
+  if (devicePickerOpen) {
+    closeDevicePicker();
+    return;
+  }
+  devicePickerOpen = true;
+  devicePickerPanelEl.style.display = "block";
+  deviceScanBtn.setAttribute("aria-expanded", "true");
+  fetchDevicePorts();
+}
+
+deviceScanBtn.addEventListener("click", toggleDevicePicker);

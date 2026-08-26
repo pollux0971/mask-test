@@ -108,3 +108,109 @@ def test_link_event_says_whether_data_has_arrived(rig):
         if e["state"] == "up":
             assert "data_seen" in e, "link up says nothing about actual data"
             assert e.get("port")
+
+
+# -- connect / disconnect -------------------------------------------------
+
+
+def test_connect_needs_a_port(rig):
+    status, body = _request(rig, "POST", "/device/connect", {})
+    assert status == 400 and "port" in body["error"]
+
+
+def test_connect_to_a_missing_port_says_so_plainly(rig):
+    """"Does not exist" and "no permission" are different problems.
+
+    A generic "cannot open" makes a permissions issue look like a broken
+    board, and the user goes hunting for the wrong thing.
+    """
+    status, body = _request(rig, "POST", "/device/connect",
+                            {"port": "/dev/nope-xyz"})
+    assert status == 409
+    assert "不存在" in body["error"]
+    assert "dialout" not in body["error"], "wrong diagnosis for a missing port"
+
+
+def test_connect_is_refused_during_a_session(rig):
+    """Swapping boards mid-session would put two devices' data under one /meta."""
+    from test_bridge_session_api import VALID_METADATA
+    rig.read_events(2.0)
+    assert _request(rig, "POST", "/session/start", VALID_METADATA)[0] == 200
+    status, body = _request(rig, "POST", "/device/connect", {"port": rig.pty})
+    assert status == 409
+    assert body["session_id"]
+
+
+def test_disconnect_is_refused_during_a_session(rig):
+    from test_bridge_session_api import VALID_METADATA
+    rig.read_events(2.0)
+    assert _request(rig, "POST", "/session/start", VALID_METADATA)[0] == 200
+    assert _request(rig, "POST", "/device/disconnect")[0] == 409
+
+
+def test_disconnect_is_a_state_not_a_fault(rig):
+    """The panel must not tell the user to check the wiring of a board they
+    just unplugged themselves."""
+    import time
+    rig.read_events(2.0)
+    assert _request(rig, "POST", "/device/disconnect")[0] == 200
+    time.sleep(1.0)
+    body = _request(rig, "GET", "/device/status")[1]
+    assert body["state"] == "disconnected"
+    assert body["user_disconnected"] is True
+    assert body["stale_streams"] == [], (
+        "a deliberate disconnect raised stale-stream alarms"
+    )
+
+
+def test_reconnecting_forgets_the_previous_board(rig):
+    """A new link must not inherit the old one's observations.
+
+    seq counters restart on a different device and "which sensors have been
+    seen" says nothing about the new board -- carrying either across would
+    make a fresh board look like whatever was plugged in before.
+    """
+    import time
+    rig.read_events(2.5)
+    before = _request(rig, "GET", "/device/status")[1]
+    assert before["sensors_seen"] == "AB"
+
+    assert _request(rig, "POST", "/device/disconnect")[0] == 200
+    time.sleep(0.8)
+    assert _request(rig, "GET", "/device/status")[1]["sensors_seen"] == ""
+
+    status, body = _request(rig, "POST", "/device/connect", {"port": rig.pty})
+    assert status == 202, body
+    assert body["state"] == "connecting"
+
+    # It comes back on its own, and the observations rebuild from scratch.
+    for _ in range(40):
+        time.sleep(0.25)
+        again = _request(rig, "GET", "/device/status")[1]
+        if again["state"] == "receiving":
+            break
+    assert again["state"] == "receiving", again
+    assert again["user_disconnected"] is False
+    assert again["sensors_seen"] == "AB"
+
+
+def test_protocol_is_renegotiated_after_a_reconnect(rig):
+    """A different board can be a different firmware version.
+
+    The v1 degradation race was exactly this: a device that announces itself
+    once. Reconnecting puts us back in that situation, so the parser is
+    rebuilt and the bridge asks again.
+    """
+    import time
+    rig.read_events(2.5)
+    assert _request(rig, "POST", "/device/disconnect")[0] == 200
+    time.sleep(0.8)
+    assert _request(rig, "POST", "/device/connect", {"port": rig.pty})[0] == 202
+
+    for _ in range(40):
+        time.sleep(0.25)
+        status = _of_type(rig.read_events(0.4), "status")
+        if status and status[-1].get("proto_confirmed"):
+            break
+    assert status and status[-1]["proto_confirmed"] is True, status
+    assert status[-1]["sr"] == 16000

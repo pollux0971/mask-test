@@ -650,7 +650,46 @@ device_clock = {"last_t_us": None}
 # has actually arrived on it. "The port opened" and "the board is talking"
 # are different facts -- measured on the real board, where the port opened
 # cleanly while neither ToF sensor produced a single line.
-serial_link = {"port": None, "opened_at": None, "first_line_at": None}
+serial_link = {"port": None, "opened_at": None, "first_line_at": None,
+               "silent_warned": False}
+
+# What the reader thread is being asked to do. `generation` bumps on every
+# change so the loop can tell "reopen on a new port" from "keep going".
+# `connected=False` means the user pressed disconnect -- a deliberate state,
+# not a fault, and it must not look like one.
+serial_target = {"port": None, "baud": 460800, "allow_v1": False,
+                 "generation": 0, "connected": True}
+serial_target_lock = threading.Lock()
+
+#: How long a port may stay open with nothing recognisable arriving before
+#: the panel is told. Long enough to cover a board that is still booting,
+#: short enough that picking /dev/ttyS0 by mistake does not look like a hang.
+SILENT_PORT_TIMEOUT_S = 8.0
+
+
+def request_serial_port(port, *, connected=True):
+    """Ask the reader thread to move to `port` (or to stop, if not connected)."""
+    with serial_target_lock:
+        serial_target["port"] = port
+        serial_target["connected"] = connected
+        serial_target["generation"] += 1
+        return serial_target["generation"]
+
+
+def reset_link_observations():
+    """Forget everything learned from the previous board.
+
+    Every one of these is scoped to a link, not to the process: seq counters
+    restart on a different device, "which sensors have been seen" says
+    nothing about the new board, and a stale-stream alarm about hardware
+    that has been unplugged is worse than no alarm at all.
+    """
+    drop_tracker.reset()
+    quality.forget_streams()
+    device_clock["last_t_us"] = None
+    session_frame_baseline.update({"tof_A": 0, "tof_B": 0})
+    protocol_state["parser"] = None
+    protocol_state["last_status_signature"] = None
 
 # What the host last *told* the sensors to do. Not what they confirmed: a
 # $STATUS carries mel= and amb= but no sens_a=/sens_b=, so the device never
@@ -1361,6 +1400,39 @@ def list_serial_ports():
     return ports, None
 
 
+def probe_serial_port(port):
+    """Can we actually open `port`? Returns `(ok, message)`.
+
+    Checked before handing the port to the reader thread so the failure
+    comes back on the request that caused it, rather than as a log line the
+    user never sees.
+
+    The two common failures need different answers: a missing port means
+    "plug it in / pick another", while a permissions error means "add
+    yourself to dialout and log out and back in" -- and that one looks
+    identical to a broken board if the message just says "cannot open".
+    """
+    path = Path(port)
+    if not path.exists():
+        return False, f"{port} 不存在。板子可能沒插上，或拔插後換成了別的埠號。"
+    try:
+        import serial
+        with serial_lock:
+            serial.Serial(port, serial_target["baud"], timeout=0.2).close()
+    except PermissionError:
+        return False, (f"沒有權限開啟 {port}。請確認你的帳號在 dialout 群組："
+                       f"`sudo usermod -a -G dialout $USER`，然後重新登入。")
+    except Exception as exc:
+        message = str(exc)
+        if "Permission denied" in message or "denied" in message.lower():
+            return False, (f"沒有權限開啟 {port}。請確認你的帳號在 dialout 群組："
+                           f"`sudo usermod -a -G dialout $USER`，然後重新登入。")
+        if "Device or resource busy" in message or "busy" in message.lower():
+            return False, f"{port} 已經被其他程式佔用。"
+        return False, f"無法開啟 {port}：{message}"
+    return True, "ok"
+
+
 def device_status():
     """Where the link stands right now.
 
@@ -1373,8 +1445,19 @@ def device_status():
     opened_at = serial_link["opened_at"]
     first = serial_link["first_line_at"]
     now = time.time()
+    with serial_target_lock:
+        wanted, connected = serial_target["port"], serial_target["connected"]
+    if not connected:
+        # The user pressed disconnect. Distinct from a fault, and reported
+        # as such -- otherwise the panel says "sensor A has been silent for
+        # 12 seconds, check the wiring" about a board they unplugged
+        # themselves.
+        return {"state": "disconnected", "port": None, "opened_at": None,
+                "connected_for_s": None, "data_seen": False,
+                "seconds_to_first_line": None, "sensors_seen": "",
+                "stale_streams": [], "user_disconnected": True}
     if port is None:
-        state = "disconnected"
+        state = "connecting" if wanted else "disconnected"
     elif first is None:
         state = "opened"        # port is open, nothing has arrived yet
     else:
@@ -1388,6 +1471,8 @@ def device_status():
         "seconds_to_first_line": (round(first - opened_at, 2)
                                   if first and opened_at else None),
         "sensors_seen": sensors_seen_string(),
+        "user_disconnected": False,
+        "silent": bool(serial_link.get("silent_warned")),
         # Whatever has gone quiet since, from the same detector the panel
         # already shows -- "connected but one sensor died" is a state the
         # user needs, and it is not the same as "disconnected".
@@ -1711,8 +1796,19 @@ def _process_mfcc(filename):
 
 def serial_reader(port, baud, allow_v1=False):
     """Runs for the lifetime of the process; pauses itself while `flashing`
-    is set so the flash subprocess can have the port exclusively."""
+    is set so the flash subprocess can have the port exclusively.
+
+    The port is no longer fixed at startup: `POST /device/connect` bumps
+    `serial_target["generation"]`, and the loop notices, closes what it has
+    and opens the new one. Reopening a connection rather than restarting the
+    process keeps every HTTP client, SSE subscriber and open session alive
+    across a replug -- and that board's connector works loose, so replugging
+    is not an edge case.
+    """
     import serial
+
+    with serial_target_lock:
+        serial_target.update(port=port, baud=baud, allow_v1=allow_v1)
 
     # State for an in-progress BEGIN_WAV_B64 ... END_WAV_B64 capture. A
     # recording pauses the mic's normal $MIC lines but $TOF lines keep
@@ -1725,19 +1821,37 @@ def serial_reader(port, baud, allow_v1=False):
         if flashing.is_set():
             time.sleep(0.2)
             continue
+
+        with serial_target_lock:
+            port = serial_target["port"]
+            baud = serial_target["baud"]
+            allow_v1 = serial_target["allow_v1"]
+            generation = serial_target["generation"]
+            connected = serial_target["connected"]
+
+        if not connected or not port:
+            # Deliberately disconnected. Nothing is published: a stale-stream
+            # alarm here would tell the user to go and check the cabling of a
+            # board they themselves just unplugged.
+            time.sleep(0.2)
+            continue
+
         try:
             with serial_lock:
                 ser = serial.Serial(port, baud, timeout=1)
             current_serial_holder["ser"] = ser
+            # Order matters: clear everything the previous link taught us
+            # FIRST, then build the new parser. reset_link_observations()
+            # nulls protocol_state["parser"], so creating it above would
+            # hand the reader a None to call .feed() on.
+            reset_link_observations()
             # A fresh parser per connection: version negotiation state
-            # belongs to one link, and reconnecting after a reflash means
-            # re-reading the new firmware's $STATUS from scratch.
+            # belongs to one link, and reconnecting -- to a different board
+            # or after a reflash -- means reading the new firmware's $STATUS
+            # from scratch.
             protocol_state["parser"] = ProtocolParser(allow_v1=allow_v1)
-            protocol_state["last_status_signature"] = None
-            # A reconnect is a new link: what the previous one delivered says
-            # nothing about this one.
-            session_frame_baseline.update(snapshot_frame_counts())
-            serial_link.update(port=port, opened_at=time.time(), first_line_at=None)
+            serial_link.update(port=port, opened_at=time.time(),
+                               first_line_at=None, silent_warned=False)
             print(f"[bridge] serial open: {port} @ {baud}")
             # "opened", not "connected": the port opening tells us nothing
             # about whether the board is talking. On the real board the port
@@ -1759,6 +1873,29 @@ def serial_reader(port, baud, allow_v1=False):
             try:
                 last_hello = 0.0
                 while not flashing.is_set():
+                    with serial_target_lock:
+                        if serial_target["generation"] != generation:
+                            break          # asked to move to another port
+
+                    # A port that opens but never speaks: almost always the
+                    # wrong device (there are 32 /dev/ttyS* on this machine
+                    # and every one of them opens cleanly). Say which it is
+                    # rather than leaving the panel spinning.
+                    opened_at = serial_link["opened_at"]
+                    if (serial_link["first_line_at"] is None
+                            and not serial_link["silent_warned"]
+                            and opened_at
+                            and time.time() - opened_at > SILENT_PORT_TIMEOUT_S):
+                        serial_link["silent_warned"] = True
+                        broadcaster.publish({
+                            "type": "link", "state": "up", "port": port,
+                            "data_seen": False, "silent": True,
+                            "message": (f"{port} 開得起來，但 "
+                                        f"{SILENT_PORT_TIMEOUT_S:.0f} 秒內沒有收到任何"
+                                        f"認得的資料——可能不是這塊板子，"
+                                        f"或板子沒有在送資料。"),
+                        })
+
                     label = ping_request["label"]
                     if label:
                         ping_request["label"] = None
@@ -2184,6 +2321,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_session_end()
         elif self.path.startswith("/session/baseline"):
             self._handle_session_baseline()
+        elif self.path.startswith("/device/connect"):
+            self._handle_device_connect()
+        elif self.path.startswith("/device/disconnect"):
+            self._handle_device_disconnect()
         elif self.path.startswith("/trial/"):
             self._handle_trial()
         elif self.path.startswith("/recognize"):
@@ -2282,6 +2423,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "real": bool(body.get("real", False)),
             "ablation_permutations": permutations,
         })
+
+    def _handle_device_connect(self):
+        """`POST /device/connect` —— `{"port": "/dev/ttyUSB0"}`。"""
+        body = self._read_json_body()
+        if body is None:
+            return
+        port = (body.get("port") or "").strip()
+        if not port:
+            self._send_json(400, {"error": "需要 port 欄位，例如 "
+                                           "{\"port\": \"/dev/ttyUSB0\"}"})
+            return
+
+        if session_registry.current is not None:
+            # Same shape as the other "not while something is in flight"
+            # refusals. Swapping the port mid-session would leave the HDF5
+            # holding data from two different boards under one set of /meta.
+            self._send_json(409, {
+                "error": "session 進行中，不能切換序列埠。請先結束 session。",
+                "session_id": session_registry.current.session_id})
+            return
+        if flashing.is_set():
+            self._send_json(409, {"error": "正在燒錄，序列埠被佔用中"})
+            return
+
+        ok, message = probe_serial_port(port)
+        if not ok:
+            self._send_json(409, {"error": message, "port": port})
+            return
+
+        request_serial_port(port, connected=True)
+        # 202, not 200: the port is *going* to be opened by the reader
+        # thread, and "opened" still is not "the board is talking" -- the
+        # panel should wait for link/data_seen before claiming connected.
+        self._send_json(202, {"accepted": True, "port": port,
+                              "state": "connecting",
+                              "note": "序列埠即將開啟。收到第一行資料前，"
+                                      "狀態會停在 opened，不代表板子有在送東西。"})
+
+    def _handle_device_disconnect(self):
+        """`POST /device/disconnect` —— 使用者主動斷開，不是故障。"""
+        if session_registry.current is not None:
+            self._send_json(409, {
+                "error": "session 進行中，不能中斷連線。請先結束 session。",
+                "session_id": session_registry.current.session_id})
+            return
+        request_serial_port(None, connected=False)
+        ser = current_serial_holder.get("ser")
+        if ser is not None:
+            try:
+                ser.close()          # unblock a readline() sitting on timeout
+            except Exception:
+                pass
+        self._send_json(200, {"disconnected": True, "state": "disconnected"})
 
     def _handle_device_ports(self):
         """`GET /device/ports` —— 掃描可用的序列埠。"""

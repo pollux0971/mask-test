@@ -25,6 +25,20 @@
       <span id="linkDot" class="link-dot"></span>
       <span class="status-conn-text" data-status-conn-text>連線中…</span>
     </div>
+    <div class="device-picker" data-device-picker>
+      <button class="device-scan-btn" data-device-scan-btn
+        title="換一個埠／重新連接裝置（bridge_server.py 要先在終端機跑起來）"
+        aria-expanded="false">
+        <span class="mode-icon">🔌</span><span class="mode-label">掃描裝置</span>
+      </button>
+      <div class="device-picker-panel" data-device-picker-panel style="display:none">
+        <div class="device-picker-hint">這顆按鈕是「換埠／重新連接」，不是「啟動整個系統」——
+          bridge_server.py 要先從終端機啟動，這裡才找得到它。</div>
+        <div class="device-picker-status" data-device-picker-status></div>
+        <div class="device-picker-list" data-device-picker-list></div>
+        <div class="device-picker-error" data-device-picker-error style="display:none"></div>
+      </div>
+    </div>
     <div class="status-warning" data-status-warning style="display:none"></div>
     <ul class="mode-nav">
       <li><button class="mode-nav-item active" data-mode="monitor">
