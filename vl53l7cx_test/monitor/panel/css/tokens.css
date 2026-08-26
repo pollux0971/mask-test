@@ -1,12 +1,22 @@
 /* Design tokens — moved verbatim from the old single-file panel.html :root
-   block (C01). Values must not change here; that's C25's job. */
+   block (C01). Base color values below are unchanged from that move; C25
+   only ADDS the semantic layer + projector-mode scale on top. */
 :root {
   --bg: #0b0e0c;
   --surface: #141915;
   --surface-2: #1b211c;
   --border: #262c27;
   --text: #e7ece8;
-  --text-dim: #8b968e;
+  /* C25: brightened from the original #8b968e (~10% toward white, same
+     hue). Measured contrast against --surface: 5.81:1 before, 6.60:1 after
+     (WCAG formula, sRGB relative luminance) -- already comfortably over
+     the 4.5:1 AA floor either way (C25.md's own "4.8:1, barely passes"
+     didn't reproduce here; whatever pair it measured, it wasn't this one
+     against --surface). Bumped anyway per C25.md's own reasoning: a
+     projector's real-world contrast is well below a monitor's, and this
+     value is read constantly (labels, hints, secondary numbers) across
+     all five modes. */
+  --text-dim: #96a099;
   --accent: #e8a33d;
   --accent-soft: rgba(232, 163, 61, 0.16);
   --warn: #e2574c;
@@ -18,6 +28,35 @@
 
   --sidebar-width: 200px;
   --sidebar-width-collapsed: 56px;
+
+  /* --- C25: semantic status layer ---
+     Aliases, not renames -- `--warn`/`--accent`/`--good` above already have
+     five stories' worth of call sites across every mode CSS, and quiz.css/
+     record.css are still being edited by other agents this round, so a
+     wholesale rename is out of scope and unsafe right now. This layer gives
+     new/updated rules a name that says what the color MEANS instead of
+     what it happens to look like.
+
+     Historical naming quirk, worth knowing before "fixing" it: `--warn` is
+     actually the RED/failure color, and `--accent` (the brand amber) is
+     what every "degraded but not failed" state has organically reused
+     (C13's low-quality amber, this file's own reflash-note). So the
+     semantic mapping below looks backwards from the token NAMES but matches
+     what every mode already visually does. */
+  --status-good: var(--good);
+  --status-good-soft: rgba(95, 191, 122, 0.14);
+  --status-warn: var(--accent);   /* degraded / low / caution -- NOT a failure */
+  --status-warn-soft: var(--accent-soft);
+  --status-bad: var(--warn);      /* fail / error / reject */
+  --status-bad-soft: var(--warn-soft);
+  --status-unknown: var(--text-dim); /* pair with a hollow/dashed shape, not a fill -- see .status-dot-unknown */
+  --status-bad-hatch: rgba(226, 87, 76, 0.35); /* monitor.css's no-signal hatch overlay -- same red as --status-bad, alpha'd for a gradient background rather than a solid fill */
+  --status-bad-glow: rgba(226, 87, 76, 0.7); /* monitor.css's red quality dot glow */
+  --highlight: #f3f6f2; /* neutral "look here" outline (C06's significant-zone marker) -- deliberately not a status color, it flags a fact (this cell moved) not a good/warn/bad judgment */
+  --bg-scrim: rgba(11, 14, 12, 0.85); /* --bg at 85% opacity, for a translucent backdrop over other content (C06's baseline-note overlay) */
+  --expect-audio: #f1b441; /* quiz.css's "音訊" expect badge -- a distinct amber from --accent on purpose (C15), not a drift to fix */
+  --expect-audio-soft: rgba(255, 191, 64, 0.16);
+
 }
 
 * { box-sizing: border-box; }
@@ -30,7 +69,74 @@ html, body {
   font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
 }
 
+/* --- C25: projector mode ---
+   One-click 130% text for Demo, toggled by shell.js and persisted in
+   sessionStorage the same way as C02's sidebar collapse. Deliberately a
+   root font-size scale (rem-based), NOT `zoom` or a transform: those scale
+   the whole rendered page as a bitmap, which is exactly what browser
+   Ctrl-+ already does and blurs every canvas (heatmaps/waterfalls/PCA
+   trajectory/bar charts) -- the story's whole reason to build this instead
+   of telling people to just zoom their browser. A root font-size change
+   only grows rem-sized text/spacing; canvases keep their own native pixel
+   backing store and stay sharp, and each mode's own resize handling
+   already recomputes canvas pixel size from its container's actual
+   (now-larger) layout box.
+   ⚠️ Only affects elements sized in rem. Any mode CSS still using literal
+   px font-sizes will not grow -- see the completion report for which mode
+   CSS files are (and aren't yet) converted. */
+html[data-projector-mode="true"] {
+  font-size: 130%;
+}
+
 .mono {
   font-family: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
   font-variant-numeric: tabular-nums;
+}
+
+/* --- C25: shared "pending backend" note ---
+   C10/C15/C16/C22/C23 each independently invented their own text and
+   styling for "this HTTP endpoint doesn't exist yet, degraded until it
+   does" -- five different treatments for the same, very common situation
+   in a project where the frontend and backend tracks run in parallel. This
+   is the one shared look going forward: calm and informational, visually
+   distinct from a real error (`.status-bad`) since "not wired up yet" is
+   an expected, temporary state, not a problem with what the user did.
+   Applied in monitor.css/validate.css this round; quiz.css/record.css pick
+   it up once unblocked instead of keeping their own bespoke versions. */
+.pending-note {
+  font-size: 0.6875rem;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  width: fit-content;
+}
+
+/* --- C25: shared "assumed / synthetic / unverified" caveat label ---
+   C05/C07 (zone-layout "ASSUMED, unverified") and C23 ("合成資料") each
+   flagged this same idea -- a caveat about confidence, not a failure --
+   with their own inline text and no shared styling. Amber, matching the
+   rest of the "caution, not failure" language above. */
+.caveat-badge {
+  color: var(--status-warn);
+  font-weight: 600;
+}
+
+/* --- C25: shared "no data yet / not evaluated" status dot ---
+   C09's own comment on this exact rule says it best: deliberately NOT a
+   shade of green or a plain dim fill -- a hollow ring reads as "unknown",
+   which must never look like "passed". Promoted from monitor.css (where it
+   started as `.quality-level-dot.level-unknown`) to a shared class so
+   validate.css's SKIPPED badge and any future "no data" indicator use the
+   exact same shape instead of each inventing their own. monitor.css keeps
+   its own rule name as an alias for the existing markup, see that file. */
+.status-dot-unknown {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: transparent;
+  border: 2px solid var(--status-unknown);
+  flex-shrink: 0;
 }

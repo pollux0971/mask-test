@@ -76,6 +76,9 @@ from host.clock.ping_sync import (                                  # noqa: E402
 )
 from host.storage.session_writer import SessionWriter               # noqa: E402
 from host.trial.state_machine import TrialStateMachine              # noqa: E402
+from host.replay.session_replay import (                            # noqa: E402
+    ReplayController, read_session_events, NoReplayEventsError, TrialNotFoundError,
+)
 
 THRESHOLDS_PATH = ROOT_DIR / "config" / "quality_thresholds.json"
 LAST_SESSION_PATH = ROOT_DIR / "config" / "last_session.json"
@@ -246,6 +249,15 @@ def handle_parsed_event(parsed):
     """
     if parsed.get("type") == "status" and parsed.get("dim"):
         current_resolution["dim"] = parsed["dim"]
+
+    if parsed.get("type") in ("tof", "mic", "mel") and replay_is_active():
+        # The disaster the story names explicitly: two data streams
+        # interleaved on one channel, with no way for the panel to tell
+        # which frame came from where. Device state (status/heartbeat) still
+        # gets through -- it is not replayed, and hiding it would make the
+        # link look dead during a replay.
+        return
+
     observe_for_quality(parsed)
     sse = to_sse_event(parsed)
     if sse:
@@ -363,7 +375,8 @@ def _json_safe(obj):
 # write into the working tree: `sessions/*.h5` and `config/last_session.json`
 # are real runtime artefacts, and a test that leaves them behind shows up as
 # repo changes nobody made on purpose.
-runtime_paths = {"sessions": ROOT_DIR / "sessions", "last_session": LAST_SESSION_PATH}
+runtime_paths = {"sessions": ROOT_DIR / "sessions", "last_session": LAST_SESSION_PATH,
+                 "verification": ROOT_DIR / "reports" / "verification"}
 
 # What this link is actually connected to (CONTRACTS #4.2). Declared on the
 # command line, never inferred: a pty from T04's synthetic device and a pty
@@ -394,6 +407,24 @@ session_lock = threading.Lock()
 # 30 seconds" ends. Host time will not do: the two clocks drift, which is
 # the whole reason B04 exists.
 device_clock = {"last_t_us": None}
+
+# What the host last *told* the sensors to do. Not what they confirmed: a
+# $STATUS carries mel= and amb= but no sens_a=/sens_b=, so the device never
+# says whether a sensor is actually ranging. Everything downstream is handed
+# `sensors_enabled_confirmed=False` alongside it so nobody can mistake the
+# command for the fact.
+device_sensor_state = {"A": True, "B": True}
+
+
+def sensors_enabled_string():
+    """"AB" | "A" | "B", or None when neither is enabled.
+
+    None rather than "" because the schema validates the value domain, and
+    "no sensors" is not a configuration anyone records against -- it means
+    the field should be absent rather than present and meaningless.
+    """
+    on = [k for k in ("A", "B") if device_sensor_state.get(k)]
+    return "".join(on) if on else None
 
 
 def manifest_path():
@@ -648,6 +679,14 @@ def build_session_meta_base(info, tof_t_us):
         # starts working with no change on this side.
         "source": link_source["value"],
     }
+    enabled = sensors_enabled_string()
+    if enabled:
+        # D10's crosstalk experiment pairs a "one sensor" recording with a
+        # "both sensors" one; without this field run_all can never match
+        # them up and C0 stays SKIPPED forever. The confirmed flag is
+        # deliberately False -- see device_sensor_state.
+        meta["sensors_enabled"] = enabled
+        meta["sensors_enabled_confirmed"] = False
     meta.update(_clock_meta())
     if meta["session_start_device_us"] == -1:
         # No usable PING burst. Fall back to the first buffered frame's own
@@ -789,6 +828,213 @@ def trial_ticker(interval=0.05):
             print(f"[bridge] trial tick failed: {exc}")
             continue
         publish_trial_events(events)
+
+
+# --- B17: session replay --------------------------------------------------
+
+replay_state = {"controller": None, "file": None}
+replay_lock = threading.Lock()
+
+
+def replay_is_active():
+    controller = replay_state["controller"]
+    return controller is not None and controller.is_active
+
+
+def resolve_session_file(raw):
+    """Contain a requested replay path inside the sessions directory.
+
+    Same resolve-then-contain as the panel's static route, and for the same
+    reason: this is a path from an HTTP query string, and `..` in it would
+    otherwise read any file the process can reach.
+    """
+    root = sessions_dir().resolve()
+    try:
+        path = Path(raw)
+        path = (path if path.is_absolute() else root / path).resolve()
+        path.relative_to(root)
+    except (ValueError, OSError):
+        return None
+    return path if path.is_file() else None
+
+
+# -- B19/C23: /verify/* —— 背景跑 D15 的驗證套件 ---------------------------
+
+def verify_dir():
+    """驗證報告的輸出根目錄。**可由 `--verification-dir` 覆蓋。**
+
+    跟 `sessions_dir()` 同一個理由：寫死成 repo 底下的路徑，測試跑一次就
+    把報告留在工作樹裡（`Rig` 已經為了同樣的問題把 sessions 與
+    last_session 沙箱化了）。
+    """
+    d = Path(runtime_paths["verification"])
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+# 一次只能跑一輪。沿用 `flashing` 的慣例：衝突回 409，不排隊。
+# 排隊在這裡沒有意義——第二個請求想要的是「用現在的資料重跑」，
+# 而它排到的時候資料已經被前一輪讀完了。
+verify_lock = threading.Lock()
+verify_state = {
+    "running": False,
+    "run_id": None,
+    "started_at": None,       # ISO 字串
+    "started_monotonic": None,
+    # ⚠️ 跑到一半時**不清空**：使用者在等新結果的期間，畫面上該繼續顯示
+    # 上一次的結論，而不是變成一片空白（那看起來像「結果不見了」）。
+    "last_run": None,
+    "last_error": None,
+}
+
+
+def verify_status():
+    """`GET /verify/state` 的內容。一律 200——「沒有在跑」不是錯誤。"""
+    with verify_lock:
+        elapsed = None
+        if verify_state["running"] and verify_state["started_monotonic"] is not None:
+            elapsed = time.monotonic() - verify_state["started_monotonic"]
+        return {
+            "type": "verify_state",
+            "running": verify_state["running"],
+            "run_id": verify_state["run_id"],
+            "started_at": verify_state["started_at"],
+            "elapsed_s": round(elapsed, 1) if elapsed is not None else None,
+            "last_run": verify_state["last_run"],
+            "last_error": verify_state["last_error"],
+        }
+
+
+def serialize_verify_report(report, run_id, out_dir, elapsed_s):
+    """把 `D15` 的報告轉成前端吃得下的 JSON。
+
+    🔴 **三種狀態（`fail` / `skipped` / `error`）原樣傳出去，不在這裡合併。**
+    它們的意思完全不同——`fail` 是「跑了沒達標」（一個結果）、`skipped` 是
+    「資料不足」（一個缺口）、`error` 是「程式炸了」（一個 bug）。序列化層
+    把它們併成「不 OK」，前端就再也分不出來，而使用者會把缺口讀成失敗。
+    """
+    return {
+        "run_id": run_id,
+        "out_dir": str(out_dir),
+        "finished_at": datetime.now().isoformat(),
+        "elapsed_s": round(elapsed_s, 1),
+        "is_synthetic": report["is_synthetic"],
+        "session_paths": report["session_paths"],
+        "matrix": report["matrix"],
+        "outcomes": [o.to_dict() for o in report["outcomes"]],
+        "inconsistencies": report["inconsistencies"],
+        "limitations": report["limitations"],
+        "blocking": [o.key for o in report["blocking"]],
+        "counts": {
+            "failed": len(report["failed"]),
+            "skipped": len(report["skipped"]),
+            "errored": len(report["errored"]),
+        },
+    }
+
+
+def run_verification(session_paths, *, fast, real, ablation_permutations):
+    """背景執行緒：跑一輪驗證並寫出報告。
+
+    **直接 import 呼叫 `analysis.run_all`，不 shell 出去跑 CLI**——
+    subprocess 會讓例外變成一串 stderr 文字，而這裡要能把
+    `ExperimentOutcome` 原樣交給前端。
+    """
+    from analysis import run_all as verifier
+    from analysis.reporting import session_loader
+    from analysis.reporting.verification_report import build_report
+
+    run_id = verify_state["run_id"]
+    out_dir = verify_dir() / run_id
+    started = time.monotonic()
+    error = None
+    payload = None
+    try:
+        sessions = [session_loader.load_session(p) for p in session_paths]
+        verifier.apply_style()
+        outcomes, extras, notes, side_reports = verifier.run_experiments(
+            sessions, fast=fast, is_synthetic=not real,
+            ablation_permutations=ablation_permutations)
+        elapsed = time.monotonic() - started
+        report = build_report(outcomes, is_synthetic=not real, extras=extras,
+                              session_paths=[s.path for s in sessions],
+                              elapsed_s=elapsed)
+        verifier.write_outputs(report, out_dir, notes, side_reports)
+        payload = serialize_verify_report(report, run_id, out_dir, elapsed)
+    except Exception as exc:                     # noqa: BLE001 — 背景執行緒
+        # 背景執行緒的例外沒有人接。不抓的話這一輪會靜靜地永遠停在
+        # `running=True`，而畫面上只會看到秒數一直加上去。
+        error = f"{type(exc).__name__}: {exc}"
+        print(f"[bridge] /verify/run 失敗: {error}", file=sys.stderr)
+        traceback.print_exc()
+    finally:
+        with verify_lock:
+            verify_state["running"] = False
+            verify_state["started_monotonic"] = None
+            verify_state["last_error"] = error
+            if payload is not None:
+                verify_state["last_run"] = payload
+        broadcaster.publish(verify_status())
+
+
+def list_verify_runs():
+    """歷史報告，新到舊。
+
+    每一輪寫進 `reports/verification/<run_id>/`（時間戳）而不是固定目錄——
+    **固定目錄的話 `C23` 的「並排比較兩份」永遠只有一份**，而「這次調整有
+    沒有變好」正是這個工具存在的理由。
+    """
+    root = verify_dir()
+    runs = []
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        summary = entry / "summary.md"
+        runs.append({
+            "run_id": entry.name,
+            "modified_at": datetime.fromtimestamp(entry.stat().st_mtime).isoformat(),
+            "has_summary": summary.is_file(),
+            "files": sorted(f.name for f in entry.iterdir() if f.is_file()),
+        })
+    return sorted(runs, key=lambda r: r["run_id"], reverse=True)
+
+
+def replay_poller(interval=0.02):
+    """Publishes due replay events. Mirrors trial_ticker: the controller has
+    no timer of its own, so something has to drive it."""
+    while True:
+        time.sleep(interval)
+        with replay_lock:
+            controller = replay_state["controller"]
+            if controller is None:
+                continue
+            try:
+                # No `now` argument: the controller anchors on its own
+                # monotonic clock. Handing it a timestamp from a different
+                # clock is exactly how the B04/B05 alignment ended up with a
+                # slope of 5.9e7 -- not repeating that here.
+                due = controller.poll()
+            except Exception as exc:
+                print(f"[bridge] replay poll failed: {exc}")
+                continue
+        for event in due:
+            broadcaster.publish(event)
+
+
+def replay_status():
+    controller = replay_state["controller"]
+    if controller is None:
+        return {"type": "replay", "state": "idle", "active": False}
+    return {
+        "type": "replay",
+        "state": "finished" if controller.finished else
+                 ("paused" if controller.paused else "playing"),
+        "active": controller.is_active,
+        "file": replay_state["file"],
+        "speed": controller.speed,
+        "paused": controller.paused,
+        "finished": controller.finished,
+        "current_trial_idx": controller.current_trial_idx,
+    }
 
 
 # --- B09 / B11 seams -------------------------------------------------------
@@ -1112,6 +1358,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_pca()
         elif self.path.startswith("/config/"):
             self._handle_config()
+        elif self.path.startswith("/replay/sessions"):
+            self._handle_replay_sessions()
+        elif self.path.startswith("/replay/state"):
+            self._send_json(200, replay_status())
+        elif self.path.startswith("/verify/state"):
+            self._send_json(200, verify_status())
+        # ⚠️ 順序有意義：`/verify/reports/<id>/<path>` 必須比
+        # `/verify/reports` 先比對，否則列表那條會把靜態檔的請求吃掉。
+        elif self.path.startswith("/verify/reports/"):
+            self._serve_verify_asset()
+        elif self.path.startswith("/verify/reports"):
+            self._send_json(200, list_verify_runs())
         elif self.path == "/" or self.path.startswith("/panel/"):
             self._serve_panel_asset()
         elif self.path == "/panel.html":
@@ -1137,8 +1395,238 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_session_baseline()
         elif self.path.startswith("/trial/"):
             self._handle_trial()
+        elif self.path.startswith("/replay/"):
+            self._handle_replay()
+        elif self.path.startswith("/verify/run"):
+            self._handle_verify_run()
         else:
             self.send_error(404)
+
+    # -- B19/C23: /verify/* -------------------------------------------------
+
+    _VERIFY_MIME = {
+        ".md": "text/markdown; charset=utf-8",
+        ".html": "text/html; charset=utf-8",
+        ".png": "image/png",
+        ".pdf": "application/pdf",
+        ".svg": "image/svg+xml",
+        ".json": "application/json; charset=utf-8",
+        ".txt": "text/plain; charset=utf-8",
+    }
+
+    def _handle_verify_run(self):
+        """`POST /verify/run` —— 202 立刻回，背景跑。
+
+        跑一輪要幾秒到兩分鐘。同步跑會讓 HTTP 連線掛在那裡、瀏覽器逾時，
+        而且第二個請求會排在後面看起來像當掉。
+        """
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        sessions = body.get("sessions")
+        if not isinstance(sessions, list) or not sessions:
+            self._send_json(400, {"error": "sessions 必須是非空的陣列"})
+            return
+
+        resolved = []
+        for raw in sessions:
+            path = resolve_session_file(str(raw))
+            if path is None:
+                # 同一套 resolve-then-contain：這是 HTTP body 裡的路徑，
+                # 裡面的 `..` 會讀到這個 process 摸得到的任何檔案。
+                self._send_json(400, {"error": f"找不到或不允許的 session: {raw}"})
+                return
+            resolved.append(path)
+
+        try:
+            permutations = int(body.get("ablation_permutations", 200))
+        except (TypeError, ValueError):
+            self._send_json(400, {"error": "ablation_permutations 必須是整數"})
+            return
+        if permutations < 0:
+            self._send_json(400, {"error": "ablation_permutations 不可為負"})
+            return
+
+        with verify_lock:
+            if verify_state["running"]:
+                self._send_json(409, {
+                    "error": "已經有一輪驗證在跑",
+                    "run_id": verify_state["run_id"],
+                    "started_at": verify_state["started_at"],
+                })
+                return
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            verify_state.update({
+                "running": True,
+                "run_id": run_id,
+                "started_at": datetime.now().isoformat(),
+                "started_monotonic": time.monotonic(),
+                "last_error": None,
+                # `last_run` 刻意不動——見 `verify_state` 的註解。
+            })
+
+        threading.Thread(
+            target=run_verification,
+            args=([str(p) for p in resolved],),
+            kwargs={
+                "fast": bool(body.get("fast", False)),
+                "real": bool(body.get("real", False)),
+                "ablation_permutations": permutations,
+            },
+            daemon=True,
+        ).start()
+
+        broadcaster.publish(verify_status())
+        self._send_json(202, {
+            "run_id": run_id,
+            "sessions": [str(p) for p in resolved],
+            # 前端要能顯示「這一輪是用什麼參數跑的」——尤其
+            # `ablation_permutations`：預設 200 是為了快，正式報告要 1000。
+            "fast": bool(body.get("fast", False)),
+            "real": bool(body.get("real", False)),
+            "ablation_permutations": permutations,
+        })
+
+    def _serve_verify_asset(self):
+        """`GET /verify/reports/<run_id>/<path>` —— 唯讀靜態服務。"""
+        rel = unquote(self.path[len("/verify/reports/"):])
+        rel = rel.split("?", 1)[0].split("#", 1)[0]
+        if not rel or rel.endswith("/"):
+            self.send_error(404)
+            return
+
+        # 同 `_serve_panel_asset()` 的 resolve-then-contain：報告目錄底下
+        # 有真的子目錄（`figures/`），所以不能用「只取檔名」那種擋法。
+        try:
+            root = verify_dir().resolve()
+            path = (root / rel).resolve()
+            path.relative_to(root)
+        except (ValueError, OSError):
+            self.send_error(403)
+            return
+        if not path.is_file():
+            self.send_error(404)
+            return
+
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", self._VERIFY_MIME.get(
+            path.suffix.lower(), "application/octet-stream"))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # -- B17: replay --------------------------------------------------------
+
+    def _handle_replay_sessions(self):
+        """List what can be replayed, newest first."""
+        try:
+            files = sorted(sessions_dir().glob("*.h5"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError as exc:
+            self._send_json(500, {"error": str(exc)})
+            return
+        self._send_json(200, [
+            {"file": f.name, "path": str(f),
+             "bytes": f.stat().st_size,
+             "modified_at": datetime.fromtimestamp(f.stat().st_mtime).isoformat()}
+            for f in files
+        ])
+
+    def _handle_replay(self):
+        action = self.path[len("/replay/"):].split("?", 1)[0].strip("/")
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+
+        if action == "start":
+            return self._handle_replay_start(query)
+
+        with replay_lock:
+            controller = replay_state["controller"]
+            if controller is None:
+                self._send_json(409, {"error": "沒有進行中的回放"})
+                return
+            try:
+                extra = self._apply_replay_action(controller, action, query)
+            except LookupError:
+                self._send_json(404, {"error": f"未知的 replay 動作: {action}"})
+                return
+            except (ValueError, TrialNotFoundError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            status = replay_status()
+        if extra:
+            status.update(extra)
+        broadcaster.publish(status)
+        self._send_json(200, status)
+
+    def _apply_replay_action(self, controller, action, query):
+        if action == "control":
+            m = re.search(r"action=(\w+)", query)
+            sub = m.group(1) if m else ""
+            if sub == "pause":
+                controller.pause()
+            elif sub == "resume":
+                controller.resume()
+            elif sub == "step":
+                event = controller.step()
+                if event:
+                    broadcaster.publish(event)
+                return {"stepped": event is not None}
+            else:
+                raise ValueError("action 必須是 pause|resume|step")
+            return None
+        if action == "speed":
+            m = re.search(r"value=([\d.]+)", query)
+            if not m:
+                raise ValueError("speed 需要 value 參數")
+            controller.set_speed(float(m.group(1)))
+            return None
+        if action == "seek":
+            m = re.search(r"trial=(\d+)", query)
+            if not m:
+                raise ValueError("seek 需要 trial 參數")
+            controller.seek_to_trial(int(m.group(1)))
+            return None
+        if action == "stop":
+            replay_state["controller"] = None
+            replay_state["file"] = None
+            return None
+        raise LookupError(action)
+
+    def _handle_replay_start(self, query):
+        m = re.search(r"file=([^&]+)", query)
+        if not m:
+            self._send_json(400, {"error": "start 需要 file 參數"})
+            return
+        raw = unquote(m.group(1))
+        path = resolve_session_file(raw)
+        if path is None:
+            # Deliberately the same answer for "outside the sessions
+            # directory" and "does not exist": a different message for each
+            # would let a caller probe the filesystem.
+            self._send_json(404, {"error": f"找不到可回放的 session: {raw}"})
+            return
+
+        m = re.search(r"start_trial=(\d+)", query)
+        start_trial = int(m.group(1)) if m else 0
+        try:
+            events = read_session_events(path, start_trial)
+            controller = ReplayController(events)
+        except NoReplayEventsError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._send_json(400, {"error": f"讀取失敗: {exc}"})
+            return
+
+        with replay_lock:
+            replay_state["controller"] = controller
+            replay_state["file"] = str(path)
+            status = replay_status()
+        status["n_events"] = len(events)
+        broadcaster.publish(status)
+        self._send_json(200, status)
 
     # -- B11 / B12: trials ------------------------------------------------
 
@@ -1165,7 +1653,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._send_json(409, {"error": err})
                     return
 
-        body = self._read_json_body() if action in ("start", "hold/start") else {}
+        body = self._read_json_body() if action in ("start", "hold/start", "reject") else {}
         if body is None:
             return
 
@@ -1229,6 +1717,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return as_trial_events(machine.abort())   # skips this word
         if action == "redo":
             return as_trial_events(machine.redo())    # keeps the same word
+        if action == "reject":
+            # A different layer from abort/discard: those act on a trial that
+            # is still in memory, this one on a trial already written to
+            # HDF5. Rejecting does NOT delete it -- the data stays and only
+            # the quality attr changes, because D12's cross-validation needs
+            # to know how many attempts went wrong during a given wear.
+            idx = body.get("trial_idx")
+            if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
+                raise ValueError("reject 需要一個非負整數 trial_idx")
+            machine.mark_current_trial_saved_quality(
+                session_runtime["h5_path"], idx, "rejected")
+            return [{"state": machine.state.value, "rejected_trial_idx": idx}]
         raise LookupError(action)
 
     # -- B09: session lifecycle -----------------------------------------
@@ -1575,6 +2075,11 @@ def main():
         "--sessions-dir", default=None,
         help="session HDF5 檔的輸出目錄（預設 <repo>/sessions）")
     parser.add_argument(
+        "--verification-dir", default=None,
+        help="/verify/run 的報告輸出根目錄（預設 <repo>/reports/verification）。"
+             "每一輪寫進底下的 <run_id>/ 子目錄——固定成同一個目錄的話，"
+             "C23 的「並排比較兩份」永遠只有一份")
+    parser.add_argument(
         "--last-session", default=None,
         help="表單預填用的 last_session.json 路徑（預設 config/last_session.json）")
     parser.add_argument(
@@ -1599,6 +2104,8 @@ def main():
     global session_registry
     if args.sessions_dir:
         runtime_paths["sessions"] = Path(args.sessions_dir)
+    if args.verification_dir:
+        runtime_paths["verification"] = Path(args.verification_dir)
     if args.last_session:
         runtime_paths["last_session"] = Path(args.last_session)
         session_registry = SessionRegistry(runtime_paths["last_session"])
@@ -1611,6 +2118,7 @@ def main():
     # when something breaks is useless exactly when it is needed.
     threading.Thread(target=quality_emitter, daemon=True).start()
     threading.Thread(target=trial_ticker, daemon=True).start()
+    threading.Thread(target=replay_poller, daemon=True).start()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.http_port), Handler)
     server.serial_port = args.port

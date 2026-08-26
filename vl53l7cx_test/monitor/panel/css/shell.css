@@ -59,7 +59,7 @@
   background: transparent;
   color: var(--text-dim);
   font-family: inherit;
-  font-size: 13px;
+  font-size: 0.8125rem;
   font-weight: 600;
   text-align: left;
   cursor: pointer;
@@ -77,7 +77,7 @@
 
 .mode-nav-item .mode-key {
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 0.6875rem;
 }
 
 .mode-nav-item.active {
@@ -97,7 +97,7 @@
   background: transparent;
   color: var(--text-dim);
   font-family: inherit;
-  font-size: 13px;
+  font-size: 0.8125rem;
   font-weight: 600;
   text-align: left;
   cursor: pointer;
@@ -115,7 +115,16 @@
 
 .collapse-toggle .mode-key {
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 0.6875rem;
+}
+
+/* --- C25: projector mode toggle --- */
+.projector-toggle.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.projector-toggle.active .mode-key {
+  color: var(--accent);
 }
 
 .main-content {
@@ -151,7 +160,7 @@
    sidebar (C04.md: "紅燈時視覺上無法忽略") -- a colored dot alone is easy
    to not notice while looking at the main content area. */
 .sidebar.status-alert {
-  box-shadow: inset 0 0 0 2px var(--warn);
+  box-shadow: inset 0 0 0 2px var(--status-bad);
 }
 
 /* Replay must look nothing like a live, healthy connection (CONTRACTS.md
@@ -159,12 +168,12 @@
    red alert ring too -- while replaying, "is live data red right now"
    isn't the relevant question. */
 .sidebar.status-replay {
-  box-shadow: inset 0 0 0 2px var(--accent);
-  background: linear-gradient(180deg, var(--accent-soft), var(--surface) 40%);
+  box-shadow: inset 0 0 0 2px var(--status-warn);
+  background: linear-gradient(180deg, var(--status-warn-soft), var(--surface) 40%);
 }
 
 .sidebar.status-reflashing {
-  box-shadow: inset 0 0 0 2px var(--accent);
+  box-shadow: inset 0 0 0 2px var(--status-warn);
 }
 
 .status-connection {
@@ -180,28 +189,28 @@
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--warn);
+  background: var(--status-bad);
   flex-shrink: 0;
 }
-.link-dot.up { background: var(--good); }
+.link-dot.up { background: var(--status-good); }
 
 .status-conn-text {
-  font-size: 12px;
+  font-size: 0.75rem;
   font-weight: 600;
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.status-conn-text.down { color: var(--warn); }
-.status-conn-text.proto-warn { color: var(--warn); }
-.status-conn-text.replay { color: var(--accent); }
-.status-conn-text.reflashing { color: var(--accent); }
+.status-conn-text.down { color: var(--status-bad); }
+.status-conn-text.proto-warn { color: var(--status-bad); }
+.status-conn-text.replay { color: var(--status-warn); }
+.status-conn-text.reflashing { color: var(--status-warn); }
 
 .status-warning {
-  font-size: 11px;
-  color: var(--warn);
-  background: var(--warn-soft);
+  font-size: 0.6875rem;
+  color: var(--status-bad);
+  background: var(--status-bad-soft);
   padding: 6px 16px;
   line-height: 1.4;
 }
@@ -226,11 +235,11 @@
   display: flex;
   justify-content: space-between;
   align-items: baseline;
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 .status-summary-label { color: var(--text-dim); }
 .status-summary-value { color: var(--text); }
-.status-summary-fps { color: var(--text-dim); font-size: 11px; }
+.status-summary-fps { color: var(--text-dim); font-size: 0.6875rem; }
 
 .sidebar.collapsed .status-conn-text,
 .sidebar.collapsed .status-warning,

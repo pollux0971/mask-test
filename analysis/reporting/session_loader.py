@@ -47,6 +47,10 @@ class Trial:
     tof_t_us: np.ndarray
     mic_rms: np.ndarray
     mel: Optional[np.ndarray]    # (F, 40) 或 None（選填）
+    # §2 選填：`tof_ambient_A/B` 是 (Ta, Z)，無效 zone 已經是 NaN。
+    # `D10` 明訂 ambient 是 crosstalk 最靈敏的指標。
+    ambient_a: Optional[np.ndarray] = None
+    ambient_b: Optional[np.ndarray] = None
     attrs: dict = field(default_factory=dict)
 
     @property
@@ -63,6 +67,32 @@ class SessionData:
     trials: List[Trial]
 
     @property
+    def sensors_enabled(self):
+        """`"AB"` / `"A"` / `"B"`，或 `None`（舊檔沒有這個欄位）。
+
+        ⚠️ **`None` 是「未知」，不是 `"AB"`。** 猜 `AB` 會讓舊資料被錯誤配對
+        進 `C0` 的串擾比較，而**結果看起來完全正常**——串擾的訊號本來就小，
+        一組配錯的資料只會讓 Δ 看起來偏大或偏小，不會有任何跡象。
+        """
+        value = self.meta.get("sensors_enabled")
+        if value is None:
+            return None
+        value = str(value).strip().upper()
+        return value if value in ("AB", "A", "B") else None
+
+    @property
+    def sensors_confirmed(self):
+        """感測器狀態是否經裝置確認過。**幾乎永遠是 `False`，而且那是刻意的。**
+
+        `$STATUS` 有 `mel=`/`amb=` 但**沒有** `sens_a=`/`sens_b=`，所以
+        `sensors_enabled` 的值是**主機端記的上次指令**，不是裝置回報的狀態
+        （§4.1.2）。寫入端刻意寫死 `False` 來逼下游不能忽略這件事。
+
+        欄位不存在時回 `False`——**「沒寫」不能當成「確認過」**。
+        """
+        return bool(self.meta.get("sensors_enabled_confirmed", False))
+
+    @property
     def wear_ids(self):
         ids = {t.wear_id for t in self.trials if t.wear_id is not None}
         if self.meta.get("wear_id") is not None:
@@ -72,6 +102,32 @@ class SessionData:
     @property
     def labels(self):
         return sorted({t.label for t in self.trials if t.label})
+
+    def stacked_tof(self, sensor="A"):
+        """整個 session 所有 trial 的 ToF 串起來，回 `(distance, valid)`。
+
+        `D10` 比的是**兩次錄製**的平均，不是逐筆 trial——crosstalk 是持續
+        存在的干擾，不是某一個詞的性質。只取距離通道（前半）。
+        """
+        attr = "tof_a" if sensor == "A" else "tof_b"
+        valid_attr = "tof_valid_a" if sensor == "A" else "tof_valid_b"
+        blocks, valids = [], []
+        for trial in self.trials:
+            data = getattr(trial, attr)
+            if data.size == 0:
+                continue
+            blocks.append(data[:, :trial.n_zones])
+            valids.append(getattr(trial, valid_attr))
+        if not blocks:
+            return None, None
+        return np.concatenate(blocks, axis=0), np.concatenate(valids, axis=0)
+
+    def stacked_ambient(self, sensor="A"):
+        """整個 session 的 ambient 串起來，或 `None`（§2 選填欄位）。"""
+        attr = "ambient_a" if sensor == "A" else "ambient_b"
+        blocks = [getattr(t, attr) for t in self.trials
+                  if getattr(t, attr) is not None and getattr(t, attr).size]
+        return np.concatenate(blocks, axis=0) if blocks else None
 
     def baseline(self, sensor="A"):
         """`(mu, sigma)`，各 (2Z,)。缺任一個就回 `(None, None)`——**不補值**，
@@ -124,6 +180,10 @@ def load_session(path):
                 mic_rms=np.asarray(group["mic_rms"], dtype=np.float64),
                 mel=(np.asarray(group["mel"], dtype=np.float64)
                      if "mel" in group else None),
+                ambient_a=(np.asarray(group["tof_ambient_A"], dtype=np.float64)
+                           if "tof_ambient_A" in group else None),
+                ambient_b=(np.asarray(group["tof_ambient_B"], dtype=np.float64)
+                           if "tof_ambient_B" in group else None),
                 attrs=attrs,
             ))
 
@@ -155,6 +215,124 @@ def usable_trials(sessions, *, require_quality=("ok", "low")):
     return result
 
 
+@dataclass
+class CrosstalkPair:
+    """`C0` 串擾實驗要的一組對照：同一次戴上、一顆開 vs 兩顆開。"""
+
+    wear_id: Optional[int]
+    solo: SessionData          # sensors_enabled 是 "A" 或 "B"
+    dual: SessionData          # sensors_enabled 是 "AB"
+    confirmed: bool            # 兩邊的感測器狀態是否都經裝置確認過
+
+    @property
+    def solo_sensor(self):
+        return self.solo.sensors_enabled
+
+    def to_dict(self) -> dict:
+        return {
+            "wear_id": self.wear_id,
+            "solo_path": str(self.solo.path),
+            "dual_path": str(self.dual.path),
+            "solo_sensor": self.solo_sensor,
+            "confirmed": self.confirmed,
+        }
+
+
+def crosstalk_pairs(sessions):
+    """從一批 session 裡配出 `C0` 需要的 (solo, dual) 組合。
+
+    回傳 `(pairs, diagnosis)`。`diagnosis` 是一份**數得出來的**盤點，配不到
+    時要靠它才知道該補錄什麼——「資料不足」這種訊息幫不上任何忙。
+
+    ## 🔴 兩邊必須是同一個 `wear_id`
+
+    跨次戴的兩組資料拿來比 crosstalk，會把**戴法差異**算成**串擾**。
+    串擾的訊號本身就小（門檻是 2 mm），而重新戴一次造成的距離差可以輕易
+    超過它——**配錯的結果看起來完全正常，只是 Δ 偏大**，沒有任何跡象。
+
+    （`D12` 那邊有同構的教訓：跨詞的距離量的是「不同的詞長得不一樣」，
+    跟戴法重複性無關。）
+
+    ## `confirmed=False` 不擋，但要傳下去
+
+    `sensors_enabled` 是主機端記的指令、不是裝置確認的狀態（§4.1.2），
+    所以 `sensors_enabled_confirmed` 幾乎永遠是 `False`。**因此不能拿它當
+    配對條件**——那會讓 `C0` 永遠跑不了。但也**不能靜默忽略**：旗標會跟著
+    `CrosstalkPair` 傳到報告，讓讀的人知道這組配對建立在未經確認的狀態上。
+    """
+    by_wear = {}
+    counts = {"AB": 0, "A": 0, "B": 0, "unknown": 0}
+    for session in sessions:
+        state = session.sensors_enabled
+        counts[state if state else "unknown"] += 1
+        if state is None:
+            continue
+        # 用 `/meta` 的 wear_id；沒有就用 trial 的（同一個 session 內應該一致）
+        wear_id = _opt_int(session.meta.get("wear_id"))
+        if wear_id is None:
+            ids = session.wear_ids
+            wear_id = ids[0] if len(ids) == 1 else None
+        by_wear.setdefault(wear_id, {"AB": [], "solo": []})
+        by_wear[wear_id]["AB" if state == "AB" else "solo"].append(session)
+
+    pairs = []
+    for wear_id, groups in sorted(by_wear.items(), key=lambda kv: (kv[0] is None, kv[0])):
+        if wear_id is None:
+            # wear_id 不明的 session 不配對：無法確認「同一次戴上」這個前提。
+            continue
+        for dual in groups["AB"]:
+            for solo in groups["solo"]:
+                pairs.append(CrosstalkPair(
+                    wear_id=wear_id, solo=solo, dual=dual,
+                    confirmed=solo.sensors_confirmed and dual.sensors_confirmed,
+                ))
+
+    diagnosis = {
+        "n_sessions": len(sessions),
+        "counts": counts,
+        "n_pairs": len(pairs),
+        "wear_ids_with_dual": sorted(w for w, g in by_wear.items()
+                                     if w is not None and g["AB"]),
+        "wear_ids_with_solo": sorted(w for w, g in by_wear.items()
+                                     if w is not None and g["solo"]),
+        "unpaired_wear_ids": sorted(
+            w for w, g in by_wear.items()
+            if w is not None and bool(g["AB"]) != bool(g["solo"])),
+        "any_unconfirmed": any(not p.confirmed for p in pairs),
+    }
+    return pairs, diagnosis
+
+
+def describe_crosstalk_gap(diagnosis) -> str:
+    """配不到時，講清楚**現在有什麼、還缺什麼**。
+
+    「資料不足」幫不上任何忙——使用者要的是「我該補錄什麼」。
+    """
+    counts = diagnosis["counts"]
+    parts = [
+        f"共 {diagnosis['n_sessions']} 個 session："
+        f"兩顆都開（AB）{counts['AB']} 個、"
+        f"只開一顆（A/B）{counts['A'] + counts['B']} 個、"
+        f"沒有 sensors_enabled 欄位（未知）{counts['unknown']} 個"
+    ]
+    if counts["unknown"]:
+        parts.append(
+            f"⚠️ 那 {counts['unknown']} 個舊檔**不會被當成「兩顆都開」**——"
+            "猜錯的話串擾結果會看起來完全正常但其實是錯的"
+        )
+    if diagnosis["unpaired_wear_ids"]:
+        parts.append(
+            f"wear_id {diagnosis['unpaired_wear_ids']} 只有其中一種組態，"
+            "**同一次戴上要各錄一次**（solo 與 dual）才配得起來"
+        )
+    if not diagnosis["n_pairs"]:
+        parts.append(
+            "尚無可用配對。請在**同一次戴上**分兩段錄："
+            "一段 `SENS:B=0`（只開 A）、一段兩顆都開"
+        )
+    return "；".join(parts) + "。"
+
+
 def availability(sessions):
     """哪些實驗跑得動、跑不動的原因是什麼。
 
@@ -170,13 +348,9 @@ def availability(sessions):
 
     missing = {}
 
-    # C0 串擾：需要「單顆開」與「兩顆開」兩種擷取組態的錄製。session schema
-    # 沒有記錄「這次錄的時候另一顆是開還是關」，所以單靠 session 檔判斷不了。
-    missing["C0"] = (
-        "串擾實驗需要「只開一顆」與「兩顆同時開」的兩次錄製對照；"
-        "§2 的 session schema 沒有記錄擷取時另一顆感測器的開關狀態，"
-        "無法從 session 檔判斷。請用 `exp_d10_crosstalk` 的專用流程單獨執行。"
-    )
+    # C0 串擾：靠 `/meta` 的 `sensors_enabled`（§2）配對 solo/dual。
+    pairs, crosstalk_diagnosis = crosstalk_pairs(sessions)
+    missing["C0"] = None if pairs else describe_crosstalk_gap(crosstalk_diagnosis)
 
     if not has_baseline:
         for key in ("A", "C", "E"):

@@ -118,6 +118,40 @@ function zscoreColorRgb(z) {
   return lerpRgb(Z_NEUTRAL, target, t);
 }
 
+// Per-zone mean/stdev across a set of frames (moved from monitor.js's C06
+// baseline capture). unstable/suspectZeroVariance/noSignal mirror B10's own
+// flags (B10.md: sigma > 2mm = unstable, ~0 = suspect, no valid samples =
+// no signal) so a zone flagged here and a zone flagged by a real B10
+// baseline mean the same thing on screen. frames: array of { dist, valid }
+// (same shape monitor.js's B10 baseline capture uses).
+export function computeZoneStats(frames, dim) {
+  const mu = new Array(dim).fill(NaN);
+  const sigma = new Array(dim).fill(NaN);
+  const unstable = [], suspectZeroVariance = [], noSignal = [];
+  for (let z = 0; z < dim; z++) {
+    const samples = [];
+    for (const f of frames) {
+      const validZone = f.valid ? f.valid[z] !== false : true;
+      const v = f.dist[z];
+      if (validZone && v != null && v >= 0) samples.push(v);
+    }
+    if (samples.length === 0) {
+      noSignal.push(z);
+      continue;
+    }
+    const m = samples.reduce((a, b) => a + b, 0) / samples.length;
+    const variance = samples.length > 1
+      ? samples.reduce((a, b) => a + (b - m) * (b - m), 0) / (samples.length - 1)
+      : 0;
+    const s = Math.sqrt(variance);
+    mu[z] = m;
+    sigma[z] = s;
+    if (s > 2.0) unstable.push(z);
+    else if (s < 0.05) suspectZeroVariance.push(z);
+  }
+  return { mu, sigma, unstable, suspectZeroVariance, noSignal };
+}
+
 // dValues: flat array (dim = side*side) of distance mm for one keyframe.
 // validArr: matching valid[] (optional -- falls back to the v<0 sentinel).
 // baseline: optional { mu, sigma, flags:{noSignal,suspectZeroVariance,unstable} }
@@ -171,6 +205,126 @@ export function drawTofKeyframeGrid(ctx, w, h, dValues, validArr, baseline) {
 // the same PCA (x,y) space, one per enrolled class. Pass null/omit when no
 // enrollment data exists yet (C10's pre-existing gap) -- this function
 // draws nothing extra in that case rather than fabricating a placeholder.
+// --- PCA fitting/projection math (moved from monitor.js's C10 work) ------
+//
+// Pure numeric functions, no DOM/canvas/dataStore coupling -- monitor.js's
+// live view uses these to periodically refit a stub model from a sliding
+// window of recent frames (see monitor.js's pcaBookkeeping/FIT_WINDOW_MS);
+// quiz.js's per-trial thumbnail (C19) does a single one-shot fit from
+// whatever ToF frames were captured for that trial instead of a periodic
+// refit, but needs the exact same fitting/projection math to be a genuine
+// "復用 C10" rather than a second, possibly-diverging implementation.
+export function vecSub(vec, mean) {
+  const out = new Array(vec.length);
+  for (let i = 0; i < vec.length; i++) out[i] = vec[i] - mean[i];
+  return out;
+}
+
+export function dot(a, b) {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+  return s;
+}
+
+function normalize(v) {
+  const n = Math.sqrt(dot(v, v)) || 1;
+  return v.map((x) => x / n);
+}
+
+function matVec(flatMat, n, v) {
+  const out = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    let s = 0;
+    const base = i * n;
+    for (let j = 0; j < n; j++) s += flatMat[base + j] * v[j];
+    out[i] = s;
+  }
+  return out;
+}
+
+// Top eigenvector/eigenvalue of a symmetric matrix via power iteration --
+// avoids needing a full eigendecomposition library for a 2-component PCA.
+function powerIteration(flatMat, n, iterations = 60) {
+  let v = normalize(Array.from({ length: n }, () => Math.random() - 0.5));
+  for (let it = 0; it < iterations; it++) {
+    v = normalize(Array.from(matVec(flatMat, n, v)));
+  }
+  const eigenvalue = dot(Array.from(matVec(flatMat, n, v)), v);
+  return { vector: v, eigenvalue };
+}
+
+// samples: array of same-length plain arrays. Returns a tof_only stub model.
+export function fitPCA2Stub(samples) {
+  const m = samples.length;
+  const n = samples[0].length;
+  const mean = new Array(n).fill(0);
+  for (const s of samples) for (let i = 0; i < n; i++) mean[i] += s[i];
+  for (let i = 0; i < n; i++) mean[i] /= m;
+
+  const cov = new Float64Array(n * n);
+  for (const s of samples) {
+    const c = vecSub(s, mean);
+    for (let i = 0; i < n; i++) {
+      const ci = c[i];
+      const base = i * n;
+      for (let j = 0; j < n; j++) cov[base + j] += ci * c[j];
+    }
+  }
+  for (let k = 0; k < cov.length; k++) cov[k] /= Math.max(1, m - 1);
+
+  const pc1 = powerIteration(cov, n);
+  const deflated = new Float64Array(n * n);
+  for (let i = 0; i < n; i++) {
+    const base = i * n;
+    for (let j = 0; j < n; j++) {
+      deflated[base + j] = cov[base + j] - pc1.eigenvalue * pc1.vector[i] * pc1.vector[j];
+    }
+  }
+  const pc2 = powerIteration(deflated, n);
+
+  let totalVariance = 0;
+  for (let i = 0; i < n; i++) totalVariance += cov[i * n + i];
+  totalVariance = totalVariance || 1e-9;
+
+  return {
+    mean,
+    components: [pc1.vector, pc2.vector],
+    dims: n,
+    source: "tof_only",
+    stub: true,
+    explainedVarianceRatio: [pc1.eigenvalue / totalVariance, pc2.eigenvalue / totalVariance],
+  };
+}
+
+export function projectPCA(model, vec) {
+  const c = vecSub(vec, model.mean);
+  return [dot(c, model.components[0]), dot(c, model.components[1])];
+}
+
+// source: "tof_only" | "enrollment". Returns null (not throw) both when the
+// endpoint genuinely doesn't exist yet (confirmed live, 404/204-no-body as
+// of C19) and on any network hiccup -- callers already have a stub-fit
+// fallback for "no real model yet", so this stays a plain null rather than
+// forcing every caller to add its own try/catch around a throwing fetch.
+export async function tryFetchServerPcaModel(source) {
+  try {
+    const res = await fetch(`/pca?model=${encodeURIComponent(source)}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json || !Array.isArray(json.mean) || !Array.isArray(json.components)) return null;
+    return {
+      mean: json.mean,
+      components: json.components,
+      dims: json.mean.length,
+      source: json.source || source,
+      stub: false,
+      explainedVarianceRatio: json.explained_variance_ratio || json.explainedVarianceRatio || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function drawPcaTrailStatic(ctx, w, h, trail, ellipses) {
   ctx.clearRect(0, 0, w, h);
   if (!trail || trail.length < 2) return;

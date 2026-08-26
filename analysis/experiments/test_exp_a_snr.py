@@ -18,6 +18,8 @@ from analysis.experiments.exp_a_snr import (
     zone_snr_grid,
 )
 from analysis.features.tof_features import active_zone_indices
+from analysis.reporting.plot_style import assert_grayscale_safe
+from analysis.reporting.text_checks import assert_english_only
 
 
 def test_zone_snr_known_case():
@@ -138,3 +140,15 @@ def test_plot_zone_snr_heatmaps_runs_and_assigns_correct_data():
     drawn_signal = heatmap_axes[1].get_images()[0].get_array()
     np.testing.assert_array_equal(np.asarray(drawn_distance), snr_distance.reshape(4, 4))
     np.testing.assert_array_equal(np.asarray(drawn_signal), snr_signal.reshape(4, 4))
+
+
+def test_plot_zone_snr_heatmaps_passes_d20_style_checks():
+    """D20：圖表文字一律英文 + 灰階下可辨讀（SNR 非負，SEQUENTIAL_CMAP 單調
+    亮度，兩者都該直接過，不需要 `diverging_opt_out`）。"""
+    snr_distance = np.arange(N_ZONES, dtype=float)
+    snr_signal = np.arange(N_ZONES, dtype=float)[::-1]
+
+    fig = plot_zone_snr_heatmaps(snr_distance, snr_signal, threshold=2.0)
+
+    assert_english_only(fig)
+    assert_grayscale_safe(fig)

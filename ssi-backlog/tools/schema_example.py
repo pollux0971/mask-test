@@ -68,13 +68,23 @@ def _example_meta() -> dict:
         "baseline_sigma_B": np.ones(TOF_VALUES_DIM, dtype=np.float32),
         "noise_floor_mu": 0.0,
         "noise_floor_sigma": 1.0,
+        # D15/C0：擷取當下哪幾顆感測器在 ranging。選填（見 session_writer.py
+        # 的 OPTIONAL_META_KEYS 說明），這裡示範「有給」的情況；
+        # sensors_enabled_confirmed 沒給就預設 False——這是主機端指令，
+        # 不是裝置確認過的狀態。
+        "sensors_enabled": "AB",
     }
 
 
 def _example_trial_kwargs(idx: int, *, with_optional: bool) -> dict:
-    """`with_optional=True`：`mel`/`audio`/`tof_ambient_*` 全部都在（形狀正確、
-    長度為 0）。`with_optional=False`：全部省略。這兩個 trial 涵蓋「全有」
-    與「全無」——選填欄位變多之後，這個對照組的意義沒有變。
+    """`with_optional=True`：`mel`/`audio`/`tof_ambient_*`/VAD 時間戳全部都在
+    （形狀正確、長度為 0；VAD 用示意用的整數）。`with_optional=False`：全部
+    省略——包含 VAD 的四個時間戳，`write_trial()` 預設值就是 `None`，不必
+    自己填 -1 假裝「沒偵測到」，那正是 CONTRACTS §2 明文禁止的做法
+    （§2.1 對 `tof_A`/`tof_B` 無效值、`OPTIONAL_VAD_TIMING_ATTRS` 對這四個
+    欄位，都是同一個原則：沒有就整個不寫，不能填一個看起來合理的數字）。
+    這兩個 trial 涵蓋「全有」與「全無」——選填欄位變多之後，這個對照組的
+    意義沒有變。
     """
     kwargs = dict(
         label="_reject",
@@ -87,7 +97,6 @@ def _example_trial_kwargs(idx: int, *, with_optional: bool) -> dict:
         mic_peak=np.zeros((0,), dtype=np.int16),
         mic_t_us=np.zeros((0,), dtype=np.int64),
         wear_id=0, mode="example", valid_zone_ratio=0.0, drop_count=0,
-        vad_start_us=-1, vad_end_us=-1, lip_onset_us=-1, voice_onset_us=-1,
         quality="ok",
     )
     if with_optional:
@@ -98,6 +107,12 @@ def _example_trial_kwargs(idx: int, *, with_optional: bool) -> dict:
         kwargs["tof_ambient_t_us"] = np.zeros((0,), dtype=np.int64)
         kwargs["audio"] = np.zeros((0,), dtype=np.int16)
         kwargs["audio_t0_us"] = 0
+        kwargs["vad_start_us"] = 0
+        kwargs["vad_end_us"] = 100
+        kwargs["lip_onset_us"] = 10
+        kwargs["voice_onset_us"] = 20
+        kwargs["speaking_mode"] = "normal"
+        kwargs["vad_confidence"] = 0.9
     return kwargs
 
 

@@ -13,6 +13,8 @@ from analysis.experiments.exp_d10_crosstalk import (
     zone_ambient_delta,
     zone_distance_delta,
 )
+from analysis.reporting.plot_style import assert_grayscale_safe
+from analysis.reporting.text_checks import assert_english_only
 
 
 def _synthetic_solo_dual_hdf5_arrays(rng, n_t=200, extra_bias=None):
@@ -155,20 +157,17 @@ def test_plot_crosstalk_heatmap_draws_correct_data():
 
 
 def test_plot_crosstalk_heatmap_text_is_english_only():
-    """圖表文字一律英文（調度員規則），沿用 D17 的檢查做法。"""
+    """圖表文字一律英文（調度員規則）。D20：改用共用的 `assert_english_only`
+    ——原本這裡跟 `D17` 各自寫一份一模一樣的 `has_cjk`，兩份遲早會漂掉一份。"""
     fig = plot_crosstalk_heatmap(np.arange(N_ZONES, dtype=float), sensor_label="B")
+    assert_english_only(fig)
 
-    texts = [fig._suptitle.get_text()] if fig._suptitle else []
-    for ax in fig.axes:
-        texts.append(ax.get_title())
-        texts.append(ax.get_xlabel())
-        texts.append(ax.get_ylabel())
 
-    def has_cjk(s):
-        return any("一" <= ch <= "鿿" for ch in s)
-
-    for t in texts:
-        assert not has_cjk(t), f"圖表文字含 CJK 字元: {t!r}"
+def test_plot_crosstalk_heatmap_passes_grayscale_check():
+    """D20：`zone_distance_delta()` 回傳非負量值（見其 docstring 的
+    `np.abs`），SEQUENTIAL_CMAP 語意正確，不需要 `diverging_opt_out`。"""
+    fig = plot_crosstalk_heatmap(np.arange(N_ZONES, dtype=float), sensor_label="A")
+    assert_grayscale_safe(fig)
 
 
 def test_format_report_flags_synthetic_and_includes_fallback_when_failed():

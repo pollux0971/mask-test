@@ -17,9 +17,11 @@
 const MODES = ["monitor", "record", "quiz", "validate", "replay"];
 const KEY_TO_MODE = { "1": "monitor", "2": "record", "3": "quiz", "4": "validate", "5": "replay" };
 const COLLAPSE_STORAGE_KEY = "panel.sidebar.collapsed";
+const PROJECTOR_STORAGE_KEY = "panel.projector"; // C25, same sessionStorage pattern as collapse above
 
 const sidebar = document.getElementById("sidebar");
 const collapseToggle = document.getElementById("collapseToggle");
+const projectorToggle = document.getElementById("projectorToggle");
 const navItems = Array.from(document.querySelectorAll(".mode-nav-item"));
 const sections = Object.fromEntries(
   MODES.map((mode) => [mode, document.getElementById(`mode-${mode}`)])
@@ -211,6 +213,39 @@ try {
   // default: expanded
 }
 
+// --- C25: projector mode ---
+//
+// One-click 130% text for Demo (C25.md). Sets a root attribute that
+// tokens.css's `html[data-projector-mode="true"]` rule reads -- this file
+// only flips the attribute and persists the choice, tokens.css owns what
+// "projector mode" actually looks like. Same sessionStorage-persisted
+// toggle pattern as setCollapsed() above, on purpose: Demo rehearsal means
+// switching this on/off repeatedly, and losing it on every reload would be
+// exactly the kind of friction this feature exists to remove.
+function setProjectorMode(on) {
+  document.documentElement.setAttribute("data-projector-mode", on ? "true" : "false");
+  projectorToggle.setAttribute("aria-pressed", on ? "true" : "false");
+  projectorToggle.classList.toggle("active", on);
+  try {
+    sessionStorage.setItem(PROJECTOR_STORAGE_KEY, on ? "1" : "0");
+  } catch {
+    // sessionStorage unavailable -- projector mode still works for this
+    // session, it just won't survive a reload.
+  }
+}
+
+function toggleProjectorMode() {
+  setProjectorMode(document.documentElement.getAttribute("data-projector-mode") !== "true");
+}
+
+projectorToggle.addEventListener("click", toggleProjectorMode);
+
+try {
+  if (sessionStorage.getItem(PROJECTOR_STORAGE_KEY) === "1") setProjectorMode(true);
+} catch {
+  // default: off
+}
+
 document.addEventListener("keydown", (e) => {
   if (isTypingTarget(e.target)) return;
   if (e.altKey || e.ctrlKey || e.metaKey) return;
@@ -218,6 +253,11 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "\\") {
     e.preventDefault();
     toggleCollapsed();
+    return;
+  }
+  if (e.key.toLowerCase() === "p") {
+    e.preventDefault();
+    toggleProjectorMode();
     return;
   }
   const mode = KEY_TO_MODE[e.key];

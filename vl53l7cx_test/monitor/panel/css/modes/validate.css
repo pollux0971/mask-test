@@ -19,12 +19,12 @@
   display: flex;
   flex-direction: column;
   gap: 4px;
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
 }
 .validate-sessions-input {
   font-family: inherit;
-  font-size: 13px;
+  font-size: 0.8125rem;
   color: var(--text);
   background: var(--surface-2);
   border: 1px solid var(--border);
@@ -37,12 +37,12 @@
   align-items: center;
   gap: 14px;
   flex-wrap: wrap;
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
 }
 .validate-btn {
   font-family: inherit;
-  font-size: 12px;
+  font-size: 0.75rem;
   font-weight: 600;
   padding: 6px 14px;
   border-radius: 999px;
@@ -63,11 +63,11 @@
   border-color: var(--warn);
 }
 .validate-run-status {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
 }
 .validate-run-error {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--warn);
   background: var(--warn-soft);
   border-radius: 6px;
@@ -101,7 +101,7 @@
   gap: 8px;
 }
 .validate-card-key {
-  font-size: 13px;
+  font-size: 0.8125rem;
   font-weight: 700;
   color: var(--accent);
   background: var(--accent-soft);
@@ -109,23 +109,23 @@
   padding: 1px 10px;
 }
 .validate-card-name {
-  font-size: 15px;
+  font-size: 0.9375rem;
   font-weight: 700;
 }
 
 .validate-card-purpose {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
   line-height: 1.4;
 }
 .validate-card-criterion {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
 }
 
 .validate-status {
   display: inline-block;
-  font-size: 13px;
+  font-size: 0.8125rem;
   font-weight: 700;
   padding: 3px 10px;
   border-radius: 999px;
@@ -136,29 +136,29 @@
   font-weight: 500;
 }
 .validate-status-pass {
-  color: var(--good);
-  background: rgba(95, 191, 122, 0.14);
+  color: var(--status-good);
+  background: var(--status-good-soft);
 }
 .validate-status-fail {
-  color: var(--warn);
-  background: var(--warn-soft);
+  color: var(--status-bad);
+  background: var(--status-bad-soft);
 }
 /* SKIPPED and ERROR are deliberately visually distinct from each other and
    from FAIL (D15's own design, C22.md must respect it): skipped = missing
    data (not a result), error = a bug (not a conclusion), fail = a real
    result. Collapsing any two of these into the same look would mislead. */
 .validate-status-skipped {
-  color: var(--text-dim);
+  color: var(--status-unknown);
   background: var(--surface-2);
   border: 1px dashed var(--border);
 }
 .validate-status-error {
-  color: var(--warn);
-  background: var(--warn-soft);
-  border: 1px solid var(--warn);
+  color: var(--status-bad);
+  background: var(--status-bad-soft);
+  border: 1px solid var(--status-bad);
 }
 .validate-reason {
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--text-dim);
   margin-top: 4px;
   line-height: 1.4;
@@ -176,15 +176,150 @@
   gap: 8px;
 }
 .validate-c0-progress {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text);
   min-height: 1.2em;
 }
 .validate-c0-result {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
   line-height: 1.4;
 }
+/* "分析步驟尚未串接" is the expected/temporary state, not a problem the
+   user caused -- C25 moved this off --warn (red) onto the shared
+   .pending-note look so it reads as calm/informational, matching
+   validate-reports-error below and the other four modes' equivalent
+   "backend not wired up yet" messages. */
 .validate-c0-result-pending {
-  color: var(--warn);
+  color: var(--text-dim);
+}
+
+/* --- C23: report viewer --- */
+.validate-reports-error {
+  /* Always the "/verify/reports unavailable" pending-backend case (see
+     refreshReports() in validate.js) -- never a real user error, so it
+     gets the shared .pending-note treatment via composition (a class list
+     addition in the HTML would need a JS change; redeclaring the same
+     rules here keeps this a pure-CSS C25 change). */
+  font-size: 0.6875rem;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  width: fit-content;
+}
+
+.validate-reports-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 180px;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+.validate-reports-empty {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+.validate-report-row {
+  display: grid;
+  grid-template-columns: auto auto auto 1fr;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.75rem;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+.validate-report-row.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.validate-report-id {
+  font-weight: 700;
+}
+.validate-report-meta {
+  color: var(--text-dim);
+}
+.validate-report-sessions {
+  color: var(--text-dim);
+  font-size: 0.6875rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.validate-compare-area {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+  overflow-y: auto;
+}
+.validate-compare-empty {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+.validate-compare-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+}
+.validate-compare-head {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+/* D15 makes summary.html fully self-contained specifically for this iframe
+   (no external CSS/JS, no http:// references) -- so this stays plain,
+   no sandbox workarounds needed for broken external resources. */
+.validate-compare-iframe {
+  width: 100%;
+  height: 420px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  /* Not a themed token on purpose -- this is the embedded document's own
+     paper-white background (D15's summary.html is a plain light-mode
+     report meant to be printed/read standalone), not a panel surface. */
+  background: #fff;
+  flex-shrink: 0;
+}
+
+.validate-report-no-figures {
+  font-size: 0.6875rem;
+  color: var(--text-dim);
+}
+.validate-report-figures {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.validate-figure {
+  margin: 0;
+}
+.validate-figure img {
+  max-width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  display: block;
+}
+.validate-figure figcaption {
+  font-size: 0.6875rem;
+  color: var(--text-dim);
+  margin-top: 4px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.validate-figure figcaption a {
+  color: var(--accent);
 }

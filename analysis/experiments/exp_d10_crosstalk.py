@@ -21,6 +21,7 @@
 import numpy as np
 
 from analysis.experiments.exp_a_snr import zone_snr_grid
+from analysis.reporting.plot_style import SEQUENTIAL_CMAP, styled
 
 N_ZONES = 16
 DISTANCE_PASS_THRESHOLD_MM = 2.0
@@ -108,18 +109,22 @@ def plot_crosstalk_heatmap(zone_delta_mm, sensor_label="A", threshold_mm=DISTANC
     zone layout: row-major (ASSUMED, unverified — see A track/E01)，
     沿用 `exp_a_snr.zone_snr_grid` 的假設與命名，不重新定義一份。
     """
-    import matplotlib.pyplot as plt
-
     grid = zone_snr_grid(zone_delta_mm, n_rows, n_cols)
 
-    fig, ax = plt.subplots(figsize=(4.5, 4))
-    im = ax.imshow(grid, cmap="magma")
-    ax.set_title(f"Crosstalk distance delta - sensor {sensor_label} (mm)")
-    ax.set_xlabel("zone column (row-major, unverified)")
-    ax.set_ylabel("zone row (row-major, unverified)")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="delta (mm)")
-    fig.suptitle(f"threshold={threshold_mm} mm")
-    fig.tight_layout()
+    # D20：`zone_distance_delta()` 回傳的本來就是 `np.abs(...)`（見其
+    # docstring），是非負量值不是有號的 Δ，SEQUENTIAL_CMAP 語意正確，
+    # 不需要發散色階（也就不需要 `diverging_opt_out`）。
+    with styled():
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(4.5, 4))
+        im = ax.imshow(grid, cmap=SEQUENTIAL_CMAP)
+        ax.set_title(f"Crosstalk distance delta - sensor {sensor_label} (mm)")
+        ax.set_xlabel("zone column (row-major, unverified)")
+        ax.set_ylabel("zone row (row-major, unverified)")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="delta (mm)")
+        fig.suptitle(f"threshold={threshold_mm} mm")
+        fig.tight_layout()
     return fig
 
 
@@ -196,6 +201,8 @@ def _demo_synthetic_run(rng, n_t=500, n_ta=60):
 if __name__ == "__main__":
     from pathlib import Path
 
+    from analysis.reporting.plot_style import save_figure
+
     rng = np.random.default_rng(0)
     delta_a, verdict_a, rate_a = _demo_synthetic_run(rng)
     delta_b, verdict_b, rate_b = _demo_synthetic_run(rng)
@@ -206,3 +213,8 @@ if __name__ == "__main__":
     out_path = Path(__file__).with_name("d10_crosstalk_report.md")
     out_path.write_text(report + "\n")
     print(f"\n報告已寫入 {out_path}")
+
+    for label, delta in (("A", delta_a), ("B", delta_b)):
+        fig = plot_crosstalk_heatmap(delta, sensor_label=label)
+        written = save_figure(fig, Path(__file__).with_name(f"d10_crosstalk_heatmap_{label.lower()}"))
+        print("圖已寫入：", ", ".join(str(p) for p in written))

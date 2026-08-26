@@ -88,6 +88,32 @@
   color: var(--text-dim);
 }
 
+/* B21: separate axis from `mode` -- same 3-button-toggle look as .wear-toggle
+   above, deliberately not sharing a class with it since the two mean
+   different things (wear repetition vs. speaking mode). */
+#mode-record .speaking-mode-toggle {
+  display: flex;
+  gap: 8px;
+}
+
+#mode-record .speaking-mode-btn {
+  flex: 1;
+  padding: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+#mode-record .speaking-mode-btn.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
 #mode-record .wear-no-history-note {
   font-size: 12px;
   color: var(--text-dim);

@@ -20,6 +20,7 @@ from analysis.reporting.verification_report import (
     render_summary_html,
     render_summary_markdown,
     sort_outcomes,
+    summary_sections,
 )
 
 
@@ -362,3 +363,64 @@ def test_empty_outcome_list_does_not_crash():
 def test_sort_outcomes_is_stable_for_unknown_keys():
     outcomes = [outcome("Y"), outcome("X"), outcome("A")]
     assert [o.key for o in sort_outcomes(outcomes)] == ["A", "X", "Y"]
+
+
+# --------------------------------- md 與 html 的章節必須一致（C23 靠 html）
+
+
+def _headings(markdown_text):
+    return [line[3:].strip() for line in markdown_text.split("\n")
+            if line.startswith("## ")]
+
+
+def _html_headings(html_text):
+    import re
+
+    return [re.sub(r"<[^>]+>", "", m).strip()
+            for m in re.findall(r"<h2>.*?</h2>", html_text, flags=re.S)]
+
+
+@pytest.mark.parametrize("make_outcomes", [
+    pytest.param(all_pass, id="all-pass"),
+    pytest.param(lambda: [outcome("A", STATUS_FAIL, diagnosis="換一種戴法再試"),
+                          outcome("C", STATUS_PASS)], id="with-diagnosis"),
+    pytest.param(lambda: [outcome("C0", STATUS_ERROR, reason="ZeroDivisionError"),
+                          outcome("B", STATUS_SKIPPED, reason="缺 wear_id")],
+                 id="error-and-skip"),
+    pytest.param(lambda: [], id="empty"),
+])
+def test_markdown_and_html_have_the_same_sections(make_outcomes):
+    """**`C23` 的報告檢視器主要靠 iframe 顯示 html。**
+
+    md 有而 html 沒有的東西，使用者就永遠看不到——而不一致的方向偏偏是
+    「使用者看的那份比較少」。這條測試存在的原因是它真的發生過：診斷建議
+    只寫進了 md，於是「失敗時有紅色警示與診斷建議」的後半段在 UI 上消失。
+    """
+    report = build_report(make_outcomes(), is_synthetic=False)
+    expected = summary_sections(report)
+    assert _headings(render_summary_markdown(report)) == expected
+    assert _html_headings(render_summary_html(report)) == expected
+
+
+def test_html_renders_the_diagnosis_text_itself():
+    """章節在不等於內容在——診斷的**文字**也要真的出現。"""
+    outcomes = [outcome("A", STATUS_FAIL, diagnosis="先確認裝置有戴好、距離對不對",
+                        reason="SNR 只有 0.4"),
+                outcome("C", STATUS_PASS)]
+    html_text = render_summary_html(build_report(outcomes, is_synthetic=False))
+    assert "先確認裝置有戴好" in html_text
+    assert "SNR 只有 0.4" in html_text
+    assert "**" not in html_text          # 不該漏出 Markdown 標記
+
+
+def test_html_escapes_diagnosis_text():
+    outcomes = [outcome("A", STATUS_FAIL, diagnosis="<img src=x onerror=alert(1)>")]
+    html_text = render_summary_html(build_report(outcomes, is_synthetic=False))
+    assert "<img src=x" not in html_text
+    assert "&lt;img" in html_text
+
+
+def test_summary_sections_omits_diagnosis_when_nothing_failed():
+    """沒有失敗就不該有一個空的「診斷建議」標題。"""
+    report = build_report(all_pass(), is_synthetic=False)
+    assert "診斷建議" not in summary_sections(report)

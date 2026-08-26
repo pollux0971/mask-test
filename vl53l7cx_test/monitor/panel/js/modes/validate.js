@@ -141,9 +141,13 @@ registerMode("validate", (() => {
       // doesn't correspond to anything real.
       runStatusEl.textContent = `執行中… 已過 ${elapsedS} 秒（目標 < 120 秒）`;
     } else if (lastRun) {
-      runStatusEl.textContent = `上次執行：${lastRun.finished_at || "?"}（耗時 ${
+      // C25: synthetic-data caveat uses the shared .caveat-badge look
+      // (tokens.css), same amber language as monitor.css's "ASSUMED,
+      // unverified" -- innerHTML here (not textContent) only to wrap that
+      // one span; every other value stays plain text.
+      runStatusEl.innerHTML = `上次執行：${lastRun.finished_at || "?"}（耗時 ${
         lastRun.elapsed_s != null ? lastRun.elapsed_s.toFixed(1) : "?"} 秒）` +
-        (lastRun.is_synthetic ? "　⚠ 合成資料" : "");
+        (lastRun.is_synthetic ? `　<span class="caveat-badge">⚠ 合成資料</span>` : "");
     } else {
       runStatusEl.textContent = "尚未執行過";
     }
@@ -327,7 +331,8 @@ registerMode("validate", (() => {
   // PNG for the D20 dual-format output.
 
   function fmtReportLabel(report) {
-    const synth = report.is_synthetic ? "　⚠ 合成" : "";
+    // C25: shared .caveat-badge look, same as the run-status one above.
+    const synth = report.is_synthetic ? `　<span class="caveat-badge">⚠ 合成</span>` : "";
     return `${report.created_at || report.id}${synth}　(${
       report.elapsed_s != null ? report.elapsed_s.toFixed(1) : "?"}s)`;
   }

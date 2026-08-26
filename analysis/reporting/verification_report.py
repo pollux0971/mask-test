@@ -361,6 +361,22 @@ def build_report(outcomes, *, is_synthetic=True, extras=None, session_paths=(),
     return report
 
 
+def summary_sections(report):
+    """這份報告**應該**有哪幾個章節。
+
+    `render_summary_markdown()` 與 `render_summary_html()` 共用這一份清單，
+    測試也拿它比對兩邊的輸出。理由：`C23` 的報告檢視器主要靠 iframe 顯示
+    html，**md 有而 html 沒有的東西，使用者就永遠看不到**——而不一致的方向
+    偏偏是「使用者看的那份比較少」。開發時真的發生過：診斷建議只寫進了 md。
+    """
+    sections = ["通過矩陣"]
+    if any(o.status in (STATUS_FAIL, STATUS_ERROR) and (o.diagnosis or o.reason)
+           for o in report["outcomes"]):
+        sections.append("診斷建議")
+    sections += ["跨實驗一致性", "已知限制"]
+    return sections
+
+
 def render_summary_markdown(report):
     """`summary.md`。**通過矩陣置頂**（story 驗收條件）。"""
     lines = ["# 驗證報告 summary", ""]
@@ -481,6 +497,19 @@ def render_summary_html(report):
         banners.append(_html_banner("warn", "合成資料，不是真實結論",
                                     "真實結論待 E05 蒐集資料後重跑。"))
 
+    # 診斷建議在 md 有、html 沒有的話，**使用者在 `C23` 的 UI 上就永遠看不到**
+    # ——而 `C23` 主要靠 iframe 顯示這份 html。「失敗時有紅色警示與診斷建議」
+    # 的後半段會安靜地消失，而且消失的方向是「使用者看的那份比較少」。
+    diagnosis = "".join(
+        f"<h3>{html.escape(f'{o.key} {o.name}')} — "
+        f"{html.escape(_plain_mark(o.status))}</h3>"
+        + (f"<p><em>{html.escape(_strip_md(o.reason))}</em></p>" if o.reason else "")
+        + (f"<pre>{html.escape(_strip_md(o.diagnosis))}</pre>" if o.diagnosis else "")
+        for o in report["outcomes"]
+        if o.status in (STATUS_FAIL, STATUS_ERROR) and (o.diagnosis or o.reason)
+    )
+    diagnosis_section = (f"<h2>診斷建議</h2>{diagnosis}" if diagnosis else "")
+
     inconsistencies = "".join(
         f'<li class="{item["severity"]}"><strong>{html.escape(item["topic"])}</strong>'
         f'（{html.escape("、".join(item["sources"]))}）</li>'
@@ -509,6 +538,7 @@ td.verdict {{ font-weight: bold; white-space: nowrap; }}
 .banner.error {{ background: #ffe1e1; border-left: 6px solid #c00; }}
 .banner.warn {{ background: #fff6e0; border-left: 6px solid #d99000; }}
 li.conflict {{ color: #c00; }}
+pre {{ background: #f6f6f6; padding: 0.6rem; overflow-x: auto; white-space: pre-wrap; }}
 </style>
 </head>
 <body>
@@ -522,6 +552,7 @@ li.conflict {{ color: #c00; }}
 </tbody>
 </table>
 <p>&#128274; = 必通過項目（失敗時整份報告的數字都不可信）。</p>
+{diagnosis_section}
 <h2>跨實驗一致性</h2>
 <ul>{inconsistencies}</ul>
 <h2>已知限制</h2>

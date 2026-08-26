@@ -15,6 +15,7 @@ from analysis.experiments.exp_d12_wear_cv import (
     scalar_cv_within_between,
     wear_verdict,
 )
+from analysis.reporting.text_checks import assert_english_only
 from analysis.similarity.cosine_baseline import cosine_dist
 
 
@@ -165,18 +166,9 @@ def test_plot_within_between_boxplot_draws_two_groups_english_only():
     box_axes = [ax for ax in fig.axes if ax.patches or ax.lines]
     assert len(box_axes) >= 1
 
-    texts = [fig._suptitle.get_text()] if fig._suptitle else []
-    for ax in fig.axes:
-        texts.append(ax.get_title())
-        texts.append(ax.get_xlabel())
-        texts.append(ax.get_ylabel())
-        texts.extend(t.get_text() for t in ax.get_xticklabels())
-
-    def has_cjk(s):
-        return any("一" <= ch <= "鿿" for ch in s)
-
-    for t in texts:
-        assert not has_cjk(t), f"圖表文字含 CJK 字元: {t!r}"
+    # D20：改用共用的 `assert_english_only`——原本這裡跟 `D14`/`D17` 各自寫
+    # 一份一模一樣的 `has_cjk`，兩份相同的字面實作遲早會漂掉一份。
+    assert_english_only(fig)
 
 
 def test_format_report_flags_synthetic_and_lists_suggestions_when_needed():

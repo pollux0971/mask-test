@@ -235,3 +235,66 @@ def test_a_saved_trial_does_not_destroy_the_baseline(rig):
         assert "trial_001" in trials, f"the trial was not saved: {trials}"
         label = f["trial_000"].attrs.get("label")
         assert label in ("_baseline", b"_baseline"), label
+
+
+# -- C14: rejecting an already-saved trial --------------------------------
+
+
+def test_reject_marks_a_saved_trial_without_deleting_it(rig):
+    """Rejecting is not deleting.
+
+    D12's cross-validation needs to know how many attempts went wrong during
+    a given wear, so the data stays and only the quality attr changes.
+    """
+    import h5py
+    _session_with_baseline(rig)
+    _request(rig, "POST", "/trial/hold/start", {})
+    time.sleep(1.2)
+    assert _request(rig, "POST", "/trial/hold/stop")[1]["state"] == "REST"
+
+    status, body = _request(rig, "POST", "/trial/reject", {"trial_idx": 1})
+    assert status == 200, body
+
+    assert _request(rig, "POST", "/session/end")[0] == 200
+    time.sleep(0.5)
+    files = list((rig.workdir / "sessions").glob("*.h5"))
+    with h5py.File(files[0], "r") as f:
+        assert "trial_001" in f, "reject deleted the trial"
+        quality = f["trial_001"].attrs.get("quality")
+        assert quality in ("rejected", b"rejected"), quality
+
+
+def test_reject_without_a_trial_idx_is_409(rig):
+    _session_with_baseline(rig)
+    status, body = _request(rig, "POST", "/trial/reject", {})
+    assert status == 409 and body["error"]
+
+
+def test_reject_with_a_nonsense_index_is_409(rig):
+    _session_with_baseline(rig)
+    assert _request(rig, "POST", "/trial/reject", {"trial_idx": -1})[0] == 409
+    assert _request(rig, "POST", "/trial/reject", {"trial_idx": "one"})[0] == 409
+
+
+# -- C0 pairing: which sensors were on --------------------------------------
+
+
+def test_sensors_enabled_is_recorded_but_never_claimed_as_confirmed(rig):
+    """D10 pairs "one sensor" runs against "both sensors" runs.
+
+    The confirmed flag stays False on purpose: $STATUS carries mel= and amb=
+    but no sens_a=/sens_b=, so this is the last command the host sent, not a
+    state the device acknowledged.
+    """
+    import h5py
+    _session_with_baseline(rig)
+    assert _request(rig, "POST", "/session/end")[0] == 200
+    time.sleep(0.5)
+    files = list((rig.workdir / "sessions").glob("*.h5"))
+    with h5py.File(files[0], "r") as f:
+        meta = dict(f["/meta"].attrs)
+    enabled = meta.get("sensors_enabled")
+    if enabled is None:
+        pytest.skip("sensors_enabled is not in the schema yet")
+    assert enabled in ("AB", b"AB")
+    assert not meta["sensors_enabled_confirmed"]

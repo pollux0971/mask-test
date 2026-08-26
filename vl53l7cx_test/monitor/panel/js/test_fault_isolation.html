@@ -54,6 +54,12 @@
     <button class="status-summary" data-status-summary>
       <span data-status-drop></span><span data-status-symmetry></span><span data-status-fps></span>
     </button>
+    <!-- C25 added a projector-mode toggle to shell.js that does an
+         unconditional getElementById("projectorToggle") at module load --
+         same requirement as #collapseToggle below, so this skeleton needs
+         it too or shell.js throws before ever reaching the fault-isolation
+         code this page exists to test. -->
+    <button id="projectorToggle" class="collapse-toggle"></button>
     <button id="collapseToggle" class="collapse-toggle"></button>
   </nav>
   <main id="mainContent" class="main-content">

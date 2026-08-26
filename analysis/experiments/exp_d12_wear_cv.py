@@ -36,6 +36,8 @@
 """
 import numpy as np
 
+from analysis.reporting.plot_style import styled
+
 CV_PASS_THRESHOLD = 0.30
 RATIO_IMPROVEMENT_THRESHOLD = 1.5
 CV_EPS = 1e-9
@@ -150,14 +152,20 @@ def distance_based_wear_ratio(trials_by_wear, dist_fn):
 
 
 def plot_within_between_boxplot(within_distances, between_distances):
-    """驗收條件：箱型圖清楚呈現兩組分布（圖表文字一律英文）。"""
-    import matplotlib.pyplot as plt
+    """驗收條件：箱型圖清楚呈現兩組分布（圖表文字一律英文）。
 
-    fig, ax = plt.subplots(figsize=(5, 4))
-    ax.boxplot([within_distances, between_distances], tick_labels=["within-wear", "between-wear"])
-    ax.set_title("Within-wear vs between-wear distance")
-    ax.set_ylabel("distance")
-    fig.tight_layout()
+    D20：套用共用樣式（字型/網格/色盤）。箱型圖不經過 `ax.imshow()`，
+    `assert_grayscale_safe()` 只掃 `ax.get_images()`，不適用也不需要——
+    兩組分布本來就是靠位置/箱型區分，不是靠顏色。
+    """
+    with styled():
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.boxplot([within_distances, between_distances], tick_labels=["within-wear", "between-wear"])
+        ax.set_title("Within-wear vs between-wear distance")
+        ax.set_ylabel("distance")
+        fig.tight_layout()
     return fig
 
 
@@ -272,6 +280,8 @@ def _demo_synthetic_run(rng):
 if __name__ == "__main__":
     from pathlib import Path
 
+    from analysis.reporting.plot_style import save_figure
+
     rng = np.random.default_rng(0)
     verdicts, distance_result = _demo_synthetic_run(rng)
     report = format_report(verdicts, distance_result, is_synthetic=True)
@@ -279,4 +289,12 @@ if __name__ == "__main__":
 
     out_path = Path(__file__).with_name("d12_wear_cv_report.md")
     out_path.write_text(report + "\n")
+    print(f"\n報告已寫入 {out_path}")
+
+    if distance_result is not None:
+        fig = plot_within_between_boxplot(
+            distance_result["within_distances"], distance_result["between_distances"]
+        )
+        written = save_figure(fig, Path(__file__).with_name("d12_wear_cv_boxplot"))
+        print("圖已寫入：", ", ".join(str(p) for p in written))
     print(f"\n報告已寫入 {out_path}")

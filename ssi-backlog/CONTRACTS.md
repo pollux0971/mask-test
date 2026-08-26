@@ -28,6 +28,7 @@
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件補上 `CONFIRM` 狀態（`B12` Hold-to-Record 專用：按住時間超出 0.3–5 s 範圍時，資料算好但**不落盤**，等使用者決定保留或跳過）。與 `B11` 「放棄的 trial 完全不落盤」一致 | `B12`, `B19`, `C12`, `C14` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件補上 `IDLE` 狀態與 `seed` 欄位；明訂 `abort`（跳過此詞）與 `redo`（保留同詞重試）語意不同，兩者都不寫入 HDF5 與 manifest；明訂 `quality` 值域凍結為 `{ok, low, rejected}`（棄用＝`rejected`，不新增第四個值）與 `B11` 的暫定門檻 0.7／0.3，並標註該門檻無實測依據、待 `E01`/`E03` 校準 | `B11`, `B12`, `B19`, `C12`, `C14`, `D12` | 是 |
 | 2026-08-26 | 6. 詞彙集 | 明訂實驗 A（逐 zone SNR）的對照詞為 `五`（round）vs `一`（spread）。`D11` 的公式用了 round／spread 但契約沒規定是哪兩個詞，`D15` 的 `run_all` 只能自己對應 | `D11`, `D15`, `E03` | 是 |
+| 2026-08-26 | 2. HDF5 Session Schema | `/meta` 新增 **`source`**（`live`/`mock`/`replay-log`/`replay-session`）。§4.2 已規定 SSE 的 `status` 要帶它，但那只在連線期間看得到——`SessionWriter._write_meta()` 只寫 `REQUIRED_META_KEYS`，傳進去的 `source` 被**靜默丟掉**（`B19` wiring 時發現）。**SSE 說得出來、檔案說不出來，而分析時只剩檔案**：`E05` 的四小時資料若錄錯來源，這是唯一能事後發現的地方 | `B07`, `B19`, `D13`, `D15`, `E05` | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | `/meta` 新增 `sensors_enabled`（`"AB"`/`"A"`/`"B"`）。原因：`D10`（C₀ 串擾）要比較單顆開 vs 兩顆開，但 schema 沒記錄擷取當下的感測器開關狀態——`D15` 的 `run_all` 因此**永遠無法自動配對 solo/dual**，`C0` 恆為 SKIPPED。值來自 `SENS:` 指令，但要照實記錄「那是主機端記的指令、非裝置確認狀態」的限制（§4.1.2） | `B07`, `B18`, `D10`, `D15`, `E02` | 是 |
 | 2026-08-26 | 6. 詞彙集 | 裁決：**接受 viseme E（舌音）為空列，不加詞**。`D14` 的預期表有 E 但 `vocab.json` 沒有任何舌音詞、且有預期表沒列的 G 應用（三個詞）。加詞會連鎖影響 `C15`–`C21`、`D22` 的樣板數、`E05` 的錄音量，收益只是驗證一個預期本來就是「三模態都弱」的類別。「本系統不涵蓋舌音」本身是可寫進論文的誠實限制。G 標 `no_expectation` 不硬套猜的預期 | `D14`, `D15`, `E05` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.3 更正融合拒識公式：必須用**原始（未正規化）距離** `d_tof_raw`/`d_mel_raw`，並把這兩個列為 JSON 的必要欄位。原因：`normalize_distances()` 強制減去最小值，`d_tof.min()` 恆為 0，任何正門檻都不會被超過 → **`reject_fused` 永遠回 False 且無任何錯誤訊息**，只會表現成「這個系統從不拒識」。用原始距離也正是兩端退化性質成立的原因（`D07` 實作時發現） | `D07`, `D09`, `C16`, `C17`, `C18` | 是 |
@@ -355,6 +356,7 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
     distance_mm, angle_deg, ambient, notes,
     fw_sha, proto_version, tof_dim,
     sensors_enabled,        # "AB" | "A" | "B" —— 擷取當下哪幾顆在 ranging
+    source,                 # live | mock | replay-log | replay-session —— 見下
     clock_slope, clock_offset, clock_residual_p95,
     clock_drift_us, clock_drift_ppm, clock_sync_span_us, clock_sync_confirmed,
     session_start_device_us, session_start_host_us, session_start_rtt_min_us,
@@ -448,6 +450,21 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
 > trial 的 `quality`——兩個獨立方法對不上是「這個 session 的時鐘可疑，
 > 下游該知道」的訊號，不是「這筆資料一定是錯的」，是否要因此下修
 > quality 由讀取端（`D` 軌／`B19` 儀表板）決定。
+
+> 🔴 **`source` 必須寫進 `/meta`，不只出現在 SSE。**
+>
+> §4.2 已經規定 `status` 事件要帶 `source`（`live`/`mock`/`replay-log`/`replay-session`），
+> **但那只在連線期間看得到**。`B19` 的作者實作時發現：
+>
+> > `SessionWriter._write_meta()` 只寫 `REQUIRED_META_KEYS`，
+> > 傳進去的 `source` 被**靜默丟掉**。
+> > ⚠️ **SSE 說得出來、檔案說不出來，而分析時只剩檔案**——
+> > `E05` 的四小時資料如果錄錯來源，**這正是唯一能事後發現的地方**。
+>
+> 錄完之後沒有人記得當時接的是真板子還是 mock。
+> 而 `D13`/`D16`/`D17`/`D19` 會拿那份 HDF5 跑出漂亮的結論，
+> **沒有任何一層會發現**——這正是當初加 `source` 要防的事，
+> 只防了一半。
 
 > **`sensors_enabled` 記錄擷取當下哪幾顆感測器在 ranging**（`"AB"`／`"A"`／`"B"`）。
 >

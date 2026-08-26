@@ -4,9 +4,13 @@
 
 **mock device → bridge_server → session → baseline → trial → HDF5 → 讀回 → 回放，這條鏈今天走得通，而且大部分是真的、不是 skip。**
 
-12 個檢查點裡 10 個綠燈、2 個明確 skip（都附原因）。過程中在自己的檔案裡（`host/replay/session_replay.py`，B17）抓到並修掉兩個真的形狀不一致的 bug——都是「照著這支測試的要求真的重播一次自己產的檔案」才會冒出來的那種問題，光看程式碼看不出來。
+最初版本 12 個檢查點裡 10 個綠燈、2 個明確 skip（都附原因）。過程中在自己的檔案裡（`host/replay/session_replay.py`，B17）抓到並修掉兩個真的形狀不一致的 bug——都是「照著這支測試的要求真的重播一次自己產的檔案」才會冒出來的那種問題，光看程式碼看不出來。
 
-測試檔：`vl53l7cx_test/monitor/test_e2e_pipeline.py`（12 個測試函式，共用一個 module-scoped fixture 跑一次完整流程）。
+**更新（同一天，後續）**：`speaking_mode`（`B21`）跟 `/replay/*` HTTP 路由（`esp-mask-test-ed`）都在這之後接上了。兩個原本的 skip 都已經換成真斷言，而且是**測試自己主動告知**要換——`test_replay_http_endpoint` 原本設計成「一旦收到非 404 就 `pytest.fail()`」，wiring 一落地它就紅了，不是我自己去翻文件才發現。現在 12 個檢查點全部是真斷言，沒有 skip。
+
+**又加了第 7 節：HDF5 → 分析層的型別接縫（D15 標記過、沒人測過的假設）。結論是沒問題，但要看下面「怎麼比的」才算數，不是一句「沒問題」。**
+
+測試檔：`vl53l7cx_test/monitor/test_e2e_pipeline.py`（19 個測試函式，共用一個 module-scoped fixture 跑一次完整流程；型別接縫那 6 個裡有 5 個吃同一份真檔，1 個是獨立構造的合成 trial）。
 
 ---
 
@@ -18,7 +22,7 @@
 
 不需要真板子、不需要額外設定。跟其他 `test_bridge_*.py` 一樣，重用 `test_bridge_sse.py` 的 `Rig`：真的起一個 `mock_device.py`（T04）子行程 + 真的起一個 `bridge_server.py`（`--source mock`）子行程，中間用 pty 接起來，session 檔寫到 `tmp_path` 級的隔離目錄，不會弄髒 repo。
 
-連跑 3 次，結果一致：`10 passed, 2 skipped`，13-14 秒。
+連跑 3 次，結果一致：`19 passed`，13-16 秒。
 
 ---
 
@@ -34,14 +38,42 @@
 | 6 | trial 的 idx 不跟 baseline 的 idx 0 撞 | `test_trial_idx_does_not_collide_with_baseline` | ✅ |
 | 7 | `mel` 是自己的 `F` 軸，跟 `mel_t_us` 成對，不用等於 `mic_t_us` | `test_mel_has_its_own_axis_paired_with_mel_t_us` | ✅ |
 | 8 | 沒偵測到時，4 個 VAD 時間 attr **完全不存在**（不是 0/-1/視窗邊界） | `test_vad_timing_attrs_are_entirely_absent` | ✅ |
-| 9 | `speaking_mode` 有寫入 | `test_speaking_mode_is_written` | ⏭️ SKIP（見下方「已知缺口」） |
+| 9 | `speaking_mode` 有寫入 | `test_speaking_mode_is_written` | ✅（B21 落地後從 skip 換成真斷言，值固定是 `"normal"`——bridge_server.py 的 `_dispatch_trial()` 目前還沒把 request body 的 `speaking_mode` 傳給 `hold_start()`，所以每筆都拿到 `TrialStateMachine.__init__` 的預設值，不是真的有分辨 normal/whisper/silent） |
 | 10 | 回放這個檔案，事件形狀跟 live 一致 | `test_replay_reproduces_live_event_shapes` | ✅（過程中修了 2 個 bug，見下方） |
 | 11 | 回放事件都帶 `replay: true` | `test_replay_events_carry_the_replay_flag` | ✅ |
 | 12 | `/events` 的 `status.source` 接 mock 時不是 `"live"` | `test_status_declares_mock_not_live` | ✅ |
+| 13 | `/replay/*` HTTP 端點：開始回放、事件真的帶 `replay:true` 送到 `/events`、回放期間即時 tof/mic/mel 被擋下不會混進來、`status.source` 不受影響 | `test_replay_http_endpoint` | ✅（ed 落地後從 skip 換成真斷言） |
 
 第 12 點原本以為要 skip（story 交下來時判斷 `source` 還沒接上），但重新讀最新的 `bridge_server.py` 發現 `--source`／`link_source["value"]` 已經是完整功能，`status` 事件的第一筆快照跟之後每一筆都帶著正確的值——ed 已經把這塊做完了，這裡直接斷言，不是 skip。
 
-`/replay/*` 這條 HTTP 路由本身還沒接（見下方），所以第 10-11 點是在**函式庫層級**（直接呼叫 `host/replay/session_replay.py` 的 `read_session_events()`/`ReplayController`）驗證，不是透過 HTTP。這仍然是「真的重播這支測試自己產生的檔案」，只是還沒有 HTTP 這層外皮。
+第 9、13 點原本設計成明確 skip 並在訊息裡寫「wiring 補上之後這裡會自動變成真斷言」；`/replay/*` 那個 skip 更進一步：一旦收到非 404 就主動 `pytest.fail()`，逼自己回來改，不會安靜地一直綠燈。兩個都在後續（`B21` 與 ed 的 `bridge_server.py` 更新）落地時被抓到、換成了真的斷言——**沒有回頭修改判斷邏輯，純粹是被動地從 skip 轉綠**，這正是最初設計這兩個 skip 時想要的效果。
+
+---
+
+## 第 7 節：HDF5 → 分析層的型別接縫
+
+### 為什麼要測這個
+
+`D15`（`analysis/reporting/session_loader.py`）的作者自己在文件字串裡標了一個沒驗證過的假設：`_as_scalar()`（負責把 h5py 讀回來的 attr 統一成 Python 型別）只對過**自己構造的合成 attr**，沒對過 `SessionWriter`（B07）真的產生的檔案。實際查證後這個缺口是真的：`analysis/reporting/test_run_all.py` 開頭就寫明「用 `h5py` 直接寫出符合 §2 的合成 session（不依賴 `host/storage`）」——`meta.attrs["subject"] = "s01"` 這種寫法跳過了 `SessionWriter` 整條寫入路徑，`_as_scalar()` 從沒真的處理過 `SessionWriter` 寫出來的 attr。這正是這個專案一直在踩的那種 bug：寫入端（`session_writer.py`）跟讀取端（`session_loader.py`）各自照著自己對 schema 的理解走，兩邊個別看都對，接縫上才會不對（`C08` 的 mel int16 vs 解碼浮點、`C05` 的 `dim` 是 zone 數不是邊長，是同一類問題）。
+
+### 怎麼比的
+
+用 `test_e2e_pipeline.py` 既有的 `pipeline` fixture（真的 mock device → bridge_server → baseline → 3 筆 trial 產生的檔案）餵給 `load_session()`，逐項比對：
+
+| 檢查項目 | 測試函式 | 比對方法 |
+|---|---|---|
+| 字串 attr（`subject`/`mode`/`session_date`/trial `label`/`mode`/`quality`）讀回是 `str` 不是 `bytes` | `test_session_loader_reads_real_string_attrs_as_str` | `isinstance(value, str)`；`label` 特意用詞彙集的中文字（非 ASCII utf-8），不是隨便一個英文字串 |
+| bool attr（`clock_sync_confirmed`/`clock_cross_check_ok`）讀回是 Python `bool` 不是 `numpy.bool_` | `test_session_loader_reads_bool_attrs_as_python_bool` | `isinstance(value, bool)` 且 `not isinstance(value, np.bool_)` |
+| 數值純量（`clock_slope`/`noise_floor_mu`/trial `wear_id`）拆包成 Python `float`/`int`，不是 `numpy.float64`/`numpy.integer` | `test_session_loader_unwraps_numeric_scalars` | `type(value) is float`；`not isinstance(wear_id, np.integer)` |
+| baseline 陣列（`baseline_mu_A` 等）形狀跟型別 | `test_session_loader_reads_baseline_arrays_with_correct_shape_and_dtype` | `mu.shape == (32,)`、`mu.dtype == np.float64`（`SessionWriter` 存成 `float32`，`session_loader.baseline()` 明確轉型成 `float64`，這裡確認轉型真的發生） |
+| 選填欄位缺席（VAD 四個時間戳、`speaking_mode`、`sensors_enabled`）不會讓 `load_session()` 拋例外或安靜給錯值 | `test_session_loader_missing_optional_attrs_are_absent_not_crashing` | 確認 `session_loader.py` 全程用 `dict.get()`（先把 `attrs.items()` 轉成一般 dict 再存取），缺席回 `None`／不在 dict 裡，不是 `KeyError` |
+| 無效 ToF zone 讀回真的是 `NaN`，有效性完全靠獨立的 `tof_valid_A`/`B` 陣列，不是靠 `NaN != NaN` 這種自比較 | `test_session_loader_invalid_tof_zones_stay_nan_and_validity_is_independent` | 不依賴 live rig 這次跑出來的合成場景剛好有沒有無效 zone——直接用 `SessionWriter` 構造一個保證有一格無效值的 trial，讀回後同時斷言 `tof_valid_a[1,5] is False` **與** `np.isnan(tof_a[1,5])`，並反向確認有效格既不是 NaN、`tof_valid_a` 也確實是 `True` |
+
+### 結論：**沒有找到問題**
+
+`h5py 3.16.0`（本機安裝版本）加上 `_as_scalar()` 現有的三個分支（`bytes`→`decode`、`np.generic`→`.item()`、`np.ndarray`→原樣回傳），對 `SessionWriter` 真的產生的檔案，上面六項全部如預期。`session_loader.py` 沒有任何地方對無效 ToF 值做 `==`/`!=` 比較，有效性判斷完全來自獨立的 `tof_valid_*` 陣列，跟 §2.1 的設計意圖一致。
+
+沒有需要修改 `session_writer.py` 或 `session_loader.py` 的地方。這 6 個測試本身就是交付——`_as_scalar()` 這個假設從今天起有真檔案的 regression 保護，不再只是「大家覺得應該沒問題」。
 
 ---
 

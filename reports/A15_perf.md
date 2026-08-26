@@ -93,20 +93,26 @@ python3 tools/fw_regression.py --port /dev/ttyUSB0 --duration 300 \
   （B01/B03 的解析器與掉幀交叉驗證邏輯，沒有自己重刻一份）
 - 算出 ToF 幀率、幀間隔標準差、掉幀率（靠 `seq` 缺口，跟裝置端 `drop_*`
   是兩個獨立算法，見 `dropwatch.py` 的 cross-check 設計）、Mel Hz、
-  **實際頻寬使用率**（用序列埠層真實收到的 bytes/秒 ÷ 46000，不依賴
-  `$H` 的欄位，見下方已知限制）
+  **實際頻寬使用率**（用序列埠層真實收到的 bytes/秒 ÷ 46080，不依賴
+  `$H` 的欄位，見下方已知限制——46080 = 460800 baud ÷ 10 bits/byte，
+  `tools/fw_regression.py` 的 `LINK_BYTES_PER_S` 就是這樣算的，跟
+  `B20_bridge_throughput.md` 用的除數一致；本節先前寫的「÷46000」是
+  文件本身的手誤，程式碼從頭到尾用的都是精確值）
 - 掉幀率 > 1% 時**以結束碼 1 退出**（`echo $?` 檢查），符合 A15 驗收條件
 - 把結果寫成 `reports/A15/<config>_<git-sha>_<時間>.md`（自動建立
   `reports/A15/` 目錄，檔名含 git sha——`git sha` 是韌體自己在 `$STATUS`
   的 `fw=` 回報的，不是主機這邊的 `git rev-parse`，確保報告對得上實際燒的韌體）
 
-⚠️ **已知限制**：`$H`（heap／溫度／新加的頻寬欄位）目前**解析不出來**——
-這一批改動把 `$H` 從 6 欄擴成 7 欄，但 `host/capture/protocol.py` 的
-`_parse_heartbeat()` 還在檢查 `len(parts) == 7`（對應舊格式），這個新
-欄位讓整行變成 8 段而被判成畸形行。**這不影響掉幀率判定**（那條路完全
-靠 `seq`，見上面），但 `heap Δ` 這一欄目前只能標 `N/A`，直到
-`host/capture/protocol.py` 更新為止（不是我的檔案，已經在 CONTRACTS.md
-變更紀錄和完成回報裡標成待處理項目）。
+✅ **已知限制已解決**（`HANDOFF.md` dry-run 稽核時重新確認，2026-08-26）：
+本節原本記錄「`host/capture/protocol.py` 的 `_parse_heartbeat()` 還在
+檢查 `len(parts) == 7`，新加的頻寬欄位讓整行變成 8 段而被判成畸形行」——
+**這個限制目前已經不成立**。實際重讀程式碼並實測：`_parse_heartbeat()`
+現在是 `len(parts) < 7` 起接受（不是等號檢查），且明確讀 `parts[7]` 當
+`bw_bytes_since_last`（缺席時是 `None`，不是 0——`0` 是合法的頻寬讀數，
+用它當缺值會讓舊韌體看起來像「這段期間完全沒傳東西」，見程式碼註解）。
+用一行合成的 8 欄 `$H`（`$H,123456,0,0,0,50000,42,7890`）餵給
+`parse_line()` 實測，`bw_bytes_since_last` 正確回傳 `7890`，`heap`／
+`temp_c` 也都正確解析，不再是 `N/A`。
 
 ## 理論頻寬對照（可先核對，不必等上機）
 

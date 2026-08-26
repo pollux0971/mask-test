@@ -38,9 +38,10 @@ const streams = {
   tofA: makeRing(),
   tofB: makeRing(),
   mic: makeRing(),
-  // No producer yet -- $F isn't wired into bridge_server.py's SSE output
-  // at all today. Reserved so a future stream doesn't need a dataStore
-  // shape change, per C03.md's "架構要為未來留位置".
+  // $F is wired into bridge_server.py's SSE output and mel events do flow
+  // (confirmed live) -- this ring was reserved ahead of that per C03.md's
+  // "架構要為未來留位置", the "no producer yet" note is stale now that
+  // there is one.
   mel: makeRing(),
   // B19's 1Hz quality event (CONTRACTS.md 4.2) -- six metrics per tick,
   // used by C09 for 60s sparklines.

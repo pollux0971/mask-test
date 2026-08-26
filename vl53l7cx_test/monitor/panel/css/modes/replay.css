@@ -6,7 +6,7 @@
 }
 
 #mode-replay .section-label {
-  font-size: 12px;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--text-dim);
@@ -26,7 +26,7 @@
   color: var(--text);
   border-radius: 6px;
   padding: 6px 10px;
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 
 .replay-select {
@@ -38,13 +38,19 @@
   min-width: 200px;
 }
 
+/* C25: pill shape + weight matches the button convention validate.css/
+   quiz.css already settled on (border-radius 999px, font-weight 600) --
+   this file's buttons were the only ones still using an 8px-radius
+   rectangle. */
 .replay-btn {
+  font-family: inherit;
   background: var(--surface-2);
   border: 1px solid var(--border);
   color: var(--text);
-  border-radius: 6px;
-  padding: 6px 12px;
-  font-size: 13px;
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 0.8125rem;
+  font-weight: 600;
   cursor: pointer;
 }
 
@@ -65,12 +71,12 @@
 }
 
 .replay-status {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
 }
 
 .replay-status.replay-status-error {
-  color: var(--warn);
+  color: var(--status-bad);
 }
 
 .replay-controls {
@@ -104,7 +110,7 @@
 }
 
 .replay-control-label {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
 }
 
@@ -126,7 +132,7 @@
 }
 
 .replay-timeline-empty {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
 }
 
@@ -142,7 +148,7 @@
   padding: 6px 8px;
   color: var(--text);
   cursor: pointer;
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 
 .replay-trial-marker:hover {
@@ -155,12 +161,16 @@
 }
 
 .replay-trial-idx {
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--text-dim);
 }
 
+/* low quality is a caveat, not a failure -- C25: amber (--status-warn),
+   not red (--status-bad), matching C13's precedent (same distinction the
+   dispatcher flagged: this and .replay-status-error above must not look
+   the same severity). */
 .replay-trial-marker[data-quality="low"] {
-  border-color: var(--warn);
+  border-color: var(--status-warn);
 }
 
 .replay-trial-marker[data-quality="rejected"] {
@@ -189,7 +199,7 @@
   border: 1px solid var(--accent);
   color: var(--accent);
   font-weight: 700;
-  font-size: 12px;
+  font-size: 0.75rem;
   letter-spacing: 0.06em;
   pointer-events: none;
   opacity: 0;

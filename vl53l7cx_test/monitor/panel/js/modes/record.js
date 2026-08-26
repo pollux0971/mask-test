@@ -153,7 +153,21 @@ const REQUIRED_FIELDS = [
   { key: "angle_deg", label: "角度 (°)" },
   { key: "ambient", label: "環境描述" },
 ];
-const MODE_SUGGESTIONS = ["normal", "whisper", "silent", "quiz"];
+// B21: normal/whisper/silent used to live in *this* datalist, conflated
+// with `mode` (session/panel type) -- exactly the two-different-axes bug
+// this story exists to fix (see SPEAKING_MODES below, CONTRACTS.md §2:
+// mode and speaking_mode are separate). Left as free text per the story's
+// explicit "mode 維持自由文字" -- only the suggestion list changes.
+const MODE_SUGGESTIONS = ["quiz"];
+
+// B21: matches quiz.js's SPEAKING_MODES verbatim (same key/label pairs,
+// "照 C15 的做法" per the story) -- session_writer.VALID_SPEAKING_MODES is
+// the actual frozen value domain this must stay a subset of.
+const SPEAKING_MODES = [
+  { key: "normal", label: "正常" },
+  { key: "whisper", label: "氣音" },
+  { key: "silent", label: "無聲" },
+];
 
 const BASELINE_DURATION_S = 30; // host/storage/baseline.py: BASELINE_DURATION_S
 const BASELINE_WAIT_GRACE_MS = 4000; // how long to wait for a real SSE progress event before saying so
@@ -226,6 +240,7 @@ registerMode("record", (() => {
   let prefill = {};
   let lastWearId = null; // derived from prefill.wear_id - 1, null if no history
   let wearMode = "new"; // "new" (🔄 +1) | "same" (➡ unchanged)
+  let speakingMode = "normal"; // B21: separate axis from `mode` -- one of SPEAKING_MODES
   let currentSession = null;
   let baselineStartedAt = null; // performance.now(), for the local pacing countdown
   let baselineWaitTimer = null;
@@ -280,6 +295,12 @@ registerMode("record", (() => {
     els.wearSameBtn.classList.toggle("active", wearMode === "same");
   }
 
+  function updateSpeakingModeUI() {
+    els.speakingModeBtns.forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.speakingMode === speakingMode);
+    });
+  }
+
   async function loadPrefill() {
     try {
       const res = await fetch("/session/prefill");
@@ -309,6 +330,13 @@ registerMode("record", (() => {
       subject: els.subject.value.trim(),
       wear_id: computeWearIdValue(),
       mode: els.mode.value.trim(),
+      // B21: speaking_mode is deliberately NOT sent here. CONTRACTS.md §2
+      // puts it on /trial_NNN's attrs, not /meta -- it's a trial property,
+      // not a session property (the README demo script switches it mid-
+      // session: normal -> whisper for one word -> back to normal, which a
+      // session-level field couldn't represent without restarting the
+      // session). Sent per-trial instead, alongside `label`, at the actual
+      // hold_start() call -- see triggerHoldStart().
       distance_mm: els.distance.value.trim() === "" ? "" : Number(els.distance.value),
       angle_deg: els.angle.value.trim() === "" ? "" : Number(els.angle.value),
       ambient: els.ambient.value.trim(),
@@ -962,7 +990,16 @@ registerMode("record", (() => {
     ensureAudioCtx(); // arm audio on the same user gesture, before any beep is due
     const label = pendingRequeueLabel;
     pendingRequeueLabel = null;
-    postTrialAction("/trial/hold/start", label != null ? { label } : undefined);
+    // B21: speaking_mode travels with the trial, not the session (see
+    // readFormMetadata()'s note) -- sent on every hold_start(), same as the
+    // one-shot label override above. ⚠ Backend wiring status: ed is adding
+    // the body.get("speaking_mode") passthrough on bridge_server.py's side
+    // (this file's authorized path doesn't include that file); until that
+    // lands, the value is sent but silently ignored server-side -- normal
+    // for this project's propose-now-wire-later pattern, not a bug here.
+    const body = { speaking_mode: speakingMode };
+    if (label != null) body.label = label;
+    postTrialAction("/trial/hold/start", body);
   }
 
   function triggerHoldStop() {
@@ -1089,6 +1126,13 @@ registerMode("record", (() => {
                   ${MODE_SUGGESTIONS.map((m) => `<option value="${m}"></option>`).join("")}
                 </datalist>
               </label>
+
+              <div class="field">
+                <span>說話模式（speaking_mode）</span>
+                <div class="speaking-mode-toggle" data-speaking-mode-toggle>
+                  ${SPEAKING_MODES.map((m) => `<button type="button" class="speaking-mode-btn" data-speaking-mode-btn data-speaking-mode="${m.key}">${m.label}</button>`).join("")}
+                </div>
+              </div>
 
               <div class="field">
                 <span>戴法（wear_id）</span>
@@ -1240,6 +1284,7 @@ registerMode("record", (() => {
         notes: root.querySelector("[data-notes]"),
         formError: root.querySelector("[data-form-error]"),
         submitBtn: root.querySelector("[data-submit]"),
+        speakingModeBtns: Array.from(root.querySelectorAll("[data-speaking-mode-btn]")),
         wearToggle: root.querySelector("[data-wear-toggle]"),
         wearNewBtn: root.querySelector("[data-wear-new]"),
         wearSameBtn: root.querySelector("[data-wear-same]"),
@@ -1296,6 +1341,12 @@ registerMode("record", (() => {
         wearMode = "same";
         updateWearIdUI();
       });
+      els.speakingModeBtns.forEach((btn) => {
+        btn.addEventListener("click", () => {
+          speakingMode = btn.dataset.speakingMode;
+          updateSpeakingModeUI();
+        });
+      });
       els.retryBtn.addEventListener("click", retryBaseline);
 
       els.beepToggle.addEventListener("change", () => {
@@ -1332,6 +1383,7 @@ registerMode("record", (() => {
       });
 
       updateWearIdUI();
+      updateSpeakingModeUI();
       showScreen("form");
       loadPrefill();
       loadVocab();

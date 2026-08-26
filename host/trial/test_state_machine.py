@@ -84,12 +84,18 @@ def _feed_mel(sm, t_start_us, t_end_us, rate_hz=62.5, n_bands=40):
         t += period_us
 
 
-def _make_sm(tmp_path, *, words=("五", "四", "八"), seed=1, clock=None, wear_id=3, mode="quiz"):
+def _make_sm(tmp_path, *, words=("五", "四", "八"), seed=1, clock=None, wear_id=3, mode="quiz",
+             baseline_mu_A=None, baseline_sigma_A=None, baseline_mu_B=None, baseline_sigma_B=None,
+             noise_floor_mu=None, noise_floor_sigma=None):
     """每次呼叫都在 `tmp_path` 底下開一個獨立子目錄放 session/manifest，
     這樣同一個測試裡呼叫兩次（例如比較兩個不同 seed 的 order）不會撞同一個
     還開著的 HDF5 檔案。`clock` 沒給就用一個新的 `FakeClock()`——**呼叫端如果
     要自己控制時間推進，必須把同一個 clock 物件傳進來**，不然狀態機讀到的
     跟測試裡 `.advance()` 的是兩個不相干的時鐘，`tick()` 永遠看不到時間變化。
+
+    `baseline_*`/`noise_floor_*`（B21）預設都是 `None`——絕大多數測試不關心
+    VAD，維持原本「沒有 baseline 就是 applicable=False」的行為，不用每個
+    既有測試都被迫多傳幾個參數。
     """
     session_dir = Path(tempfile.mkdtemp(dir=tmp_path))
     h5_path = session_dir / "session.h5"
@@ -101,6 +107,9 @@ def _make_sm(tmp_path, *, words=("五", "四", "八"), seed=1, clock=None, wear_
         words, aligner, writer, h5_path, manifest_path,
         wear_id=wear_id, mode=mode, seed=seed,
         clock=clock or FakeClock(), manifest_root=session_dir,
+        baseline_mu_A=baseline_mu_A, baseline_sigma_A=baseline_sigma_A,
+        baseline_mu_B=baseline_mu_B, baseline_sigma_B=baseline_sigma_B,
+        noise_floor_mu=noise_floor_mu, noise_floor_sigma=noise_floor_sigma,
     )
     return sm, writer, aligner, h5_path, manifest_path
 
@@ -353,6 +362,65 @@ def test_mark_saved_trial_quality_rejects_invalid_value(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# B21 階段 2：raw event 保留（給 host.vad.* 的 detect_from_events() 用，
+# 還沒有任何呼叫端消費，先鎖住「保留＋能正確切視窗」這件事）
+
+
+def _raw_tof_event(t_us, sensor="A", dim=16):
+    return {
+        "type": "tof", "proto": 2, "sensor": sensor, "seq": t_us, "t_us": t_us,
+        "has_timestamp": True, "dim": dim,
+        "distance": [100.0] * dim, "signal": [10.0] * dim, "signal_present": True,
+        "valid": [True] * dim, "n_valid": dim,
+    }
+
+
+def _raw_mic_event(t_us, rms=100.0, peak=1000.0):
+    return {"type": "mic", "proto": 2, "seq": t_us, "t_us": t_us, "has_timestamp": True,
+            "rms": rms, "peak": peak}
+
+
+def test_push_event_buffers_raw_tof_and_mic_events(tmp_path):
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path)
+    sm.push_event(_raw_tof_event(1_000_000, sensor="A"))
+    sm.push_event(_raw_tof_event(1_000_000, sensor="B"))
+    sm.push_event(_raw_mic_event(1_000_000))
+
+    assert len(sm._raw_events) == 3
+    assert {e["type"] for e in sm._raw_events} == {"tof", "mic"}
+
+
+def test_push_event_ignores_non_tof_mic_types(tmp_path):
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path)
+    sm.push_event({"type": "mel", "t_us": 1_000_000, "log_mel": [0.0] * 40})
+    sm.push_event({"type": "quality", "t_us": 1_000_000, "metrics": {}})
+    assert sm._raw_events == []
+
+
+def test_raw_events_window_slices_to_capture_boundaries(tmp_path):
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path)
+    for t_us in (900_000, 1_000_000, 1_500_000, 2_000_000, 2_100_000):
+        sm.push_event(_raw_tof_event(t_us))
+        sm.push_event(_raw_mic_event(t_us))
+
+    window = sm._raw_events_window(1_000_000, 2_000_000)
+    t_values = sorted({e["t_us"] for e in window})
+    assert t_values == [1_000_000, 1_500_000, 2_000_000]
+    assert len(window) == 6  # 3 個時間點 x (tof + mic)
+
+
+def test_raw_events_trimmed_by_mic_buffer_seconds(tmp_path):
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path)
+    sm.push_event(_raw_tof_event(0))
+    far_future_us = int(sm._mic_buffer_seconds * 1_000_000) + 1_000_000
+    sm.push_event(_raw_tof_event(far_future_us))
+
+    assert all(e["t_us"] != 0 for e in sm._raw_events), (
+        "超過 mic_buffer_seconds 的舊事件應該被修剪掉，不能無限累積"
+    )
+
+
+# ---------------------------------------------------------------------------
 # mel（$F）：獨立取樣率、選填
 
 
@@ -597,6 +665,157 @@ def test_hold_start_requires_device_t_us(tmp_path):
     sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path)
     with pytest.raises(ValueError):
         sm.hold_start()
+
+
+# ---------------------------------------------------------------------------
+# B21 階段 1：speaking_mode 是 trial 的屬性，不是 session 的（跟 `mode` 分開）
+
+
+def test_speaking_mode_rejects_invalid_value_before_capture_starts(tmp_path):
+    """故事的整個重點：使用者填了 {normal,whisper,silent} 以外的值，必須在
+    真的開始錄之前就報錯，不能等到 SAVE 那一刻才讓整個 session 中斷。"""
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path)
+    with pytest.raises(ValueError, match="speaking_mode"):
+        sm.hold_start(device_t_us=1_000_000, speaking_mode="quiz")
+    assert sm.state == TrialState.IDLE, "驗證失敗不該把狀態機推進 CAPTURE"
+
+    with pytest.raises(ValueError, match="speaking_mode"):
+        sm.start_trial(speaking_mode="loud")
+    assert sm.state == TrialState.IDLE
+
+
+def test_speaking_mode_is_sticky_across_trials(tmp_path):
+    """沒指定 speaking_mode 的呼叫沿用上一次的值，不是每次重置成 normal
+    ——面板上的三顆按鈕是「目前選哪個」，不是每個 trial 各自獨立的東西。"""
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path)
+    sm.hold_start(device_t_us=1_000_000, speaking_mode="whisper")
+    assert sm._speaking_mode == "whisper"
+    sm.abort()  # 放棄這筆，回到 IDLE 才能再 hold_start()
+
+    sm.hold_start(device_t_us=2_000_000)  # 沒指定
+    assert sm._speaking_mode == "whisper", "沒指定就該沿用上一次的值"
+
+
+def test_speaking_mode_written_to_hdf5(tmp_path):
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
+    _feed_tof(aligner, "A", 900_000, 1_300_000)
+    _feed_tof(aligner, "B", 900_000, 1_300_000)
+    _feed_mic(sm, 900_000, 1_300_000)
+
+    sm.hold_start(device_t_us=1_000_000, speaking_mode="whisper")
+    sm.hold_stop(device_t_us=2_000_000)
+    writer.__exit__(None, None, None)
+
+    with h5py.File(h5_path, "r") as f:
+        assert f["trial_000"].attrs["speaking_mode"] == "whisper"
+
+
+# ---------------------------------------------------------------------------
+# B21 階段 3：真的呼叫 B15/B16，四個 VAD 欄位是真值
+
+
+def _tof_events_from_synth(tof, t_us, sensor, n_zones):
+    events = []
+    for row, ts in zip(tof, t_us):
+        events.append({
+            "type": "tof", "sensor": sensor, "seq": len(events), "t_us": int(ts),
+            "dim": n_zones, "distance": list(row[:n_zones]), "signal": list(row[n_zones:]),
+            "valid": [True] * n_zones,
+        })
+    return events
+
+
+def _mic_events_from_synth(rms, t_us):
+    return [{"type": "mic", "seq": i, "t_us": int(ts), "rms": float(r), "peak": 0.0}
+            for i, (r, ts) in enumerate(zip(rms, t_us))]
+
+
+def test_vad_fields_are_real_when_baseline_and_speech_present(tmp_path):
+    """錄一筆有語音的 trial，四個 VAD 欄位應該是真值，不是 None（B21 的
+    驗收條件）。合成資料，不是真實錄音——跟 host/vad/test_tof_vad.py／
+    test_audio_vad.py 自己承認的限制一樣，這裡驗的是接線接對了，不是
+    偵測演算法本身的準確度（那是 B15/B16 自己的驗收範圍）。
+    """
+    from host.vad.test_audio_vad import NOISE_MU, NOISE_SIGMA, synth_recording
+    from host.vad.test_tof_vad import N_ZONES, baseline, synth_tof
+
+    baseline_mu, baseline_sigma = baseline()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(
+        tmp_path, baseline_mu_A=baseline_mu, baseline_sigma_A=baseline_sigma,
+        noise_floor_mu=NOISE_MU, noise_floor_sigma=NOISE_SIGMA,
+    )
+
+    tof, tof_t, _, _ = synth_tof(np.random.RandomState(21))
+    rms, mic_t, _, _ = synth_recording(np.random.RandomState(21))
+    for e in _tof_events_from_synth(tof, tof_t, "A", N_ZONES):
+        sm.push_event(e)
+    for e in _mic_events_from_synth(rms, mic_t):
+        sm.push_event(e)
+
+    # 涵蓋 synth_tof/synth_recording 兩者的動作區間（見它們自己的預設
+    # onset_frame/n_active/n_voiced），加上 hold-to-record 的 pre/post-roll。
+    hold_start_t_us = tof_t[0] + 1_500_000
+    hold_stop_t_us = hold_start_t_us + 1_200_000
+    sm.hold_start(device_t_us=hold_start_t_us, speaking_mode="normal")
+    events = sm.hold_stop(device_t_us=hold_stop_t_us)
+    save_event = events[0] if isinstance(events, list) else events
+    assert save_event["state"] == "SAVE"
+    assert "vad_comparable" in save_event
+
+    writer.__exit__(None, None, None)
+    with h5py.File(h5_path, "r") as f:
+        attrs = f["trial_000"].attrs
+        for key in ("vad_start_us", "vad_end_us", "lip_onset_us", "voice_onset_us"):
+            assert key in attrs, f"{key} 應該是真值，不該整個 attr 缺席"
+
+
+def test_silent_mode_has_lip_onset_but_no_voice_onset(tmp_path):
+    """驗收條件：silent 模式下 voice_onset_us 缺席但 lip_onset_us 仍有值
+    ——不可假設四個欄位同時存在或同時缺席。"""
+    from host.vad.test_tof_vad import N_ZONES, baseline, synth_tof
+
+    baseline_mu, baseline_sigma = baseline()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(
+        tmp_path, baseline_mu_A=baseline_mu, baseline_sigma_A=baseline_sigma,
+        noise_floor_mu=300.0, noise_floor_sigma=30.0,
+    )
+
+    tof, tof_t, _, _ = synth_tof(np.random.RandomState(22))
+    for e in _tof_events_from_synth(tof, tof_t, "A", N_ZONES):
+        sm.push_event(e)
+    # 刻意不餵任何 mic 事件：silent 模式本來就不該有語音。
+
+    hold_start_t_us = tof_t[0] + 1_500_000
+    hold_stop_t_us = hold_start_t_us + 1_200_000
+    sm.hold_start(device_t_us=hold_start_t_us, speaking_mode="silent")
+    sm.hold_stop(device_t_us=hold_stop_t_us)
+
+    writer.__exit__(None, None, None)
+    with h5py.File(h5_path, "r") as f:
+        attrs = f["trial_000"].attrs
+        assert "lip_onset_us" in attrs, "silent 模式下唇動偵測仍應該有值"
+        assert "voice_onset_us" not in attrs, "silent 模式下不該有語音起點"
+
+
+def test_no_baseline_means_all_four_vad_attrs_absent(tmp_path):
+    """沒有 baseline（例如舊測試、或呼叫端還沒接上 B21 的新參數）時，四個
+    欄位應該整個 attr 不寫入——不是 0、不是 capture 視窗邊界，這是 CONTRACTS
+    的既有要求，B21 接上真的偵測邏輯後不能悄悄退化回填假值。"""
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
+    _feed_tof(aligner, "A", 900_000, 1_300_000)
+    _feed_tof(aligner, "B", 900_000, 1_300_000)
+    _feed_mic(sm, 900_000, 1_300_000)
+
+    sm.hold_start(device_t_us=1_000_000)
+    sm.hold_stop(device_t_us=2_000_000)
+    writer.__exit__(None, None, None)
+
+    with h5py.File(h5_path, "r") as f:
+        attrs = f["trial_000"].attrs
+        for key in ("vad_start_us", "vad_end_us", "lip_onset_us", "voice_onset_us"):
+            assert key not in attrs
 
 
 def test_tick_never_auto_exits_a_hold_to_record_capture(tmp_path):

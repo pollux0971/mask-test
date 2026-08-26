@@ -24,7 +24,7 @@
 
 import { registerMode } from "../shell.js";
 import { dataStore } from "../bus.js";
-import { melColorRgb } from "../draw/thumbnails.js";
+import { melColorRgb, fitPCA2Stub, projectPCA, tryFetchServerPcaModel, computeZoneStats } from "../draw/thumbnails.js";
 
 const DIST_MIN = 0, DIST_MAX = 1200; // mm, clamps the distance color scale
 const DIST_NEAR = [23, 73, 90];      // rgb, close object
@@ -92,37 +92,10 @@ function fmtDelta(mm) {
   return (mm >= 0 ? "+" : "") + mm.toFixed(1);
 }
 
-// unstable/suspectZeroVariance/noSignal mirror B10's own flags (B10.md:
-// sigma > 2mm = unstable, ~0 = suspect, no valid samples = no signal) so a
-// zone flagged by a real B10 baseline and a zone flagged by this client
-// capture mean the same thing on screen.
-function computeZoneStats(frames, dim) {
-  const mu = new Array(dim).fill(NaN);
-  const sigma = new Array(dim).fill(NaN);
-  const unstable = [], suspectZeroVariance = [], noSignal = [];
-  for (let z = 0; z < dim; z++) {
-    const samples = [];
-    for (const f of frames) {
-      const validZone = f.valid ? f.valid[z] !== false : true;
-      const v = f.dist[z];
-      if (validZone && v != null && v >= 0) samples.push(v);
-    }
-    if (samples.length === 0) {
-      noSignal.push(z);
-      continue;
-    }
-    const m = samples.reduce((a, b) => a + b, 0) / samples.length;
-    const variance = samples.length > 1
-      ? samples.reduce((a, b) => a + (b - m) * (b - m), 0) / (samples.length - 1)
-      : 0;
-    const s = Math.sqrt(variance);
-    mu[z] = m;
-    sigma[z] = s;
-    if (s > 2.0) unstable.push(z);
-    else if (s < 0.05) suspectZeroVariance.push(z);
-  }
-  return { mu, sigma, unstable, suspectZeroVariance, noSignal };
-}
+// computeZoneStats moved to draw/thumbnails.js so C19's quiz.js thumbnail
+// can reuse it too (it uses each trial's own captured window as its own
+// baseline, since there's no cross-mode access to monitor.js's B10
+// baseline state) -- same reasoning as the PCA math above.
 
 function buildGrid(el, side) {
   el.style.gridTemplateColumns = `repeat(${side}, 1fr)`;
@@ -314,111 +287,10 @@ const REFIT_INTERVAL_MS = 2000;
 const MIN_FIT_SAMPLES = 40;       // well above the 64-dim rank-deficiency floor
 const SERVER_MODEL_CHECK_MS = 10000; // auto-upgrade stub -> real once the endpoint exists
 
-function vecSub(vec, mean) {
-  const out = new Array(vec.length);
-  for (let i = 0; i < vec.length; i++) out[i] = vec[i] - mean[i];
-  return out;
-}
-
-function dot(a, b) {
-  let s = 0;
-  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
-  return s;
-}
-
-function normalize(v) {
-  const n = Math.sqrt(dot(v, v)) || 1;
-  return v.map((x) => x / n);
-}
-
-function matVec(flatMat, n, v) {
-  const out = new Float64Array(n);
-  for (let i = 0; i < n; i++) {
-    let s = 0;
-    const base = i * n;
-    for (let j = 0; j < n; j++) s += flatMat[base + j] * v[j];
-    out[i] = s;
-  }
-  return out;
-}
-
-// Top eigenvector/eigenvalue of a symmetric matrix via power iteration --
-// avoids needing a full eigendecomposition library for a 2-component PCA.
-function powerIteration(flatMat, n, iterations = 60) {
-  let v = normalize(Array.from({ length: n }, () => Math.random() - 0.5));
-  for (let it = 0; it < iterations; it++) {
-    v = normalize(Array.from(matVec(flatMat, n, v)));
-  }
-  const eigenvalue = dot(Array.from(matVec(flatMat, n, v)), v);
-  return { vector: v, eigenvalue };
-}
-
-// samples: array of same-length plain arrays. Returns a tof_only stub model.
-function fitPCA2Stub(samples) {
-  const m = samples.length;
-  const n = samples[0].length;
-  const mean = new Array(n).fill(0);
-  for (const s of samples) for (let i = 0; i < n; i++) mean[i] += s[i];
-  for (let i = 0; i < n; i++) mean[i] /= m;
-
-  const cov = new Float64Array(n * n);
-  for (const s of samples) {
-    const c = vecSub(s, mean);
-    for (let i = 0; i < n; i++) {
-      const ci = c[i];
-      const base = i * n;
-      for (let j = 0; j < n; j++) cov[base + j] += ci * c[j];
-    }
-  }
-  for (let k = 0; k < cov.length; k++) cov[k] /= Math.max(1, m - 1);
-
-  const pc1 = powerIteration(cov, n);
-  const deflated = new Float64Array(n * n);
-  for (let i = 0; i < n; i++) {
-    const base = i * n;
-    for (let j = 0; j < n; j++) {
-      deflated[base + j] = cov[base + j] - pc1.eigenvalue * pc1.vector[i] * pc1.vector[j];
-    }
-  }
-  const pc2 = powerIteration(deflated, n);
-
-  let totalVariance = 0;
-  for (let i = 0; i < n; i++) totalVariance += cov[i * n + i];
-  totalVariance = totalVariance || 1e-9;
-
-  return {
-    mean,
-    components: [pc1.vector, pc2.vector],
-    dims: n,
-    source: "tof_only",
-    stub: true,
-    explainedVarianceRatio: [pc1.eigenvalue / totalVariance, pc2.eigenvalue / totalVariance],
-  };
-}
-
-function projectPCA(model, vec) {
-  const c = vecSub(vec, model.mean);
-  return [dot(c, model.components[0]), dot(c, model.components[1])];
-}
-
-async function tryFetchServerPcaModel(source) {
-  try {
-    const res = await fetch(`/pca?model=${encodeURIComponent(source)}`);
-    if (!res.ok) return null;
-    const json = await res.json();
-    if (!json || !Array.isArray(json.mean) || !Array.isArray(json.components)) return null;
-    return {
-      mean: json.mean,
-      components: json.components,
-      dims: json.mean.length,
-      source: json.source || source,
-      stub: false,
-      explainedVarianceRatio: json.explained_variance_ratio || json.explainedVarianceRatio || null,
-    };
-  } catch {
-    return null; // endpoint doesn't exist yet (expected right now) or the network hiccuped
-  }
-}
+// vecSub/dot/normalize/matVec/powerIteration/fitPCA2Stub/projectPCA/
+// tryFetchServerPcaModel moved to draw/thumbnails.js so C19's per-trial
+// quiz.js thumbnail can reuse the exact same fitting/projection math
+// instead of a second, possibly-diverging implementation.
 
 const SENSORS = ["A", "B"];
 const CHANNELS = ["dist", "sig"];
@@ -453,11 +325,16 @@ const QUALITY_METRICS = [
   { key: "noise_floor", label: "音訊底噪", format: (v) => Math.round(v).toString(), provenance: "暫定" },
   { key: "bandwidth", label: "鏈路使用率", format: (v) => (v * 100).toFixed(0) + "%", provenance: "契約" },
 ];
-// [暫定]/[契約] above is a static snapshot of config/quality_thresholds.json's
-// _source field at the time this was written (esp-mask-test-ad suggested
-// this, "建議不是要求") -- there's no endpoint serving that file to the
-// browser, so this doesn't auto-update if B19 revises it. A real fetch
-// would need a new route, same category of gap as C10's /pca.
+// [暫定]/[契約] above are the INITIAL fallback provenance tags -- shown
+// before the first live fetch resolves (or if it fails), so the badges are
+// never blank. esp-mask-test-ed's GET /config/quality_thresholds
+// (re-reads config/quality_thresholds.json on every request, mtime hot
+// reload server-side per B19) now exists, so fetchQualityThresholds()
+// below overwrites these from the live file once it responds -- a
+// threshold edited and saved during E01 tuning shows up here without a
+// panel restart. The thresholds THEMSELVES (green/yellow cutoffs) are
+// still B19's job to apply server-side per "前端只負責顯示" (C09.md); this
+// only ever displays the _source provenance tag, never computes a level.
 
 const QUALITY_LEVEL_COLOR = {
   green: "#5fbf7a",  // var(--good)
@@ -467,6 +344,7 @@ const QUALITY_LEVEL_COLOR = {
 };
 const QUALITY_SPARKLINE_MS = 60000; // C09.md: "60 秒趨勢迷你圖"
 const DEVICE_STATE_CHECK_MS = 2000;
+const QUALITY_THRESHOLDS_CHECK_MS = 10000; // matches SERVER_MODEL_CHECK_MS's cadence philosophy -- frequent enough to feel live during E01 tuning, not a busy-poll
 
 // `size` is a cached { w, h } CSS-pixel box (see the ResizeObserver set up
 // in init() below), not a live canvas.clientWidth/clientHeight read --
@@ -527,7 +405,7 @@ registerMode("monitor", (() => {
   }
 
   // --- C09: quality dashboard state ---
-  const qualityEls = { value: {}, dot: {}, hint: {}, sparkCanvas: {}, sparkCtx: {} };
+  const qualityEls = { value: {}, dot: {}, hint: {}, sparkCanvas: {}, sparkCtx: {}, provBadge: {} };
   const sparkSize = {}; // key -> { w, h } CSS px, kept current by sparkResizeObserver (init())
   let sparkResizeObserver = null;
   const lastLevels = {}; // key -> "green"|"yellow"|"red"|"unknown", for the record-confirm gate
@@ -535,6 +413,34 @@ registerMode("monitor", (() => {
   let reflashNoteEl = null;
   let recBtn = null, recSecondsEl = null, recStatusEl = null;
   let lastDeviceStateCheckAt = 0;
+
+  // Extracts the leading "[暫定]"/"[契約]" tag from a metric's `_source`
+  // string (config/quality_thresholds.json's own convention, see that
+  // file's _provenance note) -- falls back to the metric's own initial
+  // QUALITY_METRICS tag if the field's shape ever changes underneath this.
+  function extractProvenanceTag(source, fallback) {
+    const m = typeof source === "string" && source.match(/^\[([^\]]+)\]/);
+    return m ? m[1] : fallback;
+  }
+
+  async function fetchQualityThresholds() {
+    try {
+      const res = await fetch("/config/quality_thresholds");
+      if (!res.ok) return; // bridge not up yet, or the file is missing/malformed -- badges keep showing their last known value
+      const json = await res.json();
+      for (const m of QUALITY_METRICS) {
+        const entry = json && json[m.key];
+        const badge = qualityEls.provBadge[m.key];
+        if (!badge || !entry) continue;
+        badge.textContent = `[${extractProvenanceTag(entry._source, m.provenance)}]`;
+        if (entry._source) badge.title = entry._source; // full explanation, not just the tag
+      }
+    } catch {
+      // network hiccup or bridge down -- badges just keep their last known
+      // value, same "don't fake it, don't crash" treatment as every other
+      // auto-upgrading fetch in this file (tryFetchServerPcaModel etc.)
+    }
+  }
 
   function handleQualityEvent(evt) {
     const metrics = evt.metrics || {};
@@ -1101,7 +1007,7 @@ registerMode("monitor", (() => {
               <div class="quality-card">
                 <div class="quality-card-head">
                   <span class="quality-label">${m.label}
-                    <span class="prov-badge mono" title="門檻出處：config/quality_thresholds.json 的 _source（靜態快照）">[${m.provenance}]</span>
+                    <span class="prov-badge mono" data-prov-badge="${m.key}" title="門檻出處：config/quality_thresholds.json 的 _source（透過 GET /config/quality_thresholds 即時讀取，改檔案存檔即生效，不需重啟）">[${m.provenance}]</span>
                   </span>
                   <span class="quality-level-dot level-unknown" data-quality-dot="${m.key}" title="unknown"></span>
                 </div>
@@ -1186,11 +1092,18 @@ registerMode("monitor", (() => {
         qualityEls.value[m.key] = root.querySelector(`[data-quality-value="${m.key}"]`);
         qualityEls.dot[m.key] = root.querySelector(`[data-quality-dot="${m.key}"]`);
         qualityEls.hint[m.key] = root.querySelector(`[data-quality-hint="${m.key}"]`);
+        qualityEls.provBadge[m.key] = root.querySelector(`[data-prov-badge="${m.key}"]`);
         const sparkCanvas = root.querySelector(`[data-quality-spark="${m.key}"]`);
         qualityEls.sparkCanvas[m.key] = sparkCanvas;
         qualityEls.sparkCtx[m.key] = sparkCanvas.getContext("2d");
         sparkResizeObserver.observe(sparkCanvas);
       }
+      // Once now (no reason to wait for the first periodic check if the
+      // endpoint already happens to exist) + periodically after, matching
+      // B19's server-side mtime hot reload: a threshold edited and saved
+      // during E01 tuning should show up here without a panel restart.
+      fetchQualityThresholds();
+      setInterval(fetchQualityThresholds, QUALITY_THRESHOLDS_CHECK_MS);
       alarmBannerEl = root.querySelector("[data-alarm-banner]");
       reflashNoteEl = root.querySelector("[data-reflash-note]");
       recBtn = root.querySelector("[data-rec-btn]");

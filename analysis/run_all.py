@@ -360,6 +360,135 @@ def _wear_distance_ratio(trials, feature_by_trial):
                   "「不同的詞長得不一樣」，跟戴法重複性無關。")
 
 
+def run_crosstalk(pairs, diagnosis, *, is_synthetic):
+    """實驗 `C0`：串擾。比較「只開一顆」與「兩顆都開」兩次錄製的差異。
+
+    ## 覆蓋率會寫進矩陣的「實測」欄，不是藏在備註裡
+
+    一組 solo 錄製只回答一個方向的問題：`solo="A"` 量的是**「B 開著會不會
+    干擾 A」**。要兩個方向都答，需要 `A` 與 `B` 各一組 solo 錄製。
+
+    只量到一邊時，矩陣那一列會寫成 `A: 1.30 mm（B 未量測）`——
+    **覆蓋率必須出現在使用者會掃的那一欄**。一個看起來很正常的 `✓ PASS`
+    配上藏在別處的「其實只驗了一半」，跟沒講一樣。
+    """
+    from analysis.experiments import exp_d10_crosstalk as mod
+
+    verdicts, ambient_rates, notes = {}, {}, []
+    for pair in pairs:
+        sensor = pair.solo_sensor
+        if sensor in verdicts:
+            continue                        # 同一顆有多組配對，取第一組就好
+        solo_dist, solo_valid = pair.solo.stacked_tof(sensor)
+        dual_dist, dual_valid = pair.dual.stacked_tof(sensor)
+        if solo_dist is None or dual_dist is None:
+            notes.append(f"感測器 {sensor} 的配對缺 ToF 資料，跳過")
+            continue
+        delta = mod.zone_distance_delta(solo_dist, solo_valid, dual_dist, dual_valid)
+        verdicts[sensor] = mod.crosstalk_verdict(delta)
+
+        solo_amb = pair.solo.stacked_ambient(sensor)
+        dual_amb = pair.dual.stacked_ambient(sensor)
+        if solo_amb is not None and dual_amb is not None:
+            _, rate = mod.zone_ambient_delta(solo_amb, dual_amb)
+            ambient_rates[sensor] = rate
+
+    if not verdicts:
+        return _skipped("C0", "配對到了但兩邊都沒有可用的 ToF 資料："
+                              + session_loader.describe_crosstalk_gap(diagnosis))
+
+    missing = [s for s in ("A", "B") if s not in verdicts]
+    worst = max(verdicts.items(), key=lambda kv: kv[1]["worst_delta_mm"])
+    measured = "、".join(f"{s}: {v['worst_delta_mm']:.2f} mm"
+                         for s, v in sorted(verdicts.items()))
+    if missing:
+        measured += f"（{'/'.join(missing)} 未量測）"
+
+    passed = all(v["passed"] for v in verdicts.values())
+    if not diagnosis["any_unconfirmed"]:
+        confirmation_note = None
+    else:
+        confirmation_note = (
+            "⚠️ 這組配對是基於 **未經裝置確認** 的感測器狀態："
+            "`sensors_enabled` 來自主機端記錄的 `SENS:` 指令，"
+            "而 `$STATUS` 沒有 `sens_a=`/`sens_b=` 可以回報實際狀態（§4.1.2）。"
+            "**指令送出去不等於裝置照做了。**"
+        )
+
+    reasons = notes[:]
+    if missing:
+        reasons.append(
+            f"只量到感測器 {'/'.join(sorted(verdicts))} 的方向。"
+            f"要驗 {'/'.join(missing)} 那個方向，需要在同一次戴上多錄一段"
+            f"「只開 {'/'.join(missing)}」的資料。"
+        )
+    if confirmation_note:
+        reasons.append(confirmation_note)
+
+    name, metric, criterion = EXPERIMENT_META["C0"]
+    return ExperimentOutcome(
+        key="C0", name=name, metric=metric, measured=measured, criterion=criterion,
+        status=STATUS_PASS if passed else STATUS_FAIL,
+        reason="；".join(reasons) if reasons else None,
+        detail={
+            "verdicts": {s: dict(v) for s, v in verdicts.items()},
+            "measured_sensors": sorted(verdicts),
+            "missing_sensors": missing,
+            "sensors_confirmed": not diagnosis["any_unconfirmed"],
+            "n_pairs": diagnosis["n_pairs"],
+            "has_ambient": sorted(ambient_rates),
+        },
+        diagnosis=None if passed else (
+            f"感測器 {worst[0]} 的最差 zone（#{worst[1]['worst_zone']}）"
+            f"距離差 {worst[1]['worst_delta_mm']:.2f} mm，超過 "
+            f"{worst[1]['threshold_mm']:.1f} mm 門檻。"
+            + ("\n\n" + mod.FALLBACK_RECOMMENDATION
+               if hasattr(mod, "FALLBACK_RECOMMENDATION") else "")
+        ),
+        report_md=_crosstalk_markdown(mod, verdicts, ambient_rates, missing,
+                                      confirmation_note, is_synthetic),
+    )
+
+
+def _crosstalk_markdown(mod, verdicts, ambient_rates, missing, confirmation_note,
+                        is_synthetic):
+    """`C0` 的報告。
+
+    `exp_d10_crosstalk.format_report()` 要求 A/B 兩顆的 verdict **與** ambient
+    變化率**都在**。實務上 ambient（`$A` 幀）是新加的，多數資料還沒有——
+    **不能為了呼叫它而餵零進去**，那是捏造一個「ambient 完全沒變」的結論。
+    所以齊全時用它的完整報告，不齊全時產一份講清楚缺什麼的簡版。
+    """
+    if len(verdicts) == 2 and len(ambient_rates) == 2:
+        return mod.format_report(verdicts["A"], verdicts["B"],
+                                 ambient_rates["A"], ambient_rates["B"], is_synthetic)
+
+    lines = ["# C0 — Crosstalk 分析（部分覆蓋）", ""]
+    if is_synthetic:
+        lines += ["> ⚠️ **本報告使用合成資料，數字不是真實結論。**", ""]
+    lines += ["| 感測器 | 最差 zone | 距離差 | 門檻 | 判定 |", "|---|---|---|---|---|"]
+    for sensor, verdict in sorted(verdicts.items()):
+        lines.append(
+            f"| {sensor} | #{verdict['worst_zone']} | "
+            f"{verdict['worst_delta_mm']:.2f} mm | {verdict['threshold_mm']:.1f} mm | "
+            f"{'✓ PASS' if verdict['passed'] else '✗ FAIL'} |")
+    lines.append("")
+    if missing:
+        lines += [f"⚠️ **感測器 {'/'.join(missing)} 的方向沒有量到。** "
+                  "一組 solo 錄製只回答一個方向：`solo=A` 量的是「B 會不會干擾 A」。"
+                  "兩個方向都要驗的話，同一次戴上要各錄一段。", ""]
+    if not ambient_rates:
+        lines += ["⚠️ **沒有 ambient 資料**（`tof_ambient_*`，§2 選填）。"
+                  "`D10` 明訂 `ambient_per_spad` 是 crosstalk **最靈敏**的指標——"
+                  "只看距離差可能漏掉還沒大到 2 mm、但 ambient 已經明顯上升的干擾。"
+                  "需要韌體開 `AMB:1`。", ""]
+    elif len(ambient_rates) < 2:
+        lines += [f"⚠️ 只有感測器 {'/'.join(sorted(ambient_rates))} 有 ambient 資料。", ""]
+    if confirmation_note:
+        lines += ["> " + confirmation_note, ""]
+    return "\n".join(lines)
+
+
 # ------------------------------------------ 側邊實驗（不進通過矩陣，餵一致性檢查）
 
 
@@ -417,8 +546,10 @@ def run_experiments(sessions, *, fast=False, is_synthetic=True,
                          + "、".join(f"{k}（{why}）" for k, why in skipped[:5])
                          + ("…" if len(skipped) > 5 else ""))
 
+    crosstalk, crosstalk_diagnosis = session_loader.crosstalk_pairs(sessions)
     runners = {
-        "C0": lambda: _skipped("C0", available["C0"]),
+        "C0": lambda: run_crosstalk(crosstalk, crosstalk_diagnosis,
+                                    is_synthetic=is_synthetic),
         "A": lambda: run_snr(sessions, trials, is_synthetic=is_synthetic),
         "B": lambda: run_wear_cv(trials, feature_by_trial, is_synthetic=is_synthetic),
         "C": lambda: run_silhouette(feature_seqs, labels, fast=fast,
@@ -429,7 +560,7 @@ def run_experiments(sessions, *, fast=False, is_synthetic=True,
     extras, side_reports = {}, []
     for key, runner in runners.items():
         reason = available.get(key)
-        if reason is not None and key != "C0":
+        if reason is not None:
             outcomes.append(_skipped(key, reason))
             continue
         if key in ("C", "E") and len(feature_seqs) < 2:

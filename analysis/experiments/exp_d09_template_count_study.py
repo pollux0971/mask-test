@@ -28,6 +28,7 @@
 """
 import numpy as np
 
+from analysis.reporting.plot_style import styled
 from analysis.similarity.cosine_baseline import cosine_dist
 from analysis.similarity.enrollment import calibrate_reject_threshold, loocv_accuracy
 from analysis.similarity.scoring import class_distances
@@ -225,22 +226,29 @@ def sweep_percentile(ns, percentiles=DEFAULT_PERCENTILE_SWEEP, n_reject_ratio=1.
 
 
 def plot_false_reject_vs_n(rows):
-    """驗收：圖表文字一律英文。畫 false-reject-rate vs n，tof/mel 各一條線。"""
-    import matplotlib.pyplot as plt
+    """驗收：圖表文字一律英文。畫 false-reject-rate vs n，tof/mel 各一條線。
 
-    ns = [r["n"] for r in rows]
-    tof_rates = [r["tof"]["false_reject_rate"] for r in rows]
-    mel_rates = [r["mel"]["false_reject_rate"] for r in rows]
+    D20：套用共用樣式——折線圖灰階下靠 `styled()` 設定的 line/marker
+    cycler 區分兩條線，不只靠顏色（這裡本來就各自手動指定了不同 marker，
+    跟共用 cycler 疊加沒有衝突）。這張圖沒有 `ax.imshow()`，不涉及
+    `assert_grayscale_safe()` 的色表檢查。
+    """
+    with styled():
+        import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(ns, tof_rates, marker="o", label="ToF")
-    ax.plot(ns, mel_rates, marker="s", label="Mel")
-    ax.axhline(FALSE_REJECT_TARGET, linestyle="--", color="gray", label=f"target ({FALSE_REJECT_TARGET:.0%})")
-    ax.set_title("False reject rate vs template count (synthetic, real-scale)")
-    ax.set_xlabel("templates per class (n)")
-    ax.set_ylabel("false reject rate")
-    ax.legend()
-    fig.tight_layout()
+        ns = [r["n"] for r in rows]
+        tof_rates = [r["tof"]["false_reject_rate"] for r in rows]
+        mel_rates = [r["mel"]["false_reject_rate"] for r in rows]
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(ns, tof_rates, marker="o", label="ToF")
+        ax.plot(ns, mel_rates, marker="s", label="Mel")
+        ax.axhline(FALSE_REJECT_TARGET, linestyle="--", color="gray", label=f"target ({FALSE_REJECT_TARGET:.0%})")
+        ax.set_title("False reject rate vs template count (synthetic, real-scale)")
+        ax.set_xlabel("templates per class (n)")
+        ax.set_ylabel("false reject rate")
+        ax.legend()
+        fig.tight_layout()
     return fig
 
 
@@ -350,6 +358,8 @@ def format_report(count_rows, percentile_rows, is_synthetic=True, safety_factor=
 if __name__ == "__main__":
     from pathlib import Path
 
+    from analysis.reporting.plot_style import save_figure
+
     print("掃樣板數（n_trials=100，7 個 n 值，percentile=95）...")
     count_rows = sweep_template_counts(n_trials=100)
     for r in count_rows:
@@ -371,3 +381,7 @@ if __name__ == "__main__":
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(report + "\n")
     print(f"\n報告已寫入 {out_path}")
+
+    fig = plot_false_reject_vs_n(count_rows)
+    written = save_figure(fig, out_path.with_name("D09_template_count_study_plot"))
+    print("圖已寫入：", ", ".join(str(p) for p in written))

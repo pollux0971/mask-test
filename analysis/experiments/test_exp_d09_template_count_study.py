@@ -15,6 +15,7 @@ from analysis.experiments.exp_d09_template_count_study import (
     sweep_percentile,
     sweep_template_counts,
 )
+from analysis.reporting.text_checks import assert_english_only
 from analysis.similarity.cosine_baseline import cosine_dist
 
 
@@ -76,17 +77,9 @@ def test_plot_false_reject_vs_n_draws_two_lines_english_only():
     assert len(line_axes) == 1
     assert len(line_axes[0].lines) >= 2  # ToF、Mel（可能還有 target 虛線）
 
-    texts = [fig._suptitle.get_text()] if fig._suptitle else []
-    for ax in fig.axes:
-        texts.append(ax.get_title())
-        texts.append(ax.get_xlabel())
-        texts.append(ax.get_ylabel())
-
-    def has_cjk(s):
-        return any("一" <= ch <= "鿿" for ch in s)
-
-    for t in texts:
-        assert not has_cjk(t), f"圖表文字含 CJK 字元: {t!r}"
+    # D20：改用共用的 `assert_english_only`（涵蓋 legend，原本這裡的本地
+    # `has_cjk` 檢查沒有掃 legend），不再各自維護一份會漂掉的字面實作。
+    assert_english_only(fig)
 
 
 def test_format_report_flags_synthetic_and_gives_concrete_recommendation():

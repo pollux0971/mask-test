@@ -16,18 +16,21 @@
 
 驗收門檻（`ssi-backlog/stories/A-firmware/A15.md`）：
     - 任一串流（tof_A / tof_B / mic / mel）掉幀率 > 1% -> 結束碼 1
-    - heap 在整段測試期間下降 >= 2 KB -> 結束碼 1（若有心跳資料可用；見下方已知限制）
+    - heap 在整段測試期間下降 >= 2 KB -> 結束碼 1（需要至少收到 2 筆心跳）
     - 否則結束碼 0
 
-已知限制（2026-08-26）：A15 把 $H 從 6 欄擴成 7 欄（新增
-`bw_bytes_since_last`，見 `ssi-backlog/CONTRACTS.md` §1.1 變更紀錄），但
-`host/capture/protocol.py` 的 `_parse_heartbeat()`（約 258 行）仍然硬性要求
-`len(parts) == 7`（對應舊格式的 6 個資料欄 + `$H` 本身）。在那邊更新之前，
-**每一行 $H 都會被判成畸形行，`heap`／`bw` 欄位在報告裡會標成
-`N/A（見已知限制）`**，不是量測失敗；掉幀率仍然準，因為那條路完全走
-`seq` 缺口（`DropTracker`），不吃 `$H`。真正的頻寬使用率改用本腳本自己在
-序列埠層算的「實際收到的總 bytes / 經過秒數」，不依賴 $H 的欄位，所以那
-一欄不受這個已知限制影響。
+已解決（原「已知限制」，`HANDOFF.md` dry-run 稽核時重新確認，2026-08-26）：
+這裡曾經記錄「A15 把 $H 從 6 欄擴成 7 欄，但 `host/capture/protocol.py`
+的 `_parse_heartbeat()` 仍然硬性要求 `len(parts) == 7`，導致每一行 $H
+都被判成畸形行、`heap`/`bw` 只能標 N/A」——**這個限制目前已經不成立**。
+`_parse_heartbeat()` 現在是 `len(parts) < 7` 起接受、且會讀 `parts[7]`
+當 `bw_bytes_since_last`（實測：餵一行合成的 8 欄 `$H` 給
+`parse_line()`，`heap`/`temp_c`/`bw_bytes_since_last` 全部正確解析）。
+下面的 `heap_str`/`malformed_h_lines` 分支保留，是防禦性的——如果
+$H 真的解析失敗（例如未來格式又變了），這裡仍然會誠實報告 N/A 而不是
+猜一個假數字，但**目前正常運作下不會觸發**，不代表本腳本仍卡在那個
+已修好的舊 bug 上。真正的頻寬使用率算法（序列埠層「實際收到的總
+bytes / 經過秒數」，不依賴 $H 欄位）從頭到尾都沒受這個問題影響。
 """
 from __future__ import annotations
 
@@ -181,7 +184,7 @@ def write_report(stats: dict, config_label: str, out_dir: Path) -> Path:
     safe_config = config_label.replace(" ", "_").replace("/", "-")
     out_path = out_dir / f"{safe_config}_{sha}_{date_tag}.md"
 
-    heap_str = "N/A（見已知限制：$H 目前解析不出來）" if stats["heap_delta"] is None else f"{stats['heap_delta']} bytes"
+    heap_str = "N/A（心跳筆數不足，至少需要 2 筆才能算差值）" if stats["heap_delta"] is None else f"{stats['heap_delta']} bytes"
     bw_str = "N/A" if stats["bandwidth_actual_pct"] is None else f"{stats['bandwidth_actual_pct']:.1f}%"
 
     lines = [
@@ -227,7 +230,9 @@ def write_report(stats: dict, config_label: str, out_dir: Path) -> Path:
         lines += [
             "",
             f"⚠️ 收到 {stats['malformed_h_lines']} 行 `$H` 但全部解析失敗"
-            "（已知限制，見本檔案開頭文件字串；heap/心跳次數因此是 0/N/A，不代表裝置沒送）。",
+            "（本檔案開頭文件字串記錄的舊已知限制已經解決，這裡若還是觸發，"
+            "代表格式又有新變化，需要重新檢查 `_parse_heartbeat()`；"
+            "heap/心跳次數因此是 0/N/A，不代表裝置沒送）。",
         ]
 
     lines += [
@@ -274,7 +279,7 @@ def main() -> int:
         )
         ok = False
     elif stats["heap_delta"] is None:
-        print("heap Δ 無法判定（$H 未解析，見已知限制），這條驗收條件本輪無法自動判定。", file=sys.stderr)
+        print("heap Δ 無法判定（收到的心跳筆數不足 2 筆），這條驗收條件本輪無法自動判定。", file=sys.stderr)
 
     return 0 if ok else 1
 

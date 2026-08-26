@@ -9,7 +9,7 @@
   display: flex;
   align-items: baseline;
   gap: 10px;
-  font-size: 12px;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--text-dim);
@@ -17,7 +17,7 @@
 
 .quiz-baseline {
   margin-left: auto;
-  font-size: 12px;
+  font-size: 0.75rem;
   letter-spacing: normal;
   text-transform: none;
   color: var(--accent);
@@ -25,7 +25,7 @@
 }
 
 .quiz-prompt {
-  font-size: 16px;
+  font-size: 1rem;
   font-weight: 600;
 }
 
@@ -33,7 +33,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 13px;
+  font-size: 0.8125rem;
   padding: 8px 12px;
   border-radius: 8px;
   width: fit-content;
@@ -63,13 +63,13 @@
   flex-wrap: wrap;
 }
 .quiz-control-label {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
   margin-right: 4px;
 }
 .quiz-mode-btn {
   font-family: inherit;
-  font-size: 12px;
+  font-size: 0.75rem;
   font-weight: 600;
   padding: 6px 12px;
   border-radius: 999px;
@@ -84,7 +84,7 @@
   border-color: var(--accent);
 }
 .quiz-trigger-row {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--warn);
 }
 
@@ -113,17 +113,17 @@
 }
 
 .quiz-card-text {
-  font-size: 28px;
+  font-size: 1.75rem;
   font-weight: 700;
 }
 
 .quiz-card-viseme {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
 }
 
 .quiz-card-expect {
-  font-size: 11px;
+  font-size: 0.6875rem;
   font-weight: 600;
   padding: 2px 8px;
   border-radius: 999px;
@@ -149,7 +149,7 @@
   opacity: 0.85;
 }
 .quiz-card-reject .quiz-card-text {
-  font-size: 18px;
+  font-size: 1.125rem;
   color: var(--text-dim);
 }
 
@@ -161,12 +161,125 @@
   flex-shrink: 0;
 }
 .quiz-result-status {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
 }
 
+/* --- C19: staged progress (B14 route's ~4s wait) + input-signal thumbnails --- */
+.quiz-progress {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-shrink: 0;
+  padding: 8px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.75rem;
+}
+.quiz-progress-stages {
+  display: flex;
+  gap: 8px;
+}
+.quiz-progress-stage {
+  padding: 3px 10px;
+  border-radius: 999px;
+  color: var(--text-dim);
+  background: var(--surface-2);
+}
+.quiz-progress-stage.active {
+  color: var(--bg);
+  background: var(--accent);
+  font-weight: 700;
+}
+.quiz-progress-stage.done {
+  color: var(--good);
+  background: rgba(95, 191, 122, 0.14);
+}
+/* "分析中" 沒有真實的伺服器進度事件（POST /recognize 送出後只能等
+   回應，不是真的知道伺服器內部跑到哪）-- 呼吸動畫代表不定進度，
+   刻意不畫假的百分比條，避免看起來像是真的在回報進度。 */
+.quiz-progress-stage.active.indeterminate {
+  animation: quiz-breathe 1.2s ease-in-out infinite;
+}
+.quiz-progress-note {
+  color: var(--text-dim);
+  margin-left: auto;
+}
+
+.quiz-thumbnails {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  flex-shrink: 0;
+}
+.quiz-thumb-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  min-width: 0;
+}
+.quiz-thumb-head {
+  font-size: 0.6875rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.quiz-thumb-sub {
+  font-size: 0.625rem;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text-dim);
+}
+.quiz-thumb-canvas-wrap {
+  height: 80px;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.quiz-thumb-canvas-wrap canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.quiz-thumb-tof-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.quiz-thumb-tof-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.quiz-thumb-tof-row-label {
+  font-size: 0.625rem;
+  color: var(--text-dim);
+  width: 12px;
+  flex-shrink: 0;
+}
+.quiz-thumb-tof-row canvas {
+  flex: 1;
+  min-width: 0;
+  aspect-ratio: 1;
+  border-radius: 4px;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+.quiz-thumb-empty {
+  font-size: 0.6875rem;
+  color: var(--text-dim);
+  padding: 10px 0;
+}
+
 .quiz-disagree-banner {
-  font-size: 13px;
+  font-size: 0.8125rem;
   font-weight: 700;
   color: var(--warn);
   background: var(--warn-soft);
@@ -224,7 +337,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 20px;
+  font-size: 1.25rem;
   font-weight: 700;
 }
 
@@ -235,7 +348,7 @@
 /* 2m 外可讀 (C18.md 明確驗收條件) -- deliberately the biggest text in
    the whole mode, bigger than the vocab cards themselves. */
 .quiz-result-card-word {
-  font-size: 56px;
+  font-size: 3.5rem;
   font-weight: 800;
   line-height: 1.1;
 }
@@ -243,7 +356,7 @@
   color: var(--text-dim);
 }
 .quiz-result-card-sub {
-  font-size: 13px;
+  font-size: 0.8125rem;
   color: var(--text-dim);
   margin-top: 4px;
 }
@@ -264,7 +377,7 @@
   border-radius: 10px;
 }
 .quiz-w-end-label {
-  font-size: 12px;
+  font-size: 0.75rem;
   font-weight: 700;
   color: var(--text-dim);
   flex-shrink: 0;
@@ -298,7 +411,7 @@
 }
 /* w 的當前值要大字顯示（C17.md 明確驗收條件），不是塞在小字狀態列裡 */
 .quiz-w-value {
-  font-size: 22px;
+  font-size: 1.375rem;
   font-weight: 700;
   color: var(--accent);
   min-width: 5.5em;
@@ -316,7 +429,7 @@
   /* 1080p / 2m-away legibility (C16.md's explicit acceptance criterion) --
      sized generously rather than shrinking to fit; the grid scrolls if the
      viewport is short instead of cramming bars smaller. */
-  font-size: 15px;
+  font-size: 0.9375rem;
 }
 
 .quiz-result-col {
@@ -337,14 +450,14 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 13px;
+  font-size: 0.8125rem;
   font-weight: 700;
   color: var(--text-dim);
 }
 .quiz-result-col.fused .quiz-result-col-head { color: var(--accent); }
 
 .quiz-reject-badge {
-  font-size: 11px;
+  font-size: 0.6875rem;
   font-weight: 700;
   color: var(--warn);
   background: var(--warn-soft);
@@ -385,7 +498,7 @@
 
 .quiz-bar-pct {
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 
 /* top-1 within a (non-rejected) column -- bold label, filled bar in the
@@ -424,7 +537,7 @@
 
 .quiz-matrix-count {
   margin-left: auto;
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
 }
 
@@ -434,7 +547,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 14px;
+  font-size: 0.875rem;
   font-weight: 700;
   color: var(--warn);
   background: var(--warn-soft);
@@ -443,7 +556,7 @@
   width: fit-content;
 }
 .quiz-assigned-word {
-  font-size: 18px;
+  font-size: 1.125rem;
 }
 
 .quiz-posthoc-controls {
@@ -458,7 +571,7 @@
 }
 .quiz-posthoc-select {
   font-family: inherit;
-  font-size: 12px;
+  font-size: 0.75rem;
   padding: 5px 10px;
   border-radius: 8px;
   border: 1px solid var(--border);
@@ -476,7 +589,7 @@
 /* Same warning-banner language as .quiz-assigned-prompt/.quiz-disagree-banner --
    deliberately not a blocking dialog (C21.md follow-up: "不用擋，提示就好"). */
 .quiz-mode-switch-warning {
-  font-size: 12px;
+  font-size: 0.75rem;
   font-weight: 700;
   color: var(--warn);
   background: var(--warn-soft);
@@ -498,7 +611,7 @@
 }
 .quiz-stats-baseline {
   margin-left: auto;
-  font-size: 12px;
+  font-size: 0.75rem;
   letter-spacing: normal;
   text-transform: none;
   color: var(--accent);
@@ -524,7 +637,7 @@
   border-color: var(--accent);
 }
 .quiz-stat-head {
-  font-size: 13px;
+  font-size: 0.8125rem;
   font-weight: 700;
   color: var(--text-dim);
 }
@@ -533,16 +646,16 @@
 }
 
 .quiz-stat-acc {
-  font-size: 24px;
+  font-size: 1.5rem;
   font-weight: 800;
 }
 .quiz-stat-ci {
-  font-size: 12px;
+  font-size: 0.75rem;
   font-weight: 600;
   color: var(--text-dim);
 }
 .quiz-stat-sub,
 .quiz-stat-breakdown {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
 }

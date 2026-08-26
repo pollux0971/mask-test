@@ -57,7 +57,10 @@ def _trial_arrays(rng, word, n_frames=30):
 
 
 def write_session(path, *, wear_id, seed, n_per_word=3, words=WORDS,
-                  with_mel=True, quality="ok"):
+                  with_mel=True, quality="ok", sensors_enabled="AB",
+                  sensors_confirmed=False, with_ambient=False,
+                  crosstalk_shift_mm=0.0):
+    """`crosstalk_shift_mm` 讓 dual 錄製的距離整體偏移，模擬串擾。"""
     rng = np.random.RandomState(seed)
     with h5py.File(path, "w") as handle:
         meta = handle.create_group("meta")
@@ -74,12 +77,26 @@ def write_session(path, *, wear_id, seed, n_per_word=3, words=WORDS,
                                                              dtype=np.float32)
         meta.attrs["noise_floor_mu"] = 300.0
         meta.attrs["noise_floor_sigma"] = 30.0
+        if sensors_enabled is not None:
+            meta.attrs["sensors_enabled"] = sensors_enabled
+            meta.attrs["sensors_enabled_confirmed"] = sensors_confirmed
 
         index = 0
         for word in words:
             for _ in range(n_per_word):
                 group = handle.create_group(f"trial_{index:03d}")
-                for name, value in _trial_arrays(rng, word).items():
+                arrays = _trial_arrays(rng, word)
+                if crosstalk_shift_mm:
+                    arrays["tof_A"] = arrays["tof_A"] + np.float32(crosstalk_shift_mm)
+                    arrays["tof_B"] = arrays["tof_B"] + np.float32(crosstalk_shift_mm)
+                if with_ambient:
+                    n = arrays["tof_A"].shape[0]
+                    for sensor in ("A", "B"):
+                        arrays[f"tof_ambient_{sensor}"] = rng.normal(
+                            5.0, 0.2, (max(1, n // 10), N_ZONES)).astype(np.float32)
+                    arrays["tof_ambient_t_us"] = (
+                        np.arange(max(1, n // 10)) * 1_000_000).astype(np.int64)
+                for name, value in arrays.items():
                     if name.startswith("mel") and not with_mel:
                         continue
                     group.create_dataset(name, data=value)
@@ -154,11 +171,20 @@ def test_missing_baseline_is_none_not_a_guess(tmp_path):
 # ------------------------------------------------------------ 可用性判定
 
 
-def test_crosstalk_is_always_skipped_from_a_session_file():
-    """§2 的 schema 沒有記錄擷取時另一顆感測器的開關狀態。"""
+def test_crosstalk_is_skipped_when_there_is_nothing_to_pair():
+    """`C0` 不再是「永遠 SKIPPED」。
+
+    這條原本斷言「§2 的 schema **沒有**記錄感測器開關狀態，所以 `C0` 永遠
+    跑不了」。`sensors_enabled` 加進 §2 之後那個前提消失了——**測試斷言的是
+    一個已經被修掉的限制**，所以改的是測試不是程式。
+
+    現在的正確行為：沒有東西可配時仍然 SKIPPED，但訊息要**數得出來**
+    （有幾個、哪一種缺），使用者才知道要補錄什麼。
+    """
     reasons = session_loader.availability([])
     assert reasons["C0"] is not None
-    assert "開關狀態" in reasons["C0"]
+    assert "共 0 個 session" in reasons["C0"]
+    assert "SENS:B=0" in reasons["C0"]           # 告訴他怎麼錄
 
 
 def test_single_wear_id_skips_the_cv_experiment(tmp_path):
@@ -413,3 +439,201 @@ def test_figures_are_written_in_both_formats(two_sessions, tmp_path):
     assert pngs and len(pngs) == len(pdfs)
     assert [p.stem for p in pngs] == [p.stem for p in pdfs]
     assert all(p.read_bytes()[:5] == b"%PDF-" for p in pdfs)
+
+
+# ======================================= C0 串擾：solo/dual 配對（sensors_enabled）
+
+from analysis.reporting.session_loader import (          # noqa: E402
+    crosstalk_pairs,
+    describe_crosstalk_gap,
+)
+
+
+@pytest.fixture
+def crosstalk_sessions(tmp_path):
+    """同一次戴上（`wear_id=1`）錄兩段：只開 A、兩顆都開。"""
+    return [
+        write_session(tmp_path / "solo_a.h5", wear_id=1, seed=3,
+                      sensors_enabled="A"),
+        write_session(tmp_path / "dual.h5", wear_id=1, seed=4,
+                      sensors_enabled="AB", crosstalk_shift_mm=0.5),
+    ]
+
+
+def _load(paths):
+    return [session_loader.load_session(p) for p in paths]
+
+
+def test_sensors_enabled_is_read_from_meta(crosstalk_sessions):
+    solo, dual = _load(crosstalk_sessions)
+    assert solo.sensors_enabled == "A"
+    assert dual.sensors_enabled == "AB"
+
+
+def test_missing_sensors_enabled_is_unknown_not_ab(tmp_path):
+    """🔴 **猜 `AB` 會讓舊資料被錯誤配對，而結果看起來完全正常。**"""
+    path = write_session(tmp_path / "old.h5", wear_id=1, seed=5,
+                         sensors_enabled=None)
+    session = session_loader.load_session(path)
+    assert session.sensors_enabled is None
+
+    pairs, diagnosis = crosstalk_pairs([session])
+    assert pairs == []
+    assert diagnosis["counts"]["unknown"] == 1
+    assert diagnosis["counts"]["AB"] == 0
+
+
+def test_confirmed_defaults_to_false_when_absent(tmp_path):
+    """「沒寫」不能當成「確認過」。"""
+    path = write_session(tmp_path / "s.h5", wear_id=1, seed=6, sensors_enabled=None)
+    assert session_loader.load_session(path).sensors_confirmed is False
+
+
+def test_pairs_solo_with_dual_on_the_same_wear(crosstalk_sessions):
+    pairs, diagnosis = crosstalk_pairs(_load(crosstalk_sessions))
+    assert len(pairs) == 1
+    pair = pairs[0]
+    assert pair.wear_id == 1
+    assert pair.solo_sensor == "A"
+    assert pair.dual.sensors_enabled == "AB"
+    assert diagnosis["n_pairs"] == 1
+
+
+def test_does_not_pair_across_different_wear_ids(tmp_path):
+    """🔴 跨次戴比 crosstalk 會把**戴法差異**算成**串擾**。
+
+    串擾門檻是 2 mm，而重新戴一次造成的距離差可以輕易超過它——
+    **配錯的結果看起來完全正常，只是 Δ 偏大。**
+    """
+    sessions = _load([
+        write_session(tmp_path / "solo_w1.h5", wear_id=1, seed=7, sensors_enabled="A"),
+        write_session(tmp_path / "dual_w2.h5", wear_id=2, seed=8, sensors_enabled="AB"),
+    ])
+    pairs, diagnosis = crosstalk_pairs(sessions)
+    assert pairs == []
+    assert diagnosis["unpaired_wear_ids"] == [1, 2]
+    assert "同一次戴上" in describe_crosstalk_gap(diagnosis)
+
+
+def test_unconfirmed_state_does_not_block_pairing(crosstalk_sessions):
+    """⚠️ `confirmed` 幾乎永遠是 `False`（`$STATUS` 沒有 `sens_a=`）。
+    拿它當配對條件會讓 `C0` 永遠跑不了——**但也不能靜默忽略**。"""
+    pairs, diagnosis = crosstalk_pairs(_load(crosstalk_sessions))
+    assert len(pairs) == 1
+    assert pairs[0].confirmed is False
+    assert diagnosis["any_unconfirmed"] is True
+
+
+def test_confirmed_true_propagates_when_the_device_did_confirm(tmp_path):
+    sessions = _load([
+        write_session(tmp_path / "s.h5", wear_id=1, seed=9, sensors_enabled="A",
+                      sensors_confirmed=True),
+        write_session(tmp_path / "d.h5", wear_id=1, seed=10, sensors_enabled="AB",
+                      sensors_confirmed=True),
+    ])
+    pairs, diagnosis = crosstalk_pairs(sessions)
+    assert pairs[0].confirmed is True
+    assert diagnosis["any_unconfirmed"] is False
+
+
+def test_gap_message_counts_what_exists_not_just_says_insufficient(tmp_path):
+    """「資料不足」幫不上任何忙——使用者要的是「我該補錄什麼」。"""
+    sessions = _load([
+        write_session(tmp_path / "d1.h5", wear_id=1, seed=11, sensors_enabled="AB"),
+        write_session(tmp_path / "old.h5", wear_id=1, seed=12, sensors_enabled=None),
+    ])
+    _, diagnosis = crosstalk_pairs(sessions)
+    message = describe_crosstalk_gap(diagnosis)
+    assert "共 2 個 session" in message
+    assert "兩顆都開（AB）1 個" in message
+    assert "未知）1 個" in message
+    assert "SENS:B=0" in message
+
+
+def test_availability_reports_c0_as_runnable_when_paired(crosstalk_sessions):
+    """`C0` 從「永遠 SKIPPED」變成「有資料就跑」。"""
+    assert session_loader.availability(_load(crosstalk_sessions))["C0"] is None
+
+
+# ------------------------------------------------------------ C0 真的跑起來
+
+
+def test_crosstalk_runs_and_reports_partial_coverage(crosstalk_sessions):
+    """只有一組 solo 錄製時，**覆蓋率要出現在矩陣的「實測」欄**，
+    不能藏在備註裡。"""
+    outcomes, _, _, _ = run_all.run_experiments(
+        _load(crosstalk_sessions), ablation_permutations=0)
+    c0 = next(o for o in outcomes if o.key == "C0")
+
+    assert c0.status in (STATUS_PASS, "fail")
+    assert c0.measured != "—"
+    assert "A:" in c0.measured
+    assert "B 未量測" in c0.measured           # ← 掃矩陣就看得到
+    assert c0.detail["measured_sensors"] == ["A"]
+    assert c0.detail["missing_sensors"] == ["B"]
+    assert c0.detail["sensors_confirmed"] is False
+    assert "未經裝置確認" in c0.reason
+    assert "只開 B" in c0.reason
+
+
+def test_crosstalk_report_flags_the_missing_ambient(crosstalk_sessions):
+    """`D10` 明訂 ambient 是 crosstalk **最靈敏**的指標——沒有它就要講。"""
+    outcomes, _, _, _ = run_all.run_experiments(
+        _load(crosstalk_sessions), ablation_permutations=0)
+    c0 = next(o for o in outcomes if o.key == "C0")
+    assert "沒有 ambient 資料" in c0.report_md
+    assert "最靈敏" in c0.report_md
+
+
+def test_crosstalk_never_fabricates_ambient_to_call_format_report(crosstalk_sessions):
+    """**不能為了呼叫 `format_report()` 而餵零進去**——那是捏造一個
+    「ambient 完全沒變」的結論。"""
+    outcomes, _, _, _ = run_all.run_experiments(
+        _load(crosstalk_sessions), ablation_permutations=0)
+    c0 = next(o for o in outcomes if o.key == "C0")
+    assert c0.detail["has_ambient"] == []
+    assert "部分覆蓋" in c0.report_md          # 簡版而非 D10 的完整報告
+
+
+def test_crosstalk_full_coverage_uses_the_d10_report(tmp_path):
+    """A/B 兩個方向都有、ambient 也齊全時，用 `D10` 自己的完整報告。"""
+    sessions = _load([
+        write_session(tmp_path / "solo_a.h5", wear_id=1, seed=13,
+                      sensors_enabled="A", with_ambient=True),
+        write_session(tmp_path / "solo_b.h5", wear_id=1, seed=14,
+                      sensors_enabled="B", with_ambient=True),
+        write_session(tmp_path / "dual.h5", wear_id=1, seed=15,
+                      sensors_enabled="AB", with_ambient=True,
+                      crosstalk_shift_mm=0.4),
+    ])
+    outcomes, _, _, _ = run_all.run_experiments(sessions, ablation_permutations=0)
+    c0 = next(o for o in outcomes if o.key == "C0")
+    assert c0.detail["measured_sensors"] == ["A", "B"]
+    assert c0.detail["missing_sensors"] == []
+    assert "未量測" not in c0.measured
+    assert c0.report_md.startswith("# D10")   # ← D10 自己的完整報告
+    assert sorted(c0.detail["has_ambient"]) == ["A", "B"]
+
+
+def test_crosstalk_fails_when_the_shift_exceeds_the_threshold(tmp_path):
+    """門檻是 2 mm。偏移 5 mm 必須 FAIL，不能永遠回 PASS。"""
+    sessions = _load([
+        write_session(tmp_path / "solo.h5", wear_id=1, seed=16, sensors_enabled="A"),
+        write_session(tmp_path / "dual.h5", wear_id=1, seed=17, sensors_enabled="AB",
+                      crosstalk_shift_mm=5.0),
+    ])
+    outcomes, _, _, _ = run_all.run_experiments(sessions, ablation_permutations=0)
+    c0 = next(o for o in outcomes if o.key == "C0")
+    assert c0.status == "fail"
+    assert c0.diagnosis and "超過" in c0.diagnosis
+
+
+def test_crosstalk_still_skipped_without_pairs(two_sessions):
+    """兩個 session 都是 `AB`（預設），配不出 solo → 仍然 SKIPPED，
+    但訊息要說清楚缺什麼。"""
+    outcomes, _, _, _ = run_all.run_experiments(
+        _load(two_sessions), ablation_permutations=0)
+    c0 = next(o for o in outcomes if o.key == "C0")
+    assert c0.status == STATUS_SKIPPED
+    assert "共 2 個 session" in c0.reason
+    assert "只開一顆（A/B）0 個" in c0.reason

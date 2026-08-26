@@ -1,14 +1,15 @@
 // Quiz mode (C15): 8-option closed-set layout.
 //
-// Data source note: words come from panel/data/vocab.json, a manually
-// synced COPY of the canonical config/vocab.json -- bridge_server.py has
-// no route serving config/*.json to the browser (same class of gap as
-// C09's quality_thresholds.json / C10's /pca, flagged in the completion
-// report; not fixable from here since bridge_server.py isn't in scope
-// this round). Editing panel/data/vocab.json changes the displayed
-// options with zero JS changes, which is what C15.md's "改 JSON 即改變
-// 選項" and E08's "4 選項備援只需要改一個 JSON" actually need -- keeping
-// it in sync with the real config/vocab.json is a manual step for now.
+// Data source note: words come from GET /config/vocab (esp-mask-test-ed's
+// endpoint, reads config/vocab.json fresh on every request -- no caching,
+// no restart needed). This used to be a manually-synced COPY at
+// panel/data/vocab.json (C15's own stopgap, made before the endpoint
+// existed) -- that file still exists for record.js, which hasn't switched
+// yet, but quiz.js no longer reads it. Editing config/vocab.json now
+// changes the displayed options with zero JS changes and zero restart,
+// which is what C15.md's "改 JSON 即改變選項" and E08's "4 選項備援只需要
+// 改一個 JSON" actually need -- and unlike the old copy, there's no second
+// file that can silently drift out of sync.
 //
 // Auto-VAD readiness: {type:"trial",...} (CONTRACTS.md 4.2) is the wire
 // signal for real PROMPT/COUNTDOWN/CAPTURE/SAVE/REST state, but nothing
@@ -48,10 +49,56 @@
 // so this is D07.md's own fuse() applied verbatim, not a guess.
 
 import { registerMode } from "../shell.js";
+import { dataStore } from "../bus.js";
+import {
+  drawMelWaterfallStatic, drawTofKeyframeGrid, computeZoneStats,
+  fitPCA2Stub, projectPCA, tryFetchServerPcaModel, drawPcaTrailStatic,
+} from "../draw/thumbnails.js";
 
-const VOCAB_URL = "data/vocab.json";
+const VOCAB_URL = "/config/vocab";
 const FALLBACK_VOCAB = { words: [], reject: { id: "_reject", text: "靜止／其他" } };
 const DEFAULT_FUSED_W = 0.5; // Demo script step 1; C17 makes this a live slider
+
+// --- C19: staged progress + input-signal thumbnails ---
+//
+// "分階段進度是走 B14 路線時的必要設計" (C19.md) -- B14.md's own latency
+// breakdown is 錄音 2.0s + base64 傳輸 1.9s + 解碼/MFCC 0.1s = ~4.0s total.
+// Only two of those phases have a live SSE signal today (bridge_server.py's
+// `{type:"record", state:"receiving"|"done"}`, confirmed live -- there's no
+// "recording" state event at all, and nothing between "done" and
+// POST /recognize's own response arriving covers "解碼/MFCC"). So:
+//   recording  -- from the moment the request is sent until "receiving"
+//                 arrives (or the response itself, if it beats that)
+//   receiving  -- from "receiving" until "done"
+//   analyzing  -- from "done" (or from request-sent, if "done" never
+//                 arrives -- e.g. today, since /recognize is 404) until the
+//                 fetch resolves. No live progress signal exists for this
+//                 phase, so it's shown as elapsed time with an explicit
+//                 indeterminate (breathing) treatment, never a fabricated
+//                 percentage -- same "don't fake per-step progress" call
+//                 esp-mask-test-ca made for C22's run_all.
+const PROGRESS_STAGES = ["recording", "receiving", "analyzing"];
+const PROGRESS_STAGE_LABEL = { recording: "錄音中", receiving: "傳輸中", analyzing: "分析中" };
+const PROGRESS_TICK_MS = 250;
+
+// Capture window for the thumbnails: dataStore.getRecent(streamKey, ms),
+// copied into plain objects immediately (never a held live reference --
+// dataStore's ring buffers keep trimming, esp-mask-test-4f's C13 finding:
+// a live reference goes silently empty later, indistinguishable from
+// "never captured"). Window length = actual elapsed request time + a fixed
+// slack, not a guess -- it's exactly how far back the data that could have
+// fed this recognition goes.
+const CAPTURE_WINDOW_SLACK_MS = 500;
+const TOF_THUMB_PX = 72; // small keyframe grid, per-cell backing pixels
+const MEL_THUMB_COLS = 80; // fewer columns than monitor.js's live 320 -- this is a thumbnail, not a scrolling waterfall
+// A one-shot per-trial PCA fit is inherently sample-starved compared to
+// monitor.js's continuously-refit MIN_FIT_SAMPLES=40 (chosen there as
+// "well above the 64-dim rank-deficiency floor" for a 15s sliding window).
+// A single ~2-4s trial has far fewer frames to offer, so this floor is
+// intentionally lower -- below it, the fit would just be interpolating
+// through too few points to mean anything, so this shows "資料不足" instead
+// of a misleadingly confident-looking trajectory.
+const PCA_THUMB_MIN_SAMPLES = 16;
 
 function softmax(values) {
   const max = Math.max(...values);
@@ -282,6 +329,17 @@ registerMode("quiz", (() => {
   // --- C21: session stats row ---
   const statsBodyEl = { tof: null, mel: null, fused: null };
   let statsBaselineEl = null;
+
+  // --- C19: staged progress + input-signal thumbnails ---
+  let progressEl = null, progressNoteEl = null;
+  const progressStageEls = {};
+  let progressStage = null; // null | "recording" | "receiving" | "analyzing" | "done"
+  let progressTimerId = null;
+  let recognizeRequestSentAt = null;
+  let thumbnailsEl = null;
+  let thumbTofGridEl = null, thumbTofNoteEl = null;
+  let thumbMelCanvas = null, thumbMelCtx = null, thumbMelNoteEl = null;
+  let thumbPcaCanvas = null, thumbPcaCtx = null, thumbPcaNoteEl = null;
 
   function renderColumn(el, classes, scores, rejected) {
     const entries = sortedEntries(classes, scores);
@@ -687,6 +745,19 @@ registerMode("quiz", (() => {
 
     renderFusedColumn(); // uses currentW (whatever the slider is already at) and the caches just set above
 
+    // C19: input-signal thumbnails. Deliberately NOT called from inside
+    // renderFusedColumn() alongside C17/C20/C21 -- unlike those three,
+    // thumbnails are a function of the captured INPUT (what the sensors
+    // saw), not of the fusion weight w, so recomputing them every time the
+    // slider moves would just redraw the identical three images repeatedly
+    // for no reason. This still runs exactly once per fresh result, right
+    // next to the renderFusedColumn() call that starts the rest of the
+    // "a result just arrived" chain.
+    const elapsedMs = recognizeRequestSentAt != null
+      ? performance.now() - recognizeRequestSentAt
+      : CAPTURE_WINDOW_SLACK_MS;
+    captureAndRenderThumbnails(elapsedMs);
+
     resultStatusEl.textContent = "已顯示辨識結果";
 
     // C20: every fresh result is one un-marked matrix observation. In
@@ -706,8 +777,232 @@ registerMode("quiz", (() => {
     }
   }
 
+  // --- C19: staged progress ---
+
+  function startProgress() {
+    progressStage = "recording";
+    if (thumbnailsEl) thumbnailsEl.style.display = "none";
+    if (progressEl) progressEl.style.display = "flex";
+    renderProgress();
+    if (progressTimerId != null) clearInterval(progressTimerId);
+    progressTimerId = setInterval(renderProgress, PROGRESS_TICK_MS);
+  }
+
+  // Stages only ever move forward. A stray "receiving"/"done" arriving
+  // after this trial already reached "analyzing" (e.g. a near-simultaneous
+  // manual /record click from record.js firing the same SSE states) must
+  // not rewind the bar back to an earlier stage.
+  function setProgressStage(stage) {
+    const from = progressStage ? PROGRESS_STAGES.indexOf(progressStage) : -1;
+    const to = PROGRESS_STAGES.indexOf(stage);
+    if (to <= from) return;
+    progressStage = stage;
+    renderProgress();
+  }
+
+  function renderProgress() {
+    if (!progressEl || progressStage == null) return;
+    const finished = progressStage === "done";
+    const currentIdx = finished ? PROGRESS_STAGES.length : PROGRESS_STAGES.indexOf(progressStage);
+    PROGRESS_STAGES.forEach((s, i) => {
+      const el = progressStageEls[s];
+      if (!el) return;
+      el.classList.toggle("done", i < currentIdx);
+      el.classList.toggle("active", i === currentIdx && !finished);
+      // "analyzing" has no live server progress signal -- indeterminate
+      // (breathing) rather than a fabricated percentage. See the C19
+      // module comment above for why.
+      el.classList.toggle("indeterminate", i === currentIdx && !finished && s === "analyzing");
+    });
+    if (progressNoteEl) {
+      if (finished) {
+        progressNoteEl.textContent = "完成";
+      } else {
+        const elapsedS = recognizeRequestSentAt != null ? (performance.now() - recognizeRequestSentAt) / 1000 : 0;
+        progressNoteEl.textContent = `已等待 ${elapsedS.toFixed(1)} 秒`;
+      }
+    }
+  }
+
+  function finishProgress() {
+    progressStage = "done";
+    renderProgress();
+    if (progressTimerId != null) { clearInterval(progressTimerId); progressTimerId = null; }
+    // Leave the "完成" state on screen briefly instead of yanking it away
+    // the instant the fetch resolves -- the stage labels finishing is part
+    // of what tells the audience "this just happened", not just the
+    // thumbnails appearing underneath.
+    setTimeout(hideProgress, 600);
+  }
+
+  function hideProgress() {
+    if (progressTimerId != null) { clearInterval(progressTimerId); progressTimerId = null; }
+    if (progressEl) progressEl.style.display = "none";
+    progressStage = null;
+  }
+
+  // --- C19: input-signal thumbnails ---
+
+  function pickNearestFrame(frames, targetMs) {
+    let best = frames[0], bestDiff = Infinity;
+    for (const f of frames) {
+      const diff = Math.abs(f.t - targetMs);
+      if (diff < bestDiff) { bestDiff = diff; best = f; }
+    }
+    return best;
+  }
+
+  // 3 keyframes per C19.md's suggestion (VAD 起點／能量峰值／VAD 終點).
+  // There's no VAD start/end producer (confirmed live -- same gap C08's
+  // noteVadMark comment documents, nothing publishes vad_start_us/
+  // vad_end_us today), so start/end honestly fall back to the captured
+  // window's own first/last frame rather than a real speech boundary.
+  // "能量峰值" is NOT a fallback, though -- it's computed for real from the
+  // captured mic RMS history, correlated by timestamp against the ToF
+  // frames (every dataStore stream shares the same performance.now() clock
+  // per bus.js, so this correlation is exact, not approximate).
+  function pickKeyframeTimes(tofFrames, micFrames) {
+    if (!tofFrames.length) return [];
+    const startT = tofFrames[0].t;
+    const endT = tofFrames[tofFrames.length - 1].t;
+    let peakT = tofFrames[Math.floor(tofFrames.length / 2)].t; // fallback: middle by index
+    if (micFrames.length) {
+      let peak = micFrames[0];
+      for (const m of micFrames) if (m.rms > peak.rms) peak = m;
+      peakT = peak.t;
+    }
+    return [startT, peakT, endT];
+  }
+
+  function renderTofThumb(tofA, tofB, micFrames) {
+    thumbTofGridEl.innerHTML = "";
+    if (!tofA.length && !tofB.length) {
+      thumbTofNoteEl.textContent = "尚無資料";
+      thumbTofGridEl.innerHTML = `<div class="quiz-thumb-empty">尚無資料</div>`;
+      return;
+    }
+    const times = pickKeyframeTimes(tofA.length ? tofA : tofB, micFrames);
+    thumbTofNoteEl.textContent = micFrames.length ? "起點／能量峰值／終點" : "起點／中點／終點（無音訊資料，退回取中點）";
+    for (const [label, frames] of [["A", tofA], ["B", tofB]]) {
+      if (!frames.length) continue;
+      const rowEl = document.createElement("div");
+      rowEl.className = "quiz-thumb-tof-row";
+      const labelEl = document.createElement("span");
+      labelEl.className = "quiz-thumb-tof-row-label";
+      labelEl.textContent = label;
+      rowEl.appendChild(labelEl);
+      // Zone-stat baseline computed from THIS trial's own captured window
+      // (there's no cross-mode access to monitor.js's B10 baseline state),
+      // same computeZoneStats() B10 baseline capture uses -- so the Δ
+      // heatmap colors show "how far this keyframe is from this trial's
+      // own average", which is exactly the contrast that makes a mouth
+      // movement visible.
+      const dim = frames[frames.length - 1].dim;
+      const sameDim = frames.filter((f) => f.dim === dim);
+      const stats = computeZoneStats(sameDim, dim);
+      const baseline = {
+        mu: stats.mu, sigma: stats.sigma,
+        flags: { unstable: stats.unstable, suspectZeroVariance: stats.suspectZeroVariance, noSignal: stats.noSignal },
+      };
+      for (const t of times) {
+        const frame = pickNearestFrame(sameDim, t);
+        const canvas = document.createElement("canvas");
+        canvas.width = TOF_THUMB_PX;
+        canvas.height = TOF_THUMB_PX;
+        rowEl.appendChild(canvas);
+        drawTofKeyframeGrid(canvas.getContext("2d"), TOF_THUMB_PX, TOF_THUMB_PX, frame.dist, frame.valid, baseline);
+      }
+      thumbTofGridEl.appendChild(rowEl);
+    }
+  }
+
+  function renderMelThumb(melFrames) {
+    const w = thumbMelCanvas.clientWidth || MEL_THUMB_COLS, h = thumbMelCanvas.clientHeight || 28;
+    thumbMelCanvas.width = w;
+    thumbMelCanvas.height = h;
+    const ctx = thumbMelCtx;
+    if (!melFrames.length) {
+      thumbMelNoteEl.textContent = "尚無 Mel 資料（未啟用，或本次沒有擷取到）";
+      ctx.clearRect(0, 0, w, h);
+      return;
+    }
+    thumbMelNoteEl.textContent = `${melFrames.length} 幀`;
+    // Downsample to MEL_THUMB_COLS columns when there are more frames than
+    // that -- this is a thumbnail, not a full-resolution scroll, per
+    // C19.md's "縮圖不拖慢主要結果的顯示".
+    const step = Math.max(1, Math.floor(melFrames.length / MEL_THUMB_COLS));
+    const sampled = [];
+    for (let i = 0; i < melFrames.length; i += step) sampled.push(melFrames[i].bands);
+    drawMelWaterfallStatic(ctx, w, h, sampled);
+  }
+
+  // Same 64-dim [A.dist, A.sig, B.dist, B.sig] feature vector monitor.js's
+  // combinedVectorNow() builds, just paired by nearest timestamp instead of
+  // "whatever's currently latest" (there's no live rAF loop here re-pairing
+  // every frame, so this reconstructs the pairing once from the capture).
+  function pairTofSamples(tofA, tofB) {
+    if (!tofA.length || !tofB.length) return [];
+    const out = [];
+    for (const a of tofA) {
+      const b = pickNearestFrame(tofB, a.t);
+      if (a.dim === b.dim) out.push({ t: a.t, vec: a.dist.concat(a.signal, b.dist, b.signal) });
+    }
+    return out;
+  }
+
+  async function renderPcaThumb(tofA, tofB) {
+    const samples = pairTofSamples(tofA, tofB);
+    const w = thumbPcaCanvas.clientWidth || 120, h = thumbPcaCanvas.clientHeight || 80;
+    thumbPcaCanvas.width = w;
+    thumbPcaCanvas.height = h;
+    const ctx = thumbPcaCtx;
+    if (samples.length < PCA_THUMB_MIN_SAMPLES) {
+      thumbPcaNoteEl.textContent = `資料不足（${samples.length} 筆，需要至少 ${PCA_THUMB_MIN_SAMPLES} 筆）`;
+      ctx.clearRect(0, 0, w, h);
+      return;
+    }
+    // Same auto-upgrade pattern as C10: try the real server model first,
+    // fall back to a one-shot client-side stub fit from just this trial's
+    // samples (labeled as such below, never presented as the real thing).
+    let model = await tryFetchServerPcaModel("tof_only");
+    let stub = !model;
+    if (!model) model = fitPCA2Stub(samples.map((s) => s.vec));
+    const trail = samples
+      .filter((s) => s.vec.length === model.dims)
+      .map((s) => { const [x, y] = projectPCA(model, s.vec); return { x, y }; });
+    // No confidence ellipses -- there's no enrollment data (D08 gap, same
+    // one C10's own PCA panel already flags), so this omits them honestly
+    // rather than fabricating a placeholder.
+    drawPcaTrailStatic(ctx, w, h, trail, null);
+    thumbPcaNoteEl.textContent = stub
+      ? `本次試驗即時擬合（${samples.length} 筆樣本，座標軸僅供參考）`
+      : `伺服器模型（${model.source}）`;
+  }
+
+  function captureAndRenderThumbnails(elapsedMs) {
+    if (!thumbnailsEl) return;
+    const windowMs = Math.max(500, elapsedMs) + CAPTURE_WINDOW_SLACK_MS;
+    // Copy into plain objects immediately -- never hold a live dataStore
+    // reference (see the C19 module comment above / esp-mask-test-4f's C13
+    // finding: a live reference goes silently empty later as the ring
+    // buffer trims, indistinguishable from "never captured").
+    const tofA = dataStore.getRecent("tofA", windowMs).map((e) => (
+      { t: e._recvMs, dim: e.dim, dist: e.dist.slice(), signal: e.signal.slice(), valid: e.valid ? e.valid.slice() : null }));
+    const tofB = dataStore.getRecent("tofB", windowMs).map((e) => (
+      { t: e._recvMs, dim: e.dim, dist: e.dist.slice(), signal: e.signal.slice(), valid: e.valid ? e.valid.slice() : null }));
+    const mic = dataStore.getRecent("mic", windowMs).map((e) => ({ t: e._recvMs, rms: e.rms }));
+    const mel = dataStore.getRecent("mel", windowMs).map((e) => ({ t: e._recvMs, bands: e.bands.slice() }));
+
+    thumbnailsEl.style.display = "grid";
+    renderTofThumb(tofA, tofB, mic);
+    renderMelThumb(mel);
+    renderPcaThumb(tofA, tofB); // async (may fetch /pca) -- fine, draws in place once it resolves without blocking the rest
+  }
+
   async function onRecognizeClick() {
     resultStatusEl.textContent = "辨識中…";
+    recognizeRequestSentAt = performance.now();
+    startProgress();
     try {
       const res = await fetch("/recognize", { method: "POST" });
       if (!res.ok) throw new Error("HTTP " + res.status);
@@ -716,10 +1011,12 @@ registerMode("quiz", (() => {
           || !Array.isArray(triResult.d_tof_raw) || !Array.isArray(triResult.d_mel_raw)) {
         throw new Error("malformed TriResult");
       }
+      finishProgress();
       renderResult(triResult);
     } catch (err) {
       // D09's /recognize doesn't exist yet (confirmed live, 404) -- this
       // is the expected state right now, not a real error to alarm over.
+      hideProgress();
       resultStatusEl.textContent = "尚未串接（/recognize 還沒上線）";
       console.warn("[quiz] /recognize unavailable:", err.message);
     }
@@ -762,10 +1059,13 @@ registerMode("quiz", (() => {
       const res = await fetch(VOCAB_URL);
       if (!res.ok) throw new Error("HTTP " + res.status);
       const json = await res.json();
-      if (!json || !Array.isArray(json.words)) throw new Error("malformed vocab.json");
+      if (!json || !Array.isArray(json.words)) throw new Error("malformed vocab response");
       vocab = json;
     } catch (err) {
-      console.error("[quiz] failed to load vocab.json, falling back to an empty set:", err);
+      // Expected when the bridge isn't running yet -- GET /config/vocab
+      // 404s/fails to connect exactly like every other endpoint this file
+      // already treats as a graceful-degradation case, not a fatal error.
+      console.error("[quiz] failed to load /config/vocab, falling back to an empty set:", err);
       vocab = FALLBACK_VOCAB;
     }
     renderCards();
@@ -818,6 +1118,30 @@ registerMode("quiz", (() => {
         <div class="quiz-result-controls">
           <button class="quiz-mode-btn" data-recognize-btn>觸發辨識</button>
           <span class="quiz-result-status mono" data-result-status>尚無辨識結果</span>
+        </div>
+        <div class="quiz-progress" data-quiz-progress style="display:none">
+          <div class="quiz-progress-stages">
+            <span class="quiz-progress-stage" data-progress-stage="recording">錄音中</span>
+            <span class="quiz-progress-stage" data-progress-stage="receiving">傳輸中</span>
+            <span class="quiz-progress-stage" data-progress-stage="analyzing">分析中</span>
+          </div>
+          <span class="quiz-progress-note mono" data-progress-note></span>
+        </div>
+        <div class="quiz-thumbnails" data-thumbnails style="display:none">
+          <div class="quiz-thumb-block">
+            <div class="quiz-thumb-head">ToF Δ 熱力圖 <span class="quiz-thumb-sub mono" data-thumb-tof-note></span></div>
+            <div class="quiz-thumb-tof-grid" data-thumb-tof-grid></div>
+          </div>
+          <div class="quiz-thumb-block">
+            <div class="quiz-thumb-head">Mel 頻譜</div>
+            <div class="quiz-thumb-canvas-wrap"><canvas data-thumb-mel></canvas></div>
+            <div class="quiz-thumb-sub mono" data-thumb-mel-note></div>
+          </div>
+          <div class="quiz-thumb-block">
+            <div class="quiz-thumb-head">PCA 軌跡</div>
+            <div class="quiz-thumb-canvas-wrap"><canvas data-thumb-pca></canvas></div>
+            <div class="quiz-thumb-sub mono" data-thumb-pca-note></div>
+          </div>
         </div>
         <div class="quiz-disagree-banner" data-disagree-banner style="display:none">
           ⚠ 三軌判斷不一致
@@ -925,6 +1249,23 @@ registerMode("quiz", (() => {
       resultStatusEl = root.querySelector("[data-result-status]");
       resultsAreaEl = root.querySelector("[data-results]");
       disagreeBannerEl = root.querySelector("[data-disagree-banner]");
+
+      // --- C19: staged progress + thumbnail wiring ---
+      progressEl = root.querySelector("[data-quiz-progress]");
+      progressNoteEl = root.querySelector("[data-progress-note]");
+      PROGRESS_STAGES.forEach((s) => {
+        progressStageEls[s] = root.querySelector(`[data-progress-stage="${s}"]`);
+      });
+      thumbnailsEl = root.querySelector("[data-thumbnails]");
+      thumbTofGridEl = root.querySelector("[data-thumb-tof-grid]");
+      thumbTofNoteEl = root.querySelector("[data-thumb-tof-note]");
+      thumbMelCanvas = root.querySelector("[data-thumb-mel]");
+      thumbMelCtx = thumbMelCanvas.getContext("2d");
+      thumbMelNoteEl = root.querySelector("[data-thumb-mel-note]");
+      thumbPcaCanvas = root.querySelector("[data-thumb-pca]");
+      thumbPcaCtx = thumbPcaCanvas.getContext("2d");
+      thumbPcaNoteEl = root.querySelector("[data-thumb-pca-note]");
+
       barsEl.tof = root.querySelector('[data-bars="tof"]');
       barsEl.mel = root.querySelector('[data-bars="mel"]');
       barsEl.fused = root.querySelector('[data-bars="fused"]');
@@ -982,6 +1323,19 @@ registerMode("quiz", (() => {
     },
 
     onData(evt) {
+      // C19: staged progress for the B14 route. Only acts while a
+      // recognize request from THIS mode is actually in flight
+      // (progressStage is null otherwise) -- so a manual /record click
+      // from record.js firing these same SSE states doesn't hijack quiz's
+      // progress bar for an unrelated recording.
+      if (evt.type === "record" && progressStage != null && progressStage !== "done") {
+        if (evt.state === "receiving") setProgressStage("receiving");
+        else if (evt.state === "done") setProgressStage("analyzing");
+        // "error" is left alone here -- POST /recognize's own response is
+        // the authoritative signal for whether THIS request failed, not a
+        // same-shaped event that might belong to an unrelated recording.
+      }
+
       // Forward-compatible hook: once a real {type:"trial"} producer
       // exists, this is where PROMPT/COUNTDOWN/CAPTURE/SAVE/REST would
       // replace the static "ready" indicator above. Nothing publishes

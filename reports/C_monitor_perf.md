@@ -165,7 +165,57 @@ agent 搶 CPU）重量一次，才能拿到跟這次可比的乾淨數字**—�
   方向）——量出來的數字顯示這不是主要瓶頸，改了風險（重寫整個 C05/C06/C07
   的渲染邏輯）跟收益不成比例，所以沒做。
 
-## 8. 測試環境清理
+## 9. 追加：`drawSparkline()` 的同類 bug ——修了，但**沒有測出效果**
+
+`esp-mask-test-ad` 授權順手修 §7 提到的 `drawSparkline()`（`monitor.js:471`，
+C09 品質儀表板），假設它是修復後殘留 517 次 layout 的部分來源。**先量**，
+誠實回報：**這個假設沒有成立**，量出來的數字幾乎沒有變化。
+
+### 修法
+
+跟 `drawTrail()` 同一招（快取 CSS 尺寸，不要每次都讀 `clientWidth`），但
+換了一個更穩的資料來源：這次不是用 `window resize` 事件手動追蹤（sparkline
+canvas 的寬度除了 window resize 以外，`.quality-grid` 的 `auto-fit` 欄位
+數、捲軸出現/消失也都可能改變它，手動列舉容易漏），改用
+**`ResizeObserver`**——瀏覽器原生 API，專門用來「觀察一個元素的框大小
+變化」，回呼是非同步的（layout 跑完之後才通知），讀它回報的快取值不會
+逼出同步 layout。6 個 sparkline canvas 共用一個 observer 實例，各自的
+最新尺寸存進 `sparkSize[m.key]`，`drawSparkline()` 改吃這個快取值當第
+四個參數，不再自己讀 `canvas.clientWidth/clientHeight`。
+
+### 為什麼沒效果（先算一次數量級，量出來的數字對得上）
+
+`drawSparkline()` 只在 `handleQualityEvent()` 裡被呼叫，一次品質事件
+（實測 ~1Hz）觸發 6 個指標各呼叫一次——**上限是 8 秒視窗內 ~48 次強制
+layout**，相對於 §5 量到的殘留 517 次（8 秒內），連 10% 都不到。修
+`drawTrail()` 之所以有感，是因為它掛在 60fps 的 rAF 迴圈裡，量級差了
+超過一個數量級；`drawSparkline()` 從一開始數量級就不夠格當主因。
+
+### 前後對照（同機器、同方法，換了一組全新的 port 避免跟前一輪或其他
+agent 的 Chrome 撞在一起）
+
+```
+                    §5 的「修 drawTrail 後」   這次「再修 drawSparkline 後」
+TaskDuration          21.7% of wall              21.0% of wall
+LayoutDuration          7.6% of wall               7.5% of wall
+LayoutCount            517 次/8s                   510 次/8s
+```
+
+**在雜訊範圍內，沒有可信的改善。** 517 次殘留 layout 目前找不到單一
+主因——比較可能是「每幀有 DOM 真的變了，瀏覽器本來就要花一次 layout
+才能畫下一幀」這種不可避免的正常成本（60fps × 8s = 480，跟殘留的
+510-517 已經很接近），不是還有別的強制同步讀取藏在什麼地方。
+
+### 這次修法要不要留著
+
+**留著。** 雖然沒測出效果，但這不是「為了效能犧牲正確性」也不是「無謂的
+抽象」——`ResizeObserver` 是處理「元素尺寸變化」這件事本來就該用的標準
+作法（比手動監聽 resize 事件更完整、更不會漏掉觸發點），拿掉一個真實存在
+的反模式（即使目前規模下影響小到測不出來），視覺行為截圖 + 6 個 canvas
+的 backing store 尺寸都確認過沒有變化。如果之後品質事件頻率提高或指標
+數量增加，這個修法會開始有感——現在先做掉，之後不用再回頭補。
+
+## 10. 測試環境清理
 
 `mock_device.py`/`bridge_server.py`/headless Chrome 全部用自己挑的空
 port（8890 / 9334）起、量完用精確 PID kill，過程中用 `ps aux` 確認過

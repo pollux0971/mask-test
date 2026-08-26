@@ -29,12 +29,15 @@ import urllib.error
 import urllib.request
 
 import h5py
+import numpy as np
 import pytest
 
 from test_bridge_session_api import _request, VALID_METADATA
 from test_bridge_sse import Rig, _of_type
 
+from analysis.reporting.session_loader import load_session
 from host.replay.session_replay import ReplayController, read_session_events
+from host.storage.session_writer import SessionWriter
 
 N_TRIALS = 3
 
@@ -61,14 +64,15 @@ def _recorded_trial_names(h5_path):
         return sorted(k for k in f if k.startswith("trial_") and k != "trial_000")
 
 
-def _post_status_only(rig, path):
+def _get_status_only(rig, path):
     """Like _request, but tolerates a plain-HTML 404 (send_error()'s default)
-    instead of assuming every response body is JSON -- /replay/* has no
-    handler yet, so it falls through to that default, unlike the rest of
-    this API which always answers in JSON.
+    instead of assuming every response body is JSON -- if /replay/* is ever
+    unwired again (a revert, a rebase) it falls through to that default,
+    unlike the rest of this API which always answers in JSON. Deliberately a
+    GET against a read-only route (`/replay/sessions`, just lists files) so
+    probing for wiring never has the side effect of starting a replay.
     """
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{rig.http_port}{path}", data=b"", method="POST")
+    req = urllib.request.Request(f"http://127.0.0.1:{rig.http_port}{path}")
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             return resp.status
@@ -105,16 +109,18 @@ def pipeline():
 
         replay_events = read_session_events(h5_path)
 
-        # ed is actively wiring /replay/* -- capture the response now so the
-        # tests below can each independently skip or assert on it.
-        replay_http_status = _post_status_only(rig, f"/replay/start?file={h5_path}")
+        # Read-only probe: does /replay/* exist at all yet? Not "start a
+        # replay and see" -- that would be a side effect baked into fixture
+        # setup, before the dedicated replay test gets to control timing.
+        replay_wired_status = _get_status_only(rig, "/replay/sessions")
 
         yield {
+            "rig": rig,
             "boot_events": boot_events,
             "baseline_body": baseline_body,
             "h5_path": h5_path,
             "replay_events": replay_events,
-            "replay_http_status": replay_http_status,
+            "replay_wired_status": replay_wired_status,
         }
     finally:
         rig.close()
@@ -286,19 +292,210 @@ def test_replay_events_carry_the_replay_flag(pipeline):
 
 
 def test_replay_http_endpoint(pipeline):
-    status_code = pipeline["replay_http_status"]
-    if status_code == 404:
+    """ed has since wired this in (bridge_server.py's `_handle_replay*`) --
+    this now runs the real thing instead of skipping. Kept defensive about
+    a 404 anyway: multiple agents are editing this file concurrently, and a
+    stale checkout or a revert should degrade to a clear skip, not a
+    confusing failure unrelated to what this test is actually about.
+    """
+    if pipeline["replay_wired_status"] == 404:
         pytest.skip(
-            "/replay/* 還沒接上 bridge_server.py（esp-mask-test-ed 進行中）-- "
-            "這不是失敗，是進度。test_replay_reproduces_live_event_shapes 和 "
-            "test_replay_events_carry_the_replay_flag 已經在函式庫層級對同一個 "
-            "檔案驗證過回放內容、事件形狀跟 replay:true 標記；一旦這個 HTTP 端點"
-            "接上，把這裡從 skip 換成真的斷言（開始回放、poll /events 收到帶 "
-            "replay:true 的事件、確認 status 的 source 在回放期間不會被真實"
-            "序列埠資料蓋掉）就會是完整的端對端 regression。"
+            "/replay/* 現在打不到（404）-- 上一輪確認過 ed 已經接上，這裡的 "
+            "404 比較可能是暫時的 checkout/rebase 狀態，不是重新回到「還沒 "
+            "wiring」。library 層級的回放驗證（test_replay_reproduces_live_"
+            "event_shapes、test_replay_events_carry_the_replay_flag）不受影響。"
         )
-    else:
-        pytest.fail(
-            f"/replay/start 現在回應 {status_code}，不再是 404 了 -- "
-            "看起來 wiring 已經完成，這支測試需要更新成真的斷言，不能再 skip"
+
+    rig = pipeline["rig"]
+    h5_path = pipeline["h5_path"]
+
+    status_code, body = _request(rig, "POST", f"/replay/start?file={h5_path}")
+    assert status_code == 200, body
+    assert body["active"] is True
+    assert body["file"] == str(h5_path)
+    assert body["n_events"] == len(pipeline["replay_events"])
+
+    try:
+        events = rig.read_events(2.0)
+
+        replayed = [e for e in events if e.get("replay") is True]
+        assert replayed, "開始回放後，/events 沒有收到任何帶 replay:true 的事件"
+        assert any(e["type"] in ("tof", "mic", "mel") for e in replayed), (
+            f"回放事件都不是 tof/mic/mel: {[e['type'] for e in replayed]}"
         )
+
+        # bridge_server.py's handle_parsed_event() drops live tof/mic/mel
+        # while replay_is_active() -- exactly the story's "two streams
+        # interleaved on one channel, no way to tell them apart" disaster.
+        # A leaked live frame here would show up unmarked (no replay key).
+        leaked_live = [e for e in events
+                       if e.get("type") in ("tof", "mic", "mel") and not e.get("replay")]
+        assert not leaked_live, (
+            f"回放期間仍然收到未標記的即時資料，兩條串流混在一起了: {leaked_live[:3]}"
+        )
+
+        # status/heartbeat are deliberately NOT suppressed during replay
+        # (device state should still look alive) -- source must still say
+        # "mock", not get overwritten by anything replay-related.
+        status_events = _of_type(events, "status")
+        if status_events:
+            assert status_events[-1]["source"] == "mock"
+    finally:
+        # Leave the rig as this test found it -- other tests in this module
+        # (and its own teardown) still use it.
+        _request(rig, "POST", "/replay/control?action=pause")
+
+
+# -- 7. HDF5 -> analysis-layer type seam (D15's flagged gap) ---------------
+#
+# analysis/reporting/test_run_all.py's own fixtures write synthetic sessions
+# directly with raw h5py (see that file's module docstring: deliberately not
+# depending on host/storage). That means session_loader.py's `_as_scalar()`
+# -- the thing responsible for bytes-vs-str and numpy-scalar-vs-Python
+# normalization -- has never been run against a file the real SessionWriter
+# (B07) produced. Writer and reader can each match their own understanding
+# of the schema and still disagree at the seam -- this project has hit that
+# exact shape of bug before (C08: mel is decoded float over SSE, not the
+# wire's int16; C05: `dim` is a zone count, not a side length). Same class
+# of risk, different seam.
+
+
+def test_session_loader_reads_real_string_attrs_as_str(pipeline):
+    """h5py 3.x decodes vlen utf-8 attrs back to `str`, not `bytes` -- but
+    that default has changed across major h5py versions before, and nothing
+    in this codebase had pinned it down against a file the real writer
+    produced until now.
+    """
+    data = load_session(pipeline["h5_path"])
+    assert isinstance(data.meta["subject"], str)
+    assert isinstance(data.meta["mode"], str)
+    assert isinstance(data.meta["session_date"], str)
+
+    recorded = _recorded_trial_names(pipeline["h5_path"])
+    trial = next(t for t in data.trials if t.key in recorded)
+    assert isinstance(trial.label, str)  # 詞彙集是非 ASCII 的中文字
+    assert isinstance(trial.mode, str)
+    assert isinstance(trial.quality, str)
+
+
+def test_session_loader_reads_bool_attrs_as_python_bool(pipeline):
+    """`clock_sync_confirmed`/`clock_cross_check_ok`寫入時是 Python bool，
+    h5py 讀回來的是 `numpy.bool_`；`_as_scalar()` 的 `np.generic` 分支應該
+    要接住它。這裡對真檔確認，不是對這個專案自己手造的 numpy bool 確認。
+    """
+    data = load_session(pipeline["h5_path"])
+    for key in ("clock_sync_confirmed", "clock_cross_check_ok"):
+        value = data.meta[key]
+        assert isinstance(value, bool), f"{key} 是 {type(value)}，不是 Python bool"
+        assert not isinstance(value, np.bool_), f"{key} 還是 numpy.bool_"
+
+
+def test_session_loader_unwraps_numeric_scalars(pipeline):
+    data = load_session(pipeline["h5_path"])
+    assert type(data.meta["clock_slope"]) is float
+    assert type(data.meta["noise_floor_mu"]) is float
+
+    recorded = _recorded_trial_names(pipeline["h5_path"])
+    trial = next(t for t in data.trials if t.key in recorded)
+    assert isinstance(trial.wear_id, int)
+    assert not isinstance(trial.wear_id, np.integer)
+
+
+def test_session_loader_reads_baseline_arrays_with_correct_shape_and_dtype(pipeline):
+    data = load_session(pipeline["h5_path"])
+    mu, sigma = data.baseline("A")
+    assert mu is not None and sigma is not None
+    assert mu.shape == (32,) and sigma.shape == (32,)
+    assert mu.dtype == np.float64  # baseline() 明確轉型，不管檔案裡存的是 float32
+
+
+def test_session_loader_missing_optional_attrs_are_absent_not_crashing(pipeline):
+    """The four VAD timestamps: still genuinely absent -- B15/B16's detectors
+    are not wired into the trial machine yet (see
+    test_vad_timing_attrs_are_entirely_absent above), unlike speaking_mode
+    and sensors_enabled which landed separately (B21, and ed's bridge_server
+    wiring) since this file was first written. `session_loader.load_session()`
+    materializes `group.attrs.items()` into a plain dict up front and reads
+    it with `dict.get()` everywhere after -- safe, missing keys come back
+    `None`/absent, never `KeyError`. Confirmed against a real file, not
+    assumed from reading the code.
+    """
+    data = load_session(pipeline["h5_path"])
+    recorded = _recorded_trial_names(pipeline["h5_path"])
+    trial = next(t for t in data.trials if t.key in recorded)
+    for attr in ("vad_start_us", "vad_end_us", "lip_onset_us", "voice_onset_us"):
+        assert attr not in trial.attrs
+
+
+def test_session_loader_reads_speaking_mode_and_sensors_enabled_when_present(pipeline):
+    """B21 (speaking_mode, defaults "normal") and ed's bridge_server wiring
+    (sensors_enabled, from host/control/device_state.py) both landed since
+    this pipeline test was first written -- these are no longer the "not
+    wired yet" gap that VAD (still unwired) and the earlier /replay/* skip
+    used to cover.
+    """
+    data = load_session(pipeline["h5_path"])
+    recorded = _recorded_trial_names(pipeline["h5_path"])
+    trial = next(t for t in data.trials if t.key in recorded)
+
+    assert trial.speaking_mode == "normal"
+    assert isinstance(trial.speaking_mode, str)
+
+    assert data.meta.get("sensors_enabled") in ("AB", "A", "B")
+    assert isinstance(data.meta["sensors_enabled"], str)
+    # 主機指令，不是裝置確認過的狀態（見 session_writer.py 的
+    # OPTIONAL_META_KEYS 說明）—— session_loader 不能把它讀成別的意思。
+    assert data.meta.get("sensors_enabled_confirmed") is False
+    assert isinstance(data.meta["sensors_enabled_confirmed"], bool)
+
+
+def test_session_loader_invalid_tof_zones_stay_nan_and_validity_is_independent(tmp_path):
+    """不依賴 live rig 這次跑出來的合成場景剛好有沒有無效 zone -- 直接構造
+    一個保證有無效 zone 的 trial，確認：(1) 讀回來真的是 NaN，不是 0/-1；
+    (2) 有效性完全來自獨立的 `tof_valid_A`/`B` 陣列，不是靠
+    `value == value` 這種 NaN 比較法（`NaN != NaN`，這正是 §2.1 選擇獨立
+    valid 陣列、而不是「非 NaN 即有效」的原因——`session_loader.py` 目前
+    沒有這樣做，這裡把它釘住，不讓以後有人為了省一個欄位改回去）。
+    """
+    path = tmp_path / "session.h5"
+    T, Z = 3, 16
+    tof_A = np.zeros((T, 2 * Z), dtype=np.float32)
+    tof_valid_A = np.ones((T, Z), dtype=bool)
+    tof_valid_A[1, 5] = False  # 第 1 幀第 5 個 zone 標成無效
+    tof_A[1, 5] = np.nan       # 無效值本身寫 NaN（§2.1）
+
+    meta = {
+        "schema_version": 1, "subject": "s01", "session_date": "2026-08-26",
+        "wear_id": 1, "mode": "quiz", "distance_mm": 30.0, "angle_deg": 0.0,
+        "ambient": "quiet room", "notes": "", "fw_sha": "0000000",
+        "proto_version": 2, "tof_dim": Z,
+        "clock_slope": 1.0, "clock_offset": 0.0, "clock_residual_p95": 0.0,
+        "clock_drift_us": 0.0, "clock_drift_ppm": 0.0,
+        "clock_sync_span_us": 0, "clock_sync_confirmed": True,
+        "session_start_device_us": 0, "session_start_host_us": 0,
+        "session_start_rtt_min_us": 0,
+        "baseline_mu_A": np.zeros(2 * Z, dtype=np.float32),
+        "baseline_sigma_A": np.ones(2 * Z, dtype=np.float32),
+        "baseline_mu_B": np.zeros(2 * Z, dtype=np.float32),
+        "baseline_sigma_B": np.ones(2 * Z, dtype=np.float32),
+        "noise_floor_mu": 0.0, "noise_floor_sigma": 1.0,
+    }
+    with SessionWriter(path, meta) as w:
+        w.write_trial(
+            0, label="五",
+            tof_A=tof_A, tof_B=np.zeros((T, 2 * Z), dtype=np.float32),
+            tof_t_us=np.arange(T, dtype=np.int64) * 1000,
+            tof_valid_A=tof_valid_A, tof_valid_B=np.ones((T, Z), dtype=bool),
+            mic_rms=np.zeros(4, dtype=np.float32), mic_peak=np.zeros(4, dtype=np.int16),
+            mic_t_us=np.arange(4, dtype=np.int64) * 1000,
+            wear_id=1, mode="quiz", valid_zone_ratio=0.98, drop_count=0,
+            quality="ok",
+        )
+
+    data = load_session(path)
+    trial = data.trials[0]
+    assert trial.tof_valid_a[1, 5] == False  # noqa: E712 -- 明確要 bool 值
+    assert np.isnan(trial.tof_a[1, 5])
+    # 有效的那些不能是 NaN，也不能被反過來當成「不是 NaN 就有效」的證據
+    assert not np.isnan(trial.tof_a[0, 5])
+    assert trial.tof_valid_a[0, 5] == True  # noqa: E712

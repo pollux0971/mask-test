@@ -52,6 +52,10 @@ from typing import Callable, List, Optional, Sequence
 import numpy as np
 
 from host.storage.manifest import add_session
+from host.storage.session_writer import VALID_SPEAKING_MODES
+from host.vad.audio_vad import detect_from_events as detect_voice
+from host.vad.onset import measure_lip_lead
+from host.vad.tof_vad import detect_from_events as detect_lips
 
 PROMPT_S = 1.5
 COUNTDOWN_S = 0.5
@@ -151,7 +155,26 @@ class TrialStateMachine:
         manifest_root=None,
         mic_buffer_seconds: float = 15.0,
         first_trial_idx: int = 0,
+        baseline_mu_A: Optional[np.ndarray] = None,
+        baseline_sigma_A: Optional[np.ndarray] = None,
+        baseline_mu_B: Optional[np.ndarray] = None,
+        baseline_sigma_B: Optional[np.ndarray] = None,
+        noise_floor_mu: Optional[float] = None,
+        noise_floor_sigma: Optional[float] = None,
     ):
+        """B21：`baseline_mu_*`/`baseline_sigma_*`（ToF，各 32 值）與
+        `noise_floor_mu`/`sigma`（麥克風）都來自 `B10` 的
+        `capture_baseline_trial()`，已經寫進 `/meta`（呼叫端 -- 目前是
+        `bridge_server.py` -- 從 session 的 `/meta` 讀出來傳進來，這裡不
+        自己開 HDF5 讀）。
+
+        全部設 `Optional[None]` 而不是必填：`host.vad.tof_vad`/`audio_vad`
+        自己在缺 baseline/底噪時就會回 `applicable=False`（不拋例外），
+        沒有理由在這裡重複擋一次；這樣也不用改動任何一個既有測試的
+        `_make_sm()` 呼叫。真正執行 `/trial/*` 的 session 一定會有
+        baseline（`baseline_done` 旗標擋著，見這個類別頂端的說明），只有
+        測試會用 `None`。
+        """
         if not words:
             raise ValueError("words 不能是空的")
         self._words = list(words)
@@ -164,6 +187,12 @@ class TrialStateMachine:
         self._mode = mode
         self._clock = clock
         self._mic_buffer_seconds = mic_buffer_seconds
+        self._baseline_mu_A = baseline_mu_A
+        self._baseline_sigma_A = baseline_sigma_A
+        self._baseline_mu_B = baseline_mu_B
+        self._baseline_sigma_B = baseline_sigma_B
+        self._noise_floor_mu = noise_floor_mu
+        self._noise_floor_sigma = noise_floor_sigma
 
         self._seed = seed if seed is not None else random.SystemRandom().randrange(2**31 - 1)
         self._order = list(self._words)
@@ -182,6 +211,15 @@ class TrialStateMachine:
         # class doesn't know whether a baseline was recorded.
         self._next_trial_idx = first_trial_idx
         self._hold_start_device_t_us: Optional[int] = None  # B12: hold-to-record
+        # B21: CONTRACTS.md §2 puts speaking_mode on the *trial*, not /meta
+        # -- it can change mid-session (README demo: normal -> whisper for
+        # one word -> normal). "Sticky" default: a call that doesn't specify
+        # it keeps whatever the last trial used, starting from "normal" for
+        # the first one -- this is this story's own call (the story text
+        # says the caller decides and documents it), matching how a
+        # panel toggle naturally behaves: the user set it once, it stays
+        # that way until they touch it again, not reset every trial.
+        self._speaking_mode: str = "normal"
 
         # mic/mel 原生取樣率的緩衝，跟 Aligner 內部的環形緩衝分開一份。
         # 原因：Aligner.frames() 只能吐單一共同取樣率，會把 mic/mel 錯誤地
@@ -189,6 +227,18 @@ class TrialStateMachine:
         # （F）要保留各自原生取樣率的要求（CONTRACTS.md §1.1.1/§2）。
         self._mic_events: List[tuple] = []
         self._mel_events: List[tuple] = []
+
+        # B21: raw ProtocolParser events, kept *in addition to* what
+        # _aligner already does with them -- Aligner.frames() only hands
+        # back AlignedFrame (resampled onto the ToF grid), but
+        # host.vad.tof_vad/audio_vad's detect_from_events() need the
+        # original per-stream dicts (type/sensor/distance/signal/t_us).
+        # Copied on push (see push_event()), not a view into anything else
+        # that might get reshaped/trimmed later -- same reasoning as
+        # _mic_events/_mel_events above, and the same bug C13 already hit
+        # once on the frontend's dataStore ring buffer (a live reference
+        # goes stale as soon as the buffer trims past it).
+        self._raw_events: List[dict] = []
 
     # -- 唯讀屬性 ---------------------------------------------------
 
@@ -249,13 +299,37 @@ class TrialStateMachine:
             self.push_mic(event["t_us"], event["rms"], event["peak"])
         elif etype == "mel":
             self.push_mel(event["t_us"], event["log_mel"])
+        # B21: only tof/mic are what detect_from_events() (host/vad/) reads;
+        # v1-protocol events have no t_us to window by (see class docstring
+        # on push_event/tick's device_t_us) and get skipped rather than
+        # buffered with no way to ever trim or slice them.
+        if etype in ("tof", "mic") and event.get("t_us") is not None:
+            t_us = int(event["t_us"])
+            self._raw_events.append(dict(event))
+            cutoff = t_us - int(self._mic_buffer_seconds * 1_000_000)
+            while self._raw_events and self._raw_events[0]["t_us"] < cutoff:
+                self._raw_events.pop(0)
         self._aligner.push_event(event)
 
     # -- trial 生命週期 -----------------------------------------------
 
-    def start_trial(self, now: Optional[float] = None, label: Optional[str] = None) -> dict:
+    def _apply_speaking_mode(self, speaking_mode: Optional[str]) -> None:
+        """B21：在真的開始錄之前就驗證，而不是留到 `_do_save()` 才讓
+        `write_trial()` 拋 `ValueError`——那個時間點使用者已經在錄音中，
+        session 當場中斷。C11 表單的 `mode` 欄位是自由文字，`speaking_mode`
+        不是同一個東西（見 CONTRACTS.md §2），這裡是值域真正被守住的地方。
+        """
+        if speaking_mode is None:
+            return
+        if speaking_mode not in VALID_SPEAKING_MODES:
+            raise ValueError(f"speaking_mode 必須是 {VALID_SPEAKING_MODES} 之一，收到 {speaking_mode!r}")
+        self._speaking_mode = speaking_mode
+
+    def start_trial(self, now: Optional[float] = None, label: Optional[str] = None,
+                     speaking_mode: Optional[str] = None) -> dict:
         if self.state != TrialState.IDLE:
             raise RuntimeError(f"不能在狀態 {self.state.value} 開始新 trial，必須先回到 IDLE")
+        self._apply_speaking_mode(speaking_mode)
         now = self._clock() if now is None else now
         self._current_label = label if label is not None else self._order[self._order_pos % len(self._order)]
         return self._enter(TrialState.PROMPT, now)
@@ -320,7 +394,7 @@ class TrialStateMachine:
     # -- B12: hold-to-record -----------------------------------------
 
     def hold_start(self, now: Optional[float] = None, device_t_us: Optional[int] = None,
-                    label: Optional[str] = None) -> dict:
+                    label: Optional[str] = None, speaking_mode: Optional[str] = None) -> dict:
         """`POST /trial/hold/start`。按下就是開始，**沒有 COUNTDOWN**——固定
         時長模式的倒數是給「使用者要等外部節奏」的情境用的，hold-to-record
         本來就是使用者自己決定何時開口，倒數只會讓體感變慢。跳過 PROMPT
@@ -335,6 +409,7 @@ class TrialStateMachine:
             raise RuntimeError(f"不能在狀態 {self.state.value} 開始 hold-to-record，必須先回到 IDLE")
         if device_t_us is None:
             raise ValueError("hold_start 需要 device_t_us（按下當下最新收到的裝置 t_us）")
+        self._apply_speaking_mode(speaking_mode)
         now = self._clock() if now is None else now
         self._current_label = label if label is not None else self._order[self._order_pos % len(self._order)]
         self._hold_start_device_t_us = int(device_t_us)
@@ -455,6 +530,17 @@ class TrialStateMachine:
         event["aborted_label"] = aborted_label
         return event
 
+    def _raw_events_window(self, start_us: int, end_us: int) -> List[dict]:
+        """B21：某個 trial 的 capture 視窗內、給 `host.vad.*` 用的原始事件
+        （`detect_from_events()` 要吃這個形狀，不是 `AlignedFrame`）。
+
+        還沒有任何呼叫端使用這個——`measure_lip_lead()` 的實際呼叫是 B21
+        階段 3（要動 `TrialStateMachine.__init__` 的簽章，需要先跟
+        `/trial/*` wiring 協調），這裡先把「保留＋能正確切出某個 trial 的
+        視窗」這件事做好、鎖進測試。
+        """
+        return [e for e in self._raw_events if start_us <= e["t_us"] <= end_us]
+
     def _do_save(self, now: float) -> dict:
         frames = list(self._aligner.frames(
             self._capture_start_t_us, self._capture_end_t_us, rate_hz=CAPTURE_RATE_HZ,
@@ -501,6 +587,36 @@ class TrialStateMachine:
         idx = self._next_trial_idx
         quality = classify_quality(valid_zone_ratio, drop_count)
 
+        # B21：真的呼叫 B15/B16，餵原始事件串（_raw_events_window()，不是
+        # AlignedFrame）與建構時給的 baseline/底噪統計。只用 sensor A 餵唇動
+        # 偵測——B21.md 自己給的介面範例只示範了單一感測器，沒有提兩顆怎麼
+        # 融合，這裡照給的範例做，不是自己發明一個融合策略。
+        #
+        # energy_mu/energy_sigma 沒有從 baseline 期間算好傳進去（B16 建議這樣
+        # 做，量出來的門檻比較準）——那需要 baseline 當時的原始幀，但
+        # TrialStateMachine 現在只拿得到 baseline 算完的 mu/sigma 摘要，沒有
+        # 原始幀可以重算能量。留 None 讓 detect_lip_activity() 自己用
+        # estimate_energy_floor() 估（B16 量過，這樣量出來的門檻偏嚴約
+        # 23%），已在完成回報裡標成已知限制，不是忘記做。
+        #
+        # excluded_zones 也沒有帶 ZoneQualityReport 進來排除已知壞掉的
+        # zone——B21.md 的建構子簽章範圍只列了 baseline_mu/sigma，沒有列
+        # quality report，這裡沒有跟著多加一個沒被要求的參數。
+        raw_window = self._raw_events_window(self._capture_start_t_us, self._capture_end_t_us)
+        lips = detect_lips(
+            raw_window, self._baseline_mu_A, self._baseline_sigma_A, sensor="A",
+        )
+        voice = detect_voice(
+            raw_window, self._noise_floor_mu, self._noise_floor_sigma,
+            speaking_mode=self._speaking_mode,
+        )
+        lead = measure_lip_lead(lips, voice)
+        vad_attrs = lead.to_trial_attrs()  # 四個都可能是 None，見 to_trial_attrs() 的文件字串
+        # `vad_confidence`：CONTRACTS.md §2 說「B15 的端點偵測信心度；silent
+        # 模式為 None」——直接沿用 VadResult.to_dict() 自己的 vad_confidence
+        # 定義（primary 是 None 就是 None），不重寫一份可能跟它不一致的邏輯。
+        vad_confidence = voice.to_dict()["vad_confidence"]
+
         self._writer.write_trial(
             idx, label=self._current_label,
             tof_A=tof_A, tof_B=tof_B, tof_t_us=tof_t_us,
@@ -513,21 +629,8 @@ class TrialStateMachine:
             mel=mel, mel_t_us=mel_t_us,
             wear_id=self._wear_id, mode=self._mode,
             valid_zone_ratio=valid_zone_ratio, drop_count=drop_count,
-            # B15/B16（host/vad/tof_vad.py, audio_vad.py, onset.py）都已完成，
-            # 但 TrialStateMachine 還沒有 wiring 到它們：這裡需要的是原始
-            # ProtocolParser 事件串（detect_from_events() 的輸入），
-            # 不是 _aligner.frames() 產生的 AlignedFrame；還需要建構時就有
-            # baseline_mu/sigma 可用（目前建構子完全沒有這個參數）。這是比
-            # 「補一個佔位值」更大的介面變更，且 TrialStateMachine 的建構子
-            # 正是 esp-mask-test-ed 現在在 bridge_server.py 上 wiring
-            # /trial/* 的呼叫點，貿然改簽章有跟他當下工作衝突的風險——
-            # 已在完成回報裡標成需要調度員排一個獨立 story/協調時機的項目。
-            # 這裡先做 CONTRACTS 明確要求的最小修正：不再填 capture 視窗邊界
-            # （那會讓「完全沒偵測到」看起來像「整段都在動」），改填 None，
-            # 讓 write_trial() 整個 attr 不寫入，而不是寫一個假數字。
-            vad_start_us=None, vad_end_us=None,
-            lip_onset_us=None, voice_onset_us=None,
-            quality=quality,
+            speaking_mode=self._speaking_mode, vad_confidence=vad_confidence,
+            quality=quality, **vad_attrs,
         )
         add_session(self._session_h5_path, self._manifest_path, root=self._manifest_root)
 
@@ -538,6 +641,14 @@ class TrialStateMachine:
             # 呼叫端（tick()/confirm_keep()）已經在呼叫這裡之前把 _order_pos
             # 前進過了，所以此刻 peek 到的就是「下一個」，不是剛存的這個。
             next_label=self.peek_next_label(),
+            # B21：measure_lip_lead() 的 comparable 旗標（兩邊的門檻 σ 不一致
+            # 就是 False，"不能拿不可比的數字寫結論"）——CONTRACTS.md 目前
+            # 沒有 HDF5 attr 給它落腳（grep 過 session_writer.py 沒有），加
+            # 一個是 host/storage/ 的改動，不在這個 story 列的授權路徑內，
+            # 而且 session_writer.py 剛被 18 改過。先讓它至少在即時的 trial
+            # SSE 事件裡看得到，完成回報裡已標成需要調度員排 session_writer.py
+            # 的一個小改動才能落盤保留。
+            vad_comparable=lead.comparable,
         )
 
 

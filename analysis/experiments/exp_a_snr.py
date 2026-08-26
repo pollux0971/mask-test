@@ -21,6 +21,8 @@ signal rate 其中一種），呼叫端對同一顆感測器呼叫兩次，分�
 """
 import numpy as np
 
+from analysis.reporting.plot_style import SEQUENTIAL_CMAP, styled
+
 N_ZONES = 16
 # `$T` 的所有通道都是整數量化值，均勻量化誤差的 σ 是 Δ/√12（Δ=1 個單位）——
 # 這是「有意義的最小 σ」的理論下限，1e-3 只擋得住除以零，擋不住「小到沒有
@@ -124,19 +126,41 @@ def plot_zone_snr_heatmaps(snr_distance, snr_signal, n_rows=4, n_cols=4, thresho
     回傳 matplotlib Figure；存檔或顯示交給呼叫端決定
     （`fig.savefig(...)` 或在 notebook 裡直接顯示）。
     """
-    import matplotlib.pyplot as plt
-
     grid_d = zone_snr_grid(snr_distance, n_rows, n_cols)
     grid_s = zone_snr_grid(snr_signal, n_rows, n_cols)
 
-    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-    for ax, grid, title in zip(axes, (grid_d, grid_s), ("Distance SNR", "Signal-rate SNR")):
-        im = ax.imshow(grid, cmap="viridis")
-        ax.set_title(title)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.suptitle(
-        "zone layout: row-major (ASSUMED, unverified — see A track/E01)"
-        + (f"  |  threshold={threshold}" if threshold is not None else "")
-    )
-    fig.tight_layout()
+    # D20：所有圖共用同一套樣式（字型/網格/色盤），`styled()` 只在區塊內生效，
+    # 不會汙染呼叫端 process 裡其他測試的全域 rcParams。SNR 是非負量值（見
+    # `zone_snr` 的 `np.abs`），單調亮度的 SEQUENTIAL_CMAP 就夠，不是發散資料。
+    with styled():
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+        for ax, grid, title in zip(axes, (grid_d, grid_s), ("Distance SNR", "Signal-rate SNR")):
+            im = ax.imshow(grid, cmap=SEQUENTIAL_CMAP)
+            ax.set_title(title)
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig.suptitle(
+            "zone layout: row-major (ASSUMED, unverified - see A track/E01)"
+            + (f"  |  threshold={threshold}" if threshold is not None else "")
+        )
+        fig.tight_layout()
     return fig
+
+
+if __name__ == "__main__":
+    from pathlib import Path
+
+    from analysis.reporting.plot_style import save_figure
+
+    rng = np.random.default_rng(0)
+    # 合成兩組逐 zone SNR（距離／signal rate），只為了示範存檔走
+    # save_figure()（D20：PNG 300dpi + PDF，並在存檔當下驗證英文 only／
+    # 灰階可辨）——數字不是真實結論。
+    snr_distance = np.abs(rng.normal(3.0, 1.5, size=N_ZONES))
+    snr_signal = np.abs(rng.normal(3.0, 1.5, size=N_ZONES))
+
+    fig = plot_zone_snr_heatmaps(snr_distance, snr_signal, threshold=DEFAULT_OVERALL_THRESHOLD)
+    out_path = Path(__file__).with_name("a_snr_heatmap")
+    written = save_figure(fig, out_path)
+    print("圖已寫入：", ", ".join(str(p) for p in written))
