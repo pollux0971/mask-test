@@ -272,6 +272,7 @@ registerMode("record", (() => {
   let baselineStartedAt = null; // performance.now(), for the local pacing countdown
   let baselineCaptureTimer = null; // fires requestBaselineCapture() once the local countdown ends
   let baselineOutcome = null; // last BaselineOutcome.to_dict(), or null
+  let baselineCapturedAtMs = null; // performance.now() when baseline last succeeded, for staleness
 
   // --- C12: trial screen state ---
   let trialState = "IDLE"; // mirrors the last {"type":"trial",...} event's `state`
@@ -550,6 +551,17 @@ registerMode("record", (() => {
     els.baselineElapsedBar.style.width = `${Math.min(100, (elapsedS / BASELINE_DURATION_S) * 100)}%`;
   }
 
+  function checkBaselineStaleness() {
+    if (baselineCapturedAtMs == null || screen !== "trial") {
+      els.baselineStaleNote.style.display = "none";
+      return;
+    }
+    const elapsedMs = performance.now() - baselineCapturedAtMs;
+    const stale = elapsedMs > BASELINE_STALE_MS;
+    els.baselineStaleNote.style.display = stale ? "flex" : "none";
+    if (stale) els.baselineStaleMinutes.textContent = (elapsedMs / 60000).toFixed(1);
+  }
+
   function renderLiveStability(progress) {
     if (!progress) return;
     if (typeof progress.elapsed_s === "number") {
@@ -573,9 +585,11 @@ registerMode("record", (() => {
   function renderBaselineOutcome(outcome) {
     baselineOutcome = outcome;
     if (outcome.ok) {
+      baselineCapturedAtMs = performance.now(); // starts the 10-minute staleness clock (checkBaselineStaleness())
       els.baselineUnstableBox.style.display = "none";
       showScreen("trial");
       renderTrialCard(); // no `trial` event has arrived yet -- render the "press to begin" placeholder
+      checkBaselineStaleness();
       return;
     }
 
@@ -1140,6 +1154,15 @@ registerMode("record", (() => {
     // for this project's propose-now-wire-later pattern, not a bug here.
     const body = { speaking_mode: speakingMode };
     if (label != null) body.label = label;
+    // Proposed (not yet consumed backend-side, see completion report): how
+    // stale the current baseline was at the exact moment this trial's
+    // capture started. A screen warning only protects whoever's watching
+    // it right now -- E05 runs 4 hours unattended-ish, and a number
+    // written to the trial itself is the only way D14 can flag/exclude
+    // trials recorded against a drifted baseline after the fact.
+    if (baselineCapturedAtMs != null) {
+      body.baseline_age_s = (performance.now() - baselineCapturedAtMs) / 1000;
+    }
     postTrialAction("/trial/hold/start", body);
   }
 
@@ -1352,6 +1375,13 @@ registerMode("record", (() => {
                 </div>
               </div>
 
+              <div class="baseline-stale-note mono" data-baseline-stale-note
+                   style="display:none; align-items:center; gap:10px; color:var(--accent);">
+                <span>⚠ baseline 已經 <span data-baseline-stale-minutes></span> 分鐘前擷取，z-score 基準可能已經漂掉，建議重新擷取</span>
+                <button type="button" class="retry-btn" data-baseline-restale-btn
+                        style="margin-top:0; padding:4px 10px; font-size:12px;">重新擷取 baseline</button>
+              </div>
+
               <div class="trial-card state-idle" data-trial-card>
                 <div class="trial-prev-label" data-trial-prev-label style="display:none"></div>
                 <div class="trial-word" data-trial-word>—</div>
@@ -1442,6 +1472,9 @@ registerMode("record", (() => {
         baselineUnstableZones: root.querySelector("[data-baseline-unstable-zones]"),
         retryBtn: root.querySelector("[data-retry-baseline]"),
         beepToggle: root.querySelector("[data-beep-toggle]"),
+        baselineStaleNote: root.querySelector("[data-baseline-stale-note]"),
+        baselineStaleMinutes: root.querySelector("[data-baseline-stale-minutes]"),
+        baselineRestaleBtn: root.querySelector("[data-baseline-restale-btn]"),
         trialIdx: root.querySelector("[data-trial-idx]"),
         trialSeed: root.querySelector("[data-trial-seed]"),
         trialCard: root.querySelector("[data-trial-card]"),
@@ -1486,6 +1519,11 @@ registerMode("record", (() => {
         });
       });
       els.retryBtn.addEventListener("click", retryBaseline);
+      // Same recapture flow as the unstable-baseline retry button above,
+      // just reachable from the trial screen once the existing baseline
+      // has gone stale (see BASELINE_STALE_MS) -- reuses enterBaselineScreen()
+      // rather than a second "recapture" code path.
+      els.baselineRestaleBtn.addEventListener("click", enterBaselineScreen);
 
       els.beepToggle.addEventListener("change", () => {
         beepEnabled = els.beepToggle.checked;
@@ -1532,7 +1570,15 @@ registerMode("record", (() => {
 
     onEnter() {
       if (countdownTimer == null) {
-        countdownTimer = setInterval(updateBaselineCountdown, 250);
+        // Same interval drives both -- updateBaselineCountdown() is a
+        // no-op off the baseline screen, checkBaselineStaleness() is a
+        // no-op off the trial screen, so sharing one timer instead of
+        // running two is just avoiding a redundant setInterval, not
+        // coupling two unrelated concerns.
+        countdownTimer = setInterval(() => {
+          updateBaselineCountdown();
+          checkBaselineStaleness();
+        }, 250);
       }
     },
 

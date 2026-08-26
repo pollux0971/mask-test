@@ -83,6 +83,42 @@
       而非 bridge（主機沒收）
 - [ ] 🔴 **`E05` 開錄前先看一次 `quality` 事件的 `alarms`，空的才開始錄**
 
+**🔴 量到非零掉幀率時，先看 `malformed` 計數，不要直接去查線材/baud/FIFO overrun**
+（見 `reports/BOOT_OUTPUT.md` §2、§6）：
+
+`uart_out_lock()` 只保護韌體自己寫的 `$` 行函式，`ESP_LOG*` 完全不走那把鎖，
+而 `mic_task`/`uart_cmd_task` 是 priority 5、`app_main`（`$T` 的來源）預設
+priority 1——高優先權隨時能在一行 `$T` 的 130+ 次 `printf()` 之間插隊。**這會
+被主機端 `protocol.py` 正確拒絕（已驗證，見 `host/capture/test_protocol.py`
+新增的 5 個測試），但那一行的 `seq` 會在 `DropTracker` 眼中造出一個缺口
+——跟裝置真的沒送出那一幀，長得一模一樣。**
+
+而且裝置自己的 `$H` `drop_*` 計數器不會把這算進去（那一幀確實被印出來了，
+韌體不知道它被自己的 log 弄髒），所以 `cross_check()` 的 `delta` 會被推成正的、
+`quality` 事件會跳出一則「傳輸途中遺失（UART overrun 或 bridge 跟不上）」的
+紅色警示——**這句歸因在這個成因下是誤導的**，不是計數器本身錯，是提示文字
+把使用者導去查錯的方向。
+
+⚠️ **`ProtocolParser.stats.malformed`／`malformed_rate` 已經算出來了，但目前
+沒有任何地方讀它**——`vl53l7cx_test/monitor/bridge_server.py` 沒有把它接進
+`quality` 事件或 panel，純粹是個內部數字。在這條路徑被接上之前，**看到非零
+掉幀率但摸不清是不是這個成因時，唯一能確認的辦法是自己讀 `ProtocolParser`
+的 `stats.malformed_rate`**（`bridge_server.py` 目前沒有 HTTP endpoint 暴露它，
+需要另外接一個除錯用的讀取點，或直接在 Python 互動環境裡查 `protocol_state["parser"].stats`）。
+
+**量級（讀原始碼估的，不是實測，數字有誤差）**：穩態下唯一會週期性觸發這個
+race 的來源是 `bone_mic.c` 的 `a15_perf` log（每 10 秒一次，`mic_task`，
+priority 5）；`vl53l7cx_test.c` 自己也有一行同名 log，但那是**同一個 task**
+印 `$T` 的，同 task 內是循序執行，不會撞到自己。其餘 `ESP_LOG*`（感測器 init
+失敗、i2s 錯誤、`SENS`/`AMB`/`MEL`/`REC` 指令回應）都只在開機那一刻或使用者
+發指令時才印，不是穩態背景噪音。粗估：一行 `$T`（4×4）在裝完 UART 驅動
+（512-byte TX ring buffer）之後，130+ 次 `printf()` 幾乎是背靠背执行完就把
+資料塞進緩衝區，真正暴露在搶佔風險下的視窗遠小於這行資料實際上線傳輸所需
+的時間；`a15_perf` 一次 10 秒才觸發一次，落在這個窄視窗裡的機率粗估在
+**千分之幾量級**，10 分鐘的錄製大概率連一次都不會撞上，但不是零——如果
+`fw_regression.py` 跑出來的掉幀率剛好是「非常小、非零」，這是第一個該懷疑
+的來源，而不是先去查線材。
+
 ---
 
 ## 2. 未驗證的假設（錯了會讓分析結論反向）
