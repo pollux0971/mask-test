@@ -88,7 +88,7 @@ import numpy as np
 ROOT_DIR = Path(__file__).resolve().parents[2]  # ssi-backlog/tools/ -> ssi-backlog -> repo root
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
-from host.storage.session_writer import SessionWriter, TOF_VALUES_DIM, TOF_VALID_DIM, MEL_BANDS  # noqa: E402
+from host.storage.session_writer import SessionWriter, TOF_VALID_DIM, MEL_BANDS  # noqa: E402
 
 SCHEMA_VERSION = 1
 VOCAB_PATH = ROOT_DIR / "config" / "vocab.json"
