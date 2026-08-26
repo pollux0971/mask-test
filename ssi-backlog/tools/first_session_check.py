@@ -288,6 +288,7 @@ CHECKS = (
     check_monotonic_time,
     check_invalid_zones,
     check_mic_noise,
+    check_mic_signal_level,
     check_clipping,
     check_drop_counts,
     check_vad_chain,

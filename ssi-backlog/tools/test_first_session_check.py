@@ -56,7 +56,8 @@ def _base_meta(**overrides):
 
 
 def _trial_arrays(n_tof=10, n_mic=10, t_us_start=0, t_us_step=1000,
-                   invalid_zone_ratio=0.0, mic_peak_value=400, force_backward_at=None):
+                   invalid_zone_ratio=0.0, mic_peak_value=400, force_backward_at=None,
+                   mic_rms_value=500.0):
     t_us = np.arange(t_us_start, t_us_start + n_tof * t_us_step, t_us_step, dtype=np.int64)
     if force_backward_at is not None:
         t_us[force_backward_at] = t_us[force_backward_at - 1] - 500
@@ -68,7 +69,7 @@ def _trial_arrays(n_tof=10, n_mic=10, t_us_start=0, t_us_step=1000,
     if n_invalid:
         valid_A[:, :n_invalid] = False
         valid_B[:, :n_invalid] = False
-    mic_rms = np.full(n_mic, 500.0, dtype=np.float32)
+    mic_rms = np.full(n_mic, mic_rms_value, dtype=np.float32)
     mic_peak = np.full(n_mic, mic_peak_value, dtype=np.int16)
     mic_t_us = np.arange(n_mic, dtype=np.int64) * 2000
     return dict(
@@ -186,6 +187,58 @@ def test_invalid_zone_ratio_and_clipping_are_reported_as_numbers_not_stops(tmp_p
     assert v.ok, f"數字異常不該變成 STOP，但拿到 {v.stop_reasons}"
     assert any("無效 zone 比例" in line for line in v.info_lines)
     assert any("削波" in line for line in v.info_lines)
+
+
+def test_mic_signal_level_is_reported_as_numbers_not_a_stop(tmp_path):
+    """真板子第一手資料 RMS 4-6，遠低於 300 的門檻——這種「數字很低但
+    不是恆為 0」的情況必須只印數字，不能變成 STOP（還不知道真實正常值
+    該是多少）。"""
+    path = tmp_path / "quiet_mic.h5"
+    meta = _base_meta()
+    _write_session(path, meta, [
+        (0, "_baseline", {}),
+        (1, "八", _trial_arrays(mic_rms_value=5.0)),
+    ])
+
+    v = check_session(str(path), target=5)
+
+    assert v.ok, f"RMS 偏低不該變成 STOP，但拿到 {v.stop_reasons}"
+    assert any("麥克風 RMS 分布" in line and "min=5.0" in line for line in v.info_lines)
+
+
+def test_mic_rms_constantly_zero_is_a_stop(tmp_path):
+    """麥克風完全沒接上訊號——查過 host/quality/metrics.py，現行的即時
+    品質儀表板對 noise_floor 只有「太吵」的方向，RMS=0 會被判成全綠。
+    這裡是目前唯一能抓到「麥克風可能沒接上」的地方，必須是 STOP。"""
+    path = tmp_path / "dead_mic.h5"
+    meta = _base_meta()
+    _write_session(path, meta, [
+        (0, "_baseline", {}),
+        (1, "八", _trial_arrays(mic_rms_value=0.0)),
+        (2, "五", _trial_arrays(mic_rms_value=0.0)),
+    ])
+
+    v = check_session(str(path), target=5)
+
+    assert not v.ok
+    assert any("恆為 0" in reason for reason in v.stop_reasons)
+
+
+def test_mic_rms_zero_in_only_some_trials_is_not_a_stop(tmp_path):
+    """只有部分 trial 是 0（例如某一筆真的沒講話）不該被當成整個
+    session 的麥克風沒接上——STOP 只保留給「整個 session 恆為 0」。"""
+    path = tmp_path / "partial_silence.h5"
+    meta = _base_meta()
+    _write_session(path, meta, [
+        (0, "_baseline", {}),
+        (1, "八", _trial_arrays(mic_rms_value=0.0)),
+        (2, "五", _trial_arrays(mic_rms_value=500.0)),
+    ])
+
+    v = check_session(str(path), target=5)
+
+    assert v.ok, f"部分為 0 不該變成 STOP，但拿到 {v.stop_reasons}"
+    assert any("恆為 0" not in line for line in v.info_lines)
 
 
 def test_drop_count_is_summed_and_reported(tmp_path):
