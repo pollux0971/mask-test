@@ -427,8 +427,31 @@ registerMode("validate", (() => {
           <span class="mono">${typeof d16 === "number" ? d16.toFixed(4) : d16}</span>
         </div>
       ` : ""}
-      ${!d19 && d16 == null ? `<div class="pending-note">這輪沒有足夠特徵跑 D16/D19（需要至少 2 個類別的資料）。</div>` : ""}
+      ${!d19 && d16 == null && !unknownExtrasHtml(extras)
+        ? `<div class="pending-note">這輪沒有足夠特徵跑 D16/D19（需要至少 2 個類別的資料）。</div>` : ""}
+      ${unknownExtrasHtml(extras)}
     `;
+  }
+
+  // esp-mask-test-ad 剛轉述 ed 對這個專案「白名單、只掃一層、忘了
+  // passthrough」這個 bug 形狀的觀察（同一個構造在後端出現五次：$H
+  // host 統計、sensors_seen、coverage、figures、extras 本身）。這裡挑
+  // d19_dual_matrix/d16_gain 是因為它們需要客製化排版（p 值、置換次數、
+  // 分組警語），但如果以後 extras 多一把 d16/d19 以外的鑰匙，不該無聲
+  // 消失 -- 通用列出來，總比讀者以為「這裡就只有這兩個」來得誠實。
+  function unknownExtrasHtml(extras) {
+    const known = new Set(["d19_dual_matrix", "d16_gain"]);
+    const rest = Object.keys(extras).filter((k) => !known.has(k));
+    if (!rest.length) return "";
+    const rows = rest.map((k) => {
+      const v = extras[k];
+      const val = typeof v === "object" && v !== null ? JSON.stringify(v) : String(v);
+      return `<tr><td class="mono">${k}</td><td class="mono">${val}</td></tr>`;
+    }).join("");
+    return `<div class="validate-extras-block">
+      <div class="validate-extras-title">其他補充數值（尚未有專屬版面）</div>
+      <table class="validate-detail-table"><tbody>${rows}</tbody></table>
+    </div>`;
   }
 
   async function refreshState() {
@@ -670,13 +693,29 @@ registerMode("validate", (() => {
     renderCompare();
   }
 
-  // figureListHtml() 拿掉了：GET /verify/reports 目前只列出報告根目錄的
-  // 檔案（見 bridge_server.py list_verify_runs() 的 entry.iterdir()，
-  // 只掃一層），從來沒有列過 figures/ 子目錄底下的檔名，而 write_outputs()
-  // 確認圖一律寫進 figures/ 子目錄 -- 前端沒有任何管道知道圖檔叫什麼名字。
-  // 猜檔名（例如照實驗 slug 拼）是原本這裡的註解自己講過要避免的做法：
-  // D15 之後改圖檔命名，這裡會靜靜地全部連不到。已回報調度員：這是
-  // 「圖表看得到」需求現在做不到的根本原因，需要後端補一個 figures 清單。
+  // list_verify_runs() 現在會回 figures（相對於該 run 目錄的路徑，例如
+  // "figures/viseme_sensitivity.png"，已跟調度員/ed 確認可以直接接在
+  // `/verify/reports/<run_id>/` 後面，不用重組路徑，也不用防 undefined
+  // ——沒有圖的 run 回 []）。
+  function figuresHtml(report) {
+    const figures = report.figures || [];
+    const pngs = figures.filter((f) => f.endsWith(".png"));
+    if (!pngs.length) return `<div class="validate-report-no-figures">（這次執行沒有產生圖表）</div>`;
+    return `<div class="validate-report-figures">` + pngs.map((png) => {
+      const stem = png.slice(0, -4);
+      const pdf = figures.find((f) => f.endsWith(".pdf") && f.slice(0, -4) === stem);
+      const pngUrl = `/verify/reports/${report.run_id}/${png}`;
+      return `
+        <figure class="validate-figure">
+          <img src="${pngUrl}" alt="${png}" loading="lazy">
+          <figcaption>
+            ${png.split("/").pop()}
+            ${pdf ? `<a href="/verify/reports/${report.run_id}/${pdf}" download>下載 PDF（向量圖，供排版用）</a>` : ""}
+          </figcaption>
+        </figure>
+      `;
+    }).join("") + `</div>`;
+  }
 
   function renderCompare() {
     if (!selectedIds.length) {
@@ -693,7 +732,7 @@ registerMode("validate", (() => {
           ${htmlUrl
             ? `<iframe class="validate-compare-iframe" src="${htmlUrl}" title="report ${report.run_id}"></iframe>`
             : `<div class="pending-note">這一輪沒有 summary.html（可能執行到一半失敗）。</div>`}
-          <div class="pending-note">圖表清單目前後端沒有提供（/verify/reports 只列出報告根目錄的檔案，不含 figures/ 子目錄），已回報調度員追加端點。</div>
+          ${figuresHtml(report)}
         </div>
       `;
     }).join("");

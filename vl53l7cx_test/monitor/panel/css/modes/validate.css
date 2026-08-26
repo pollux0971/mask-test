@@ -525,3 +525,38 @@
   background: #fff;
   flex-shrink: 0;
 }
+
+.validate-report-no-figures {
+  font-size: 0.6875rem;
+  color: var(--text-dim);
+}
+.validate-report-figures {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.validate-figure {
+  margin: 0;
+}
+.validate-figure img {
+  max-width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  display: block;
+  /* D20 的圖是深色文字配白底（給論文排版用），跟面板的深色主題疊在一起
+     會刺眼且邊界糊 -- 白底卡片墊一層，圖本身不強改色（改了就跟輸出的
+     PDF 不一致，那份圖表是要給人拿去印的）。 */
+  background: #fff;
+  padding: 4px;
+}
+.validate-figure figcaption {
+  font-size: 0.6875rem;
+  color: var(--text-dim);
+  margin-top: 4px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.validate-figure figcaption a {
+  color: var(--accent);
+}
