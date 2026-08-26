@@ -175,6 +175,13 @@ def _stale_stream_message(item):
             f"所以請直接檢查該感測器的接線。")
 
 
+_DEAD_MIC_HINT = (
+    "麥克風的 RMS 這段時間裡一直精確是 0，不是「偏低」——貼合骨傳導麥克風"
+    "即使很安靜，量到的也是個位數（例如 4-6），精確的 0 代表根本沒有訊號"
+    "進來，多半是接觸不良或線材鬆脫。這不是底噪好，是麥克風可能沒接上。"
+)
+
+
 def _transport_alarm_message(stream, host, device, malformed):
     """Explain a positive delta without over-claiming its cause.
 
@@ -329,6 +336,32 @@ class QualityAggregator:
                             "timeout_s": limit})
         return out
 
+    #: The streams that actually carry recognition data. `heartbeat` is
+    #: deliberately excluded: it is the one stream that keeps flowing even
+    #: when every sensor has died, so counting it here would hide exactly
+    #: the failure this check exists to catch.
+    _PAYLOAD_STREAMS = ("tof_A", "tof_B", "mic")
+
+    def _no_payload_flowing(self, stale_stream_names) -> bool:
+        """True when none of tof_A/tof_B/mic are currently delivering data.
+
+        `bandwidth` counts every byte on the wire, `$H` included -- a link
+        that is nothing but heartbeats still reads as "some bandwidth in
+        use" and can land comfortably inside the green threshold. This is
+        what tells that apart from genuine payload traffic, reusing
+        `stale_streams()`'s judgment of "silent" rather than inventing a
+        second one that could disagree with it.
+        """
+        with self._lock:
+            last_seen = dict(self._last_seen)
+        for stream in self._PAYLOAD_STREAMS:
+            if stream in stale_stream_names:
+                continue                       # confirmed stale
+            if last_seen.get(stream) is None:
+                continue                       # never seen at all
+            return False                       # at least one is alive
+        return True
+
     def observe_tof(self, event: dict, now: float | None = None) -> None:
         now = self._clock() if now is None else now
         sensor = event.get("sensor")
@@ -431,6 +464,21 @@ class QualityAggregator:
     def _noise_floor(self):
         return _percentile([v for _, v in self._rms], NOISE_FLOOR_PERCENTILE)
 
+    def _mic_all_zero(self):
+        """True when every rms sample in the current window is exactly 0.
+
+        Not "low" -- a hard, sustained 0. A real bone-conduction mic against
+        skin reads single digits at rest (measured on hardware: RMS 4-6,
+        confirmed normal by firmware review -- that is ~0.015% of full
+        scale, and the firmware applies no scaling that could zero it out),
+        so a threshold anywhere above 0 would misclassify that as dead. Only
+        "never anything but 0" is a value no connected microphone produces.
+        Same criterion ssi-backlog/tools/first_session_check.py already uses
+        for a recorded session (`n_zero == all_rms.size`) -- one judgment,
+        not two that could disagree.
+        """
+        return bool(self._rms) and all(v == 0 for _, v in self._rms)
+
     def _bandwidth(self, now):
         if not self._bytes:
             return None
@@ -514,6 +562,7 @@ class QualityAggregator:
                 "noise_floor": self._noise_floor(),
                 "bandwidth": self._bandwidth(now),
             }
+            mic_dead = self._mic_all_zero()
             alarms = self._transport_alarms()
 
         # Outside the lock: these reach into collaborators that take their
@@ -538,6 +587,14 @@ class QualityAggregator:
                 entry["level"] = "red"
                 entry["hint"] = alarm["message"]
 
+        # A sustained, exact 0 is not "quiet" -- see _mic_all_zero(). Overrides
+        # whatever the plain threshold table said, the same way alarms above do.
+        if mic_dead:
+            entry = metrics.get("noise_floor")
+            if entry is not None:
+                entry["level"] = "red"
+                entry["hint"] = _DEAD_MIC_HINT
+
         event = {"type": "quality", "t": time.time(), "metrics": metrics}
 
         stale = self.stale_streams(now)
@@ -550,6 +607,17 @@ class QualityAggregator:
                 "silent_for_s": item["silent_for_s"],
                 "message": _stale_stream_message(item),
             } for item in stale)
+
+        # bandwidth counts every byte on the wire, heartbeats included -- a
+        # link with no payload streams alive can still show a "healthy"
+        # low-but-nonzero number. Demote it to unknown rather than trust a
+        # figure that is not measuring what the dashboard implies it is.
+        stale_names = {item["stream"] for item in stale}
+        if self._no_payload_flowing(stale_names):
+            entry = metrics.get("bandwidth")
+            if entry is not None and entry["level"] != "unknown":
+                entry["level"] = "unknown"
+                entry.pop("hint", None)
 
         if self.sensors_seen is not None:
             try:

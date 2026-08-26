@@ -1,10 +1,10 @@
 # 品質儀表板：六個指標的 `direction` 逐項核對
 
-> 範圍：只讀 `host/quality/metrics.py`、`config/quality_thresholds.json`，
-> **沒有修改**。逐項回答三個問題——方向對不對、另一端的極端值代表什麼、
-> 有沒有「只有中間才對」的指標。**方向是邏輯問題，現在就能判斷；
-> `green`/`yellow` 門檻的數字要等真實配戴資料，這裡不動那些數字，
-> 只在確認方向有問題時提最小的邏輯修法。**
+> 範圍：一開始只讀 `host/quality/metrics.py`、`config/quality_thresholds.json`
+> 做核對，**兩個修法提案經調度員核准後這一輪已經動手做了**（見文末「已實作」
+> 一節）；`config/quality_thresholds.json` 的數字**沒有動**，方向/邏輯層
+> 修法都不碰 `green`/`yellow` 門檻。原始核對逐項回答三個問題——方向對不對、
+> 另一端的極端值代表什麼、有沒有「只有中間才對」的指標。
 
 ## 結論先講
 
@@ -53,19 +53,23 @@ def _noise_floor(self):
 完全沒有訊號」跟「低但仍然是麥克風收音」是兩種不同的物理狀態，只用一個
 `lower_better` 加一個下限門檻表達不出這個差異。**
 
-### 最小修法提案（只提案，不改）
+### ✅ 已實作（調度員核准後這輪動手做了）
 
-不需要改 `direction`，也不需要現在動 `green`/`yellow` 的數字。邏輯層面
-最小的修法：對 `_noise_floor()` 的值域加一個**下限存活檢查**——真正接著
-的麥克風，即使在完全安靜的房間裡，ADC 本身的量化雜訊跟電路熱雜訊也幾乎
-不可能讓連續一段時間的 rms 精確或接近 0（這是可以先用合成資料驗證的
-假設，不需要真板子：`ssi-backlog/tools/mock_device.py` 現在有沒有模擬
-「麥克風斷路」這個狀態，如果沒有，這也是一個可以先補的測試缺口）。
-具體做法交給接手的人判斷，方向是：**在 `_noise_floor()` 或
-`ThresholdTable.classify()` 這一層，額外標記「rms 持續為 0（或低於某個
-物理上不可能的極小值）」為 `unknown` 或直接觸發一個獨立的告警**，
-不要讓它落進正常的 `green`/`yellow`/`red` 三段式門檻裡跟真正的「安靜」
-混在一起。
+沒有改 `direction`，沒有動 `green`/`yellow` 的數字。加了一個獨立的
+存活檢查 `_mic_all_zero()`：這個視窗裡的 `rms` **全部**精確等於 0
+才視為死亡，不是「低於某個門檻」——真板子實測過，貼合骨傳導麥克風安靜時
+RMS 是 4-6（`22` 查過韌體確認正常，沒有任何縮放/截斷），**任何大於 0 的
+下限都會誤殺這個正常值**，所以判準刻意只抓「恆為 0」這一種情況，跟
+`ssi-backlog/tools/first_session_check.py` 判斷一筆錄好的 session 用的
+是同一個條件（`n_zero == all_rms.size`），不是另外發明一個可能對不上的
+門檻。命中時把 `noise_floor` 的等級直接覆寫成 `red`，附一句說明「這是
+精確的 0，不是安靜」的提示，做法跟既有的 `_transport_alarms()`／
+`stale_streams()` 覆寫 `level` 的機制一致。
+
+測試：`host/quality/test_metrics.py` 新增 4 個——恆為 0 觸發 `red`、
+只要有一筆非 0 就不觸發、真實安靜值（4-6）維持 `green` 不受影響、
+既有的「低但非 0」案例（`test_noise_floor_is_a_low_percentile_not_the_mean`）
+沒有被誤傷。
 
 ---
 
@@ -98,17 +102,27 @@ def _bandwidth(self, now):
 `E05` 錄製過程中出現「感測器斷線但 bandwidth 卻是綠燈」的案例，直接對照
 這份報告就能定位到這裡，不用重新從頭查起。
 
-### 最小修法提案（只提案，不改）
+### ✅ 已實作（改用 `ed` 剛加的 `stale_streams()`，不是原提案那版）
 
-`QualityAggregator.snapshot()` 同一次呼叫裡已經算出 `valid_zones`（ToF
-是否有資料）跟 `noise_floor`（Mic 是否有資料），**不需要新增資料來源**：
-邏輯層面最小的修法是**交叉檢查**——如果 `valid_zones` 跟 `noise_floor`
-都是 `None`（代表這個視窗完全沒有 ToF 也沒有 Mic 資料），但 `bandwidth`
-仍然算出一個非 `None` 的值，代表這個頻寬幾乎全部是心跳／雜訊，**這種
-情況下 `bandwidth` 的等級應該連帶降成 `unknown`**，不應該單獨看
-`bandwidth` 自己的門檻。跟目前 `_transport_alarms()` 已經在做的「跨指標
-交叉核對才能發現的故障」（B20 的 delta 檢查）是同一種設計精神，不是新
-發明一套機制。
+原提案是拿 `valid_zones`/`noise_floor` 是否為 `None` 來交叉判斷——寫這段
+之後發現 `ed` 剛好加了 `stale_streams()`（逐串流的逾時偵測），**這正是
+同一件事的更準確版本**：`valid_zones`/`noise_floor` 是 `None` 只代表
+「這個視窗完全沒有樣本」，跟「串流已經逾時、確認死亡」不是同一件事
+（例如視窗剛清空但下一幀馬上要到），改用 `stale_streams()` 的判斷結果
+（加上「這個串流從來沒被看過」的狀態）就不用發明第二套「這條線是不是
+死的」邏輯，兩個機制才不會對同一件事給出不同答案。
+
+實作：新增 `_no_payload_flowing()`，檢查 `tof_A`/`tof_B`/`mic` 是否
+**全部**都在 `stale_streams()` 回報的名單裡、或從來沒被看過（`heartbeat`
+刻意排除——它正是唯一在所有感測器都死掉時還會持續跳動的串流，算進去
+會讓這個檢查失效）。三者全部「死或從未出現」時，把 `bandwidth` 的等級
+覆寫成 `unknown` 並移除多餘的 hint，不管原本的門檻分類是什麼。
+
+測試：`host/quality/test_metrics.py` 新增 2 個——只剩心跳時 `bandwidth`
+被降成 `unknown`；至少一個 payload 串流還活著時維持原本的門檻分類不受
+影響。另外跑過 `test_bridge_sse.py` 對真的 mock device 子行程（55 個
+測試全過），確認正常情況下（payload 真的在流動）不會被誤判成
+`unknown`。
 
 ---
 
@@ -174,9 +188,13 @@ if aligner is None or aligner.n_buckets < MIN_CLOCK_BUCKETS:
 
 ---
 
-## 沒有動的東西
+## 這輪動了什麼、沒動什麼
 
-`host/quality/metrics.py`、`config/quality_thresholds.json` 全程只讀，
-沒有修改任何邏輯或數字。上面兩個提案（`noise_floor` 的下限防護、
-`bandwidth` 的交叉核對）都只是方向性描述，具體怎麼實作、要不要做、
-`green`/`yellow` 數字要不要跟著調，留給調度員核准後再排。
+`host/quality/metrics.py`：加了 `_mic_all_zero()`、`_no_payload_flowing()`
+兩個方法跟 `snapshot()` 裡對應的兩處覆寫、`_DEAD_MIC_HINT` 訊息常數；
+`host/quality/test_metrics.py` 加了 6 個測試。**`config/quality_thresholds.json`
+一個數字都沒動**——兩個修法都是邏輯層的存活檢查/交叉核對，`direction`
+跟 `green`/`yellow` 完全沒有變。沒有碰 `analysis/`、`panel/**`，也沒有動
+`bridge_server.py`（它只是呼叫 `QualityAggregator.snapshot()`，這輪的
+改動對它透明，不需要跟著改）。跑過 `host/quality/`（39 個測試）跟
+`test_bridge_sse.py`（55 個測試，含真的 mock device 子行程），全過。

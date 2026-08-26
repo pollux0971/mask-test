@@ -200,6 +200,39 @@ def test_noise_floor_is_a_low_percentile_not_the_mean(thresholds):
     assert agg.snapshot()["metrics"]["noise_floor"]["value"] == 100
 
 
+def test_noise_floor_low_but_nonzero_is_still_green(thresholds):
+    """Measured on real hardware: a bone-conduction mic against skin reads
+    single digits at rest (RMS 4-6), not zero. That is normal, not a fault
+    -- the dead-mic check below must not catch this."""
+    agg = QualityAggregator(thresholds, clock=FakeClock())
+    for rms in [4, 5, 6, 5, 4, 5, 6, 5, 4, 5]:
+        agg.observe_mic({"type": "mic", "rms": rms, "peak": rms, "t_us": 0})
+    entry = agg.snapshot()["metrics"]["noise_floor"]
+    assert entry["level"] == "green"
+    assert "hint" not in entry
+
+
+def test_noise_floor_sustained_exact_zero_is_flagged_dead(thresholds):
+    """A hard, sustained 0 -- not "low" -- is what a disconnected mic looks
+    like. The plain threshold table would call this green (0 <= 300); the
+    dead-mic override must catch it before that happens."""
+    agg = QualityAggregator(thresholds, clock=FakeClock())
+    for _ in range(10):
+        agg.observe_mic({"type": "mic", "rms": 0, "peak": 0, "t_us": 0})
+    entry = agg.snapshot()["metrics"]["noise_floor"]
+    assert entry["level"] == "red"
+    assert "0" in entry["hint"] or "麥克風" in entry["hint"]
+
+
+def test_noise_floor_one_nonzero_sample_is_not_flagged_dead(thresholds):
+    """Even a single real reading in the window means the mic is connected
+    -- "all zero" has to mean *all*, not "mostly zero"."""
+    agg = QualityAggregator(thresholds, clock=FakeClock())
+    for rms in [0, 0, 0, 0, 5]:
+        agg.observe_mic({"type": "mic", "rms": rms, "peak": rms, "t_us": 0})
+    assert agg.snapshot()["metrics"]["noise_floor"]["level"] != "red"
+
+
 def test_bandwidth_is_a_fraction_of_link_capacity(thresholds):
     clock = FakeClock()
     agg = QualityAggregator(thresholds, baud=460800, clock=clock)
@@ -207,6 +240,38 @@ def test_bandwidth_is_a_fraction_of_link_capacity(thresholds):
     clock.advance(1.0)
     agg.note_bytes(23040)             # half of 46080 B/s
     assert agg.snapshot()["metrics"]["bandwidth"]["value"] == pytest.approx(0.5)
+
+
+def test_bandwidth_green_from_heartbeat_only_is_demoted_to_unknown(thresholds):
+    """A link with nothing but $H still moves some bytes, and that number
+    can land comfortably inside the green threshold -- but heartbeats are
+    not recognition data. Reuses stale_streams()'s judgment of "nothing is
+    flowing" rather than inventing a second one that could disagree."""
+    clock = FakeClock()
+    agg = QualityAggregator(thresholds, baud=460800, clock=clock, host_clock=clock)
+    agg.observe_tof(_tof("A"))
+    agg.observe_tof(_tof("B"))
+    agg.observe_mic({"type": "mic", "rms": 100, "peak": 100, "t_us": 0})
+    agg.note_bytes(100)
+    clock.advance(5.0)  # past every payload stream's 3s timeout
+    agg.note_bytes(100)  # still moving a trickle of bytes (heartbeats)
+    entry = agg.snapshot()["metrics"]["bandwidth"]
+    assert entry["level"] == "unknown"
+    assert "hint" not in entry
+
+
+def test_bandwidth_stays_green_while_payload_is_actually_flowing(thresholds):
+    """The demotion must not fire just because the link is quiet -- only
+    when none of tof_A/tof_B/mic are delivering anything."""
+    clock = FakeClock()
+    agg = QualityAggregator(thresholds, baud=460800, clock=clock, host_clock=clock)
+    agg.note_bytes(0)
+    clock.advance(1.0)
+    agg.observe_tof(_tof("A"))  # at least one payload stream is alive
+    agg.note_bytes(23040)
+    entry = agg.snapshot()["metrics"]["bandwidth"]
+    assert entry["value"] == pytest.approx(0.5)
+    assert entry["level"] == "green"
 
 
 def test_metrics_with_no_data_are_unknown(thresholds):

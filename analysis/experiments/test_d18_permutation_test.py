@@ -245,3 +245,152 @@ def test_tof_only_significant_even_in_silent_mode():
 
     assert report["tof_only"]["passed"] is True
     assert report["tof_only"]["pvalue"] < P_VALUE_THRESHOLD
+
+
+# ============================ 分組驗證與 p 值解析度（統計嚴謹度稽核的第 2、3 項）
+
+import numpy as _np  # noqa: E402
+import pytest as _pytest  # noqa: E402
+
+from analysis.experiments.d18_permutation_test import (  # noqa: E402
+    p_value_floor,
+    permutation_report,
+)
+from analysis.experiments.d18_permutation_test import (  # noqa: E402
+    format_report as _format_report,
+)
+from analysis.experiments.d18_permutation_test import (  # noqa: E402
+    run_permutation_test as _run_permutation_test,
+)
+
+_WORDS = ["wu", "yi", "si", "ba"]
+
+
+def _leaky_dataset(n_per_word=6, wear_leak=3.0, seed=0):
+    """合成資料：詞的訊號 + **戴法的洩漏訊號**。
+
+    `[0:8]` 帶詞彙資訊，`[60:64]` 帶「這是第幾次戴」的資訊。隨機切 CV 會讓
+    模型靠後者得分；按 `wear_id` 分組之後那條路就斷了。
+    """
+    rng = _np.random.RandomState(seed)
+    labels, wear, feats = [], [], []
+    for i in range(n_per_word * len(_WORDS)):
+        word = _WORDS[i % len(_WORDS)]
+        w = 1 if i < n_per_word * len(_WORDS) // 2 else 2
+        data = rng.normal(0, 1, (24, 104))
+        data[:, 0:8] += _WORDS.index(word) * 1.5
+        data[:, 60:64] += w * wear_leak
+        labels.append(word)
+        wear.append(w)
+        feats.append(data)
+    return feats, labels, wear
+
+
+# -- p 值解析度 --------------------------------------------------------------
+
+
+@_pytest.mark.parametrize("n,expected", [
+    (200, 1 / 201), (1000, 1 / 1001), (9999, 1 / 10000),
+])
+def test_p_value_floor_matches_the_sklearn_formula(n, expected):
+    """`p = (C+1)/(N+1)`，所以 p 不可能小於 `1/(N+1)`。"""
+    assert p_value_floor(n) == _pytest.approx(expected)
+
+
+def test_200_permutations_cannot_resolve_the_pass_threshold():
+    """🔴 `run_all` 的預設是 200 → p 下限 0.005，而通過門檻是 0.01。
+    **「p 剛好壓在門檻下」與「p 小到量不出來」在這個解析度下分不出來。**"""
+    assert p_value_floor(200) > 0.01 / 3
+    assert p_value_floor(1000) < 0.01 / 5
+
+
+def test_report_prints_the_permutation_count_and_floor():
+    """**沒有這一段，讀報告的人無從判斷 p 值有多細。**"""
+    feats, labels, _ = _leaky_dataset(n_per_word=3)
+    text = _format_report(permutation_report(feats, labels, n_permutations=50, cv=3))
+    assert "p 下限" in text
+    assert f"{p_value_floor(50):.5f}" in text
+    assert "不可宣稱" in text
+
+
+def test_report_warns_when_the_floor_is_close_to_the_threshold():
+    feats, labels, _ = _leaky_dataset(n_per_word=3)
+    coarse = _format_report(permutation_report(feats, labels, n_permutations=50, cv=3))
+    assert "只差不到一個數量級" in coarse
+
+    fine = _format_report(permutation_report(feats, labels, n_permutations=1000, cv=3))
+    assert "只差不到一個數量級" not in fine
+
+
+# -- 分組驗證 ----------------------------------------------------------------
+
+
+def test_grouping_removes_the_wear_leakage():
+    """**這條測試就是這次改動的理由。**
+
+    資料裡刻意放了「這是第幾次戴」的訊號。隨機切 CV 讓模型靠它得分；
+    按 `wear_id` 分組之後那條路斷了，**準確率會掉——而那是對的**。
+    """
+    feats, labels, wear = _leaky_dataset(wear_leak=4.0)
+    ungrouped = _run_permutation_test(feats, labels, "tof_combined",
+                                       n_permutations=50, cv=3)
+    grouped = _run_permutation_test(feats, labels, "tof_combined",
+                                     n_permutations=50, cv=3, groups=wear)
+
+    assert ungrouped["grouping"] == "ungrouped_no_groups_given"
+    assert grouped["grouping"] == "grouped"
+    assert grouped["n_groups"] == 2
+    assert grouped["score"] < ungrouped["score"], (
+        "分組之後準確率沒有下降——洩漏訊號可能沒有生效，這條測試就失去意義了")
+
+
+def test_single_group_is_reported_not_silently_downgraded():
+    """🔴 **使用者的第一批資料很可能只戴一次。**
+
+    此時分組驗證**做不到**。安靜退回未分組 CV 是最糟的失敗方式——
+    報告看起來跟真的做了分組一樣，等於**宣稱一個沒做的方法學保證**。
+    """
+    feats, labels, _ = _leaky_dataset(n_per_word=4)
+    result = _run_permutation_test(feats, labels, "tof_combined",
+                                    n_permutations=50, cv=3,
+                                    groups=[1] * len(labels))
+    assert result["grouping"] == "ungrouped_single_group"
+    assert result["grouping_note"]
+    assert "無法進行" in result["grouping_note"]
+    assert "灌水" in result["grouping_note"]
+
+
+@_pytest.mark.parametrize("groups,expected", [
+    (None, "ungrouped_no_groups_given"),
+    ("single", "ungrouped_single_group"),
+    ("two", "grouped"),
+])
+def test_report_text_differs_for_all_three_grouping_states(groups, expected):
+    """三種狀態在報告裡**看起來必須完全不同**。"""
+    feats, labels, wear = _leaky_dataset(n_per_word=4)
+    actual = {None: None, "single": [1] * len(labels), "two": wear}[groups]
+    report = permutation_report(feats, labels, n_permutations=50, cv=3, groups=actual)
+    assert report["all"]["grouping"] == expected
+
+    text = _format_report(report)
+    if expected == "grouped":
+        assert "✅ **有做分組驗證**" in text
+    elif expected == "ungrouped_single_group":
+        assert "🔴 **分組驗證無法進行" in text
+    else:
+        assert "⚠️ **這一輪沒有做分組驗證**" in text
+
+
+def test_mismatched_groups_length_raises():
+    feats, labels, _ = _leaky_dataset(n_per_word=2)
+    with _pytest.raises(ValueError, match="長度"):
+        _run_permutation_test(feats, labels, "all", n_permutations=10, cv=2,
+                              groups=[1, 2])
+
+
+def test_grouped_cv_folds_are_clamped_to_the_group_count():
+    """`StratifiedGroupKFold` 的折數不能超過 group 數。"""
+    feats, labels, wear = _leaky_dataset(n_per_word=4)
+    result = _run_permutation_test(feats, labels, "all", n_permutations=10,
+                                    cv=5, groups=wear)
+    assert result["cv"] <= result["n_groups"] == 2

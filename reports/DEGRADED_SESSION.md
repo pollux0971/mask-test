@@ -227,6 +227,120 @@ sensors_seen 少於 sensors_enabled  →  A / B / C / E 回 SKIPPED，
    所以 `C0` 的 skip 理由講的是配對不足。
    若之後真的照 `C0` 流程錄了 solo/dual，行為需要另外驗。
 
+---
+
+# 第二輪：**中途掉線**（B 錄到一半停 / B 斷斷續續）
+
+第一輪只測了「B 從頭到尾沒資料」。這一輪測 `E05` 更可能發生的兩種形態，
+**兩組詞彙都跑**（因為第一輪已經證明結論會因詞彙而異）。
+
+| 情境 | B 的樣子 |
+|---|---|
+| **dropout** | 前 3 個 trial 正常，**後 3 個完全沒有** |
+| **intermittent** | 每個 trial 都在，但**只有約 25% 的幀有資料** |
+
+## 結果
+
+| 情境 | 詞彙 | `/meta` `sensors_seen` | per-trial `sensors_seen` | `C` | `blocking` |
+|---|---|---|---|---|---|
+| dropout | real | 🔴 `"AB"` | ✅ `AB AB AB A A A` | `FAIL` 0.107 | `[A, C]` |
+| dropout | **alt** | 🔴 `"AB"` | ✅ `AB AB AB A A A` | 🔴 **`PASS` 0.302** | 🔴 **`[]`** |
+| intermittent | real | 🔴 `"AB"` | 🔴 `AB AB AB AB AB AB` | `FAIL` 0.132 | `[A, C]` |
+| intermittent | **alt** | 🔴 `"AB"` | 🔴 `AB AB AB AB AB AB` | 🔴 **`PASS` 0.315** | 🔴 **`[]`** |
+
+`C0` 四種情境都 `SKIPPED`（一致且誠實）。
+`B`（跨次戴 CV）**四種都 `PASS`**——它對中途掉線完全沒有反應
+（第一輪的全程無資料它才會 fail）。
+
+## 🔴 我的預期成立：`/meta` 的 `sensors_seen` 對中途掉線無效
+
+**四種情境全部是 `"AB"`。**
+
+**所以第一輪提案 1（讓 `availability()` 讀 `/meta` 的 `sensors_seen`）
+對最常見的失效形態完全無效。** 幸好先測了。
+
+## ✅ 好消息：per-trial `sensors_seen` **抓得到 dropout**
+
+```
+per-trial sensors_seen = ['AB', 'AB', 'AB', 'A', 'A', 'A']
+                                          ^^^^^^^^^^^^^^^^ B 從這裡開始沒了
+```
+
+**`esp-mask-test-18` 今天加的那一層，正好補在對的位置。**
+`/meta` 是整個 session 一個值，粒度太粗；per-trial 才對得上「哪幾筆受影響」。
+
+而且特徵向量也對得起來：
+```
+dropout  第一個 trial : all-zero cols=0     ← B 還在
+dropout  最後一個 trial: all-zero cols=32    ← B 的 32 維被填 0.0
+```
+
+→ **拿 per-trial `sensors_seen` 當閘門，dropout 這一種可以精準地只排除受影響的 trial，
+不用整個 session 作廢。**
+
+## 🔴 壞消息：**intermittent 沒有任何一層抓得到**
+
+```
+per-trial sensors_seen = ['AB', 'AB', 'AB', 'AB', 'AB', 'AB']   ← 全部說「兩顆都有」
+feature 向量            : all-zero cols=0                        ← 沒有任何一欄被填 0
+```
+
+B **確實有送資料**，只是只有 25% 的幀有。所以：
+
+- `sensors_seen` 是 `"AB"`——**技術上完全正確**，B 的確出現在線上
+- 特徵向量沒有整欄為 0——**因為那 25% 的幀足以讓每一欄都有值**
+- 五張卡片在 alt 詞彙下 **`C` PASS、`blocking` 為空**
+
+> 🔴 **一顆只有四分之一時間在工作的感測器，
+> 在每一層檢查上都跟一顆完全正常的感測器無法區分。**
+
+⚠️ 而 `esp-mask-test-7c [4bedc9]` 實測過 **25% 覆蓋率時 `d_tof` 的排名會翻掉**
+——也就是說，**這個抓不到的情境，正是會實際改變辨識結論的那個。**
+
+## 🔴 `coverage` 也在同一層被丟掉
+
+`host/features/live_pipeline.py` 的 `SensorCoverage` **正是為這件事設計的**，
+它的 docstring 自己就寫著：
+
+> `present_frames`：各模態單獨 present 的幀數……
+> **一顆感測器在整段窗口只活了一半，`present_frames` 看得出來。**
+
+**但 `analysis/run_all.py` 與 `analysis/reporting/` 對 `coverage` 的引用是零。**
+（唯二兩筆 grep 命中是 `test_run_all.py` 裡不相干的 crosstalk 覆蓋率測試。）
+
+`build_feature_seqs()` 拿到的 `QueryAssembly` 有 `.coverage`，
+第五個回傳值卻是 `trim_info`——**`coverage` 就在那裡，沒有被帶出來。**
+
+→ **這跟 `sensors_seen` 是同一個故事：算好了、資訊正確、在最後一關被丟掉。
+今天第三次。**
+
+## 修法提案更新
+
+**第一輪的提案 1 要改。** 正確的閘門是**兩層**：
+
+| 失效形態 | 抓得到的訊號 | 動作 |
+|---|---|---|
+| 全程無資料 | `/meta` `sensors_seen` | 整個 session 標 `SKIPPED` |
+| **中途掉線** | **per-trial `sensors_seen`** | **只排除受影響的 trial**（不用整批作廢） |
+| **斷斷續續** | 🔴 **只有 `coverage.present_frames`** | **需要把 `coverage` 帶出 `build_feature_seqs()`** |
+
+⚠️ **第三列是新的工作**，不是「讀一個已經在 `/meta` 的欄位」那麼便宜——
+`coverage` 目前**根本沒有離開 `live_pipeline` 那一層**，也沒有寫進 HDF5。
+
+⚠️ **而且要決定門檻**：覆蓋率多低才算不可用？
+`7c [4bedc9]` 的 25% 是「排名會翻掉」的實測點，可以當起點，
+但**那是一個需要有人拍板的數字，不是我能自己決定的。**
+
+## 第二輪的限制
+
+1. 一樣是合成資料——**行為可信，分數不可信**。
+2. **`intermittent` 我用「每幀獨立 25% 機率」**。真實的斷線比較可能是
+   **成塊**的（斷 2 秒、回來、再斷）。成塊斷線對 `usable_frames` 的影響
+   可能更大，**沒測**。
+3. `E` 這張卡在 alt 詞彙下仍然 `SKIPPED`，**兩輪都沒能判定它**。
+4. `A` 在 dropout/intermittent 下 `measured` 都是 `'103.91 / nan'` 這種形式
+   ——**`nan` 又一次直接印給使用者看**（第一輪提案 4 依然成立）。
+
 ## 對使用者的直接建議
 
 **可以用一顆感測器先錄一批**——資料本身是好的，`/meta` 也記得下
@@ -236,3 +350,7 @@ sensors_seen 少於 sensors_enabled  →  A / B / C / E 回 SKIPPED，
 它們量的是一個少了一半的系統。**`C0` 則是誠實地告訴你量不了。**
 
 ⚠️ **而且不要照著那些診斷去調整戴法或 PCA 參數**——先確認兩顆感測器都活著。
+
+🔴 **而「確認兩顆都活著」目前只有一個可靠的方法：錄的當下看面板的
+`stale_streams` 警示**（`CONTRACTS.md` §4.2）。
+**錄完之後，斷斷續續的那種掉線在檔案裡看不出來。**
