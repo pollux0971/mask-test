@@ -953,7 +953,10 @@ HTTP wiring（`B19`）要對應的形狀，例外型別已經對好該轉成哪�
 {"type":"tof",     "sensor":"A", "seq":.., "t_us":.., "dist":[..], "signal":[..], "valid":[..]}
 {"type":"mic",     "seq":.., "t_us":.., "rms":.., "peak":..}
 {"type":"mel",     "seq":.., "t_us":.., "bands":[..]}
-{"type":"quality", "t":.., "metrics":{"drop_rate":{"value":..,"level":"green","hint":".."}, ...}}
+{"type":"quality", "t":.., "metrics":{"drop_rate":{"value":..,"level":"green","hint":".."}, ...},
+                   "sensors_seen":"AB", "malformed":0, "malformed_rate":0.0,
+                   "stale_streams":[{"stream":"tof_A","silent_for_s":..,"timeout_s":..}],
+                   "alarms":[{"kind":"stale","stream":"tof_A","message":".."}]}
 {"type":"trial",   "state":"PROMPT|COUNTDOWN|CAPTURE|CONFIRM|SAVE|REST|IDLE", "label":"..", "idx":.., "seed":.., "next_label":".."}
 {"type":"session", "state":"started|baseline|ended", "progress":{..}}
 {"type":"status",  "protocol_version":2, "degraded":false, "recording_allowed":true,
@@ -983,6 +986,16 @@ HTTP wiring（`B19`）要對應的形狀，例外型別已經對好該轉成哪�
 橋接端**連上序列埠後會立刻送一次 `PING`**：板子開機通常遠早於 bridge 啟動，
 開機那行 `$STATUS` 早就過去了，不主動問就永遠協商不到版本、也拿不到 §1.1.2 的
 音框參數。§1.1 規定「每次收到 `PING` 都要重發 `$STATUS`」正是為了這個情境。
+**協商未確認時會持續每 2 秒重問**，直到成功——第一次 PING 可能在雜訊線上遺失。
+
+除了 `ProtocolParser.state()` 的欄位，`status` 事件另外帶
+**`source`**（§4.2 開頭）、**`sensors_seen`** 與 **`sensors_enabled`**
+（見下方 `quality` 段的說明；兩者不一致就是診斷）。
+
+⚠️ **`status` 不只在收到 `$STATUS` 行時發**：只要協商狀態或 `sensors_seen`
+改變就會發一次。協定 v1 的裝置**一輩子只送一行 `$STATUS`（開機那行）**，
+面板晚 100 ms 連上就永遠看不到 `degraded`，**錄音鈕會留在啟用狀態**——
+而那正是 `B02` 要防的事。
 
 #### `quality`（`B19`，1 Hz）
 
@@ -1002,6 +1015,72 @@ bridge 每秒比一次 mtime，**改完存檔即時生效，不需重啟**。
 推算，所以正常情況下**永遠落後**裝置端（差額 = `$H` 當下的連續掉幀長度）。
 差額為正代表幀在兩個計數器之間遺失——**那是傳輸層故障的訊號，不是誤差**，
 因此獨立成警報而非放寬容忍度。前端應顯著標示，不要當成掉幀率的一部分。
+
+##### 三種失效，三個獨立訊號（**不可互相取代**）
+
+| 訊號 | 意思 | 怎麼偵測 |
+|---|---|---|
+| `malformed` / `malformed_rate` | **收到了，但那行是壞的** | `ProtocolParser` 解析失敗 |
+| `alarms`（`delta > 0`） | **收到了，但中間少了幾筆** | `seq` 缺口 vs 裝置 `$H` |
+| **`stale_streams`** | 🔴 **完全沒收到，而且可能永遠不會再收到** | 該串流「多久沒有任何資料」 |
+
+> **為什麼逾時必須獨立存在**：`seq` 缺口是從「兩個**收到的**幀之間的距離」推出來的，
+> 所以**一條停掉就再也不恢復的串流，根本不會產生任何缺口**——沒有下一幀可以比。
+> 韌體端同樣看不到：I2C 斷線時 `check_data_ready()` 本身就失敗，
+> **累加 `drop_A`/`drop_B` 的整個區塊被跳過**，`$H` 的計數器凍在原地。
+> **一顆死掉的感測器，在 `$H` 上跟完全正常的長得一模一樣。**
+>
+> ⚠️ 所以 `malformed` 為 0、`delta` 為 0、`drop_*` 為 0
+> **不代表串流是活的**。要判斷「還在不在」只能看 `stale_streams`。
+
+**事件的完整額外欄位**：
+
+```json
+{"type":"quality", "t":.., "metrics":{..},
+ "sensors_seen": "A",
+ "malformed": 0, "malformed_rate": 0.0,
+ "stale_streams": [{"stream":"tof_A", "silent_for_s":12.4, "timeout_s":3.0}],
+ "alarms": [{"kind":"stale", "stream":"tof_A", "silent_for_s":12.4,
+             "metric":"drop_rate", "message":"…"}]}
+```
+
+- **`message` 可以直接印給人看**，前端不需要自己組字。
+  訊息裡已經先回答了操作者的第一個反駁（「可是 `$H` 看起來正常」）。
+- **逾時門檻按串流分別訂**，因為速率差一個數量級以上：
+  `tof_A`／`tof_B`／`mic`／`mel` = **3 秒**，**`heartbeat` = 10 秒**（1 Hz）。
+  同一個數字要嘛對心跳狼來了，要嘛要一分鐘才發現感測器死了。
+- ⚠️ **`MEL:0` 關掉的 `$F` 不算 stale**（看 `$STATUS` 的 `mel=`）。
+  把刻意關掉的串流報成故障，是讓人學會忽略警報最快的方法。
+- ⚠️ **從來沒出現過的串流不算 stale**。「從來沒上來」是另一種故障，
+  由 `sensors_seen` 表達；兩邊都報會讓人以為是兩個問題。
+
+##### `sensors_seen`（也在 `status` 事件上）
+
+值域 `{"", "A", "B", "AB"}`，同時出現在 `status` 與 `quality` 事件，
+並寫進 `/meta`（§2）。**從資料流本身數出來的**，不需要韌體加任何欄位。
+
+三個欄位是三件不同的事，**可以不一致，而那個不一致本身就是資訊**：
+
+| 欄位 | 意思 |
+|---|---|
+| `sensors_enabled` | 主機**下令**開哪幾顆 |
+| `sensors_enabled_confirmed` | 裝置**確認**過沒有（目前恆 `false`，`$STATUS` 沒有 `sens_*`） |
+| **`sensors_seen`** | **實際有資料流過來的** |
+
+> 🔴 **`sensors_seen = "A"` 的意思是「線上出現過標著 A 的 `$T` 行」，
+> 不是「A 這顆感測器是好的」。**
+> 第一塊真板子上 **A 初始化失敗、活著的是 B，但 B 送出來的標籤是 `A`**。
+> 主機端只看得到標籤，看不到韌體那行 `is_alive failed`（那是 `ESP_LOGE`，
+> 不是 `$` 開頭，永遠不會到主機）。**要真的分辨是哪一顆，需要 `$STATUS`
+> 補 `sens_a=`/`sens_b=`**——同 §4.1.2 標過的缺口。
+>
+> **`""` 是合法值，跟「欄位不存在」意義相反**：`""` = 量過，結果是一顆都沒看到；
+> 不存在 = 這個 session 根本沒記錄（舊檔）。**前者是結論，後者是未知。**
+
+⚠️ **`/meta` 裡的 `sensors_seen` 是「自這條連線建立起算」**，不是自 session start
+起算——`/meta` 在 baseline 當下寫入，而 baseline 用的是 **session start 之前**
+緩衝的那幾秒，照 session start 歸零會在兩顆都正常時讀出 `""`。
+**中途掉線由 `stale_streams` 即時反映，那條才是即時的。**
 
 > **`IDLE` 是合法狀態，必須廣播。** 它出現在 `REST` 結束、以及 `abort`／`redo` 之後，
 > 意思是「可以開始下一個 trial 了」。前端沒有它就只能靠逾時猜，而猜錯的代價是
