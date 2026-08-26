@@ -353,3 +353,26 @@ def test_energy_thresholds_are_read_when_present(rig):
         # session above ran a full baseline + writer cycle to prove it.
         return
     assert len(present) == 2, f"only {present} was written; both or neither"
+
+
+# -- B21: speaking_mode ---------------------------------------------------
+
+
+def test_speaking_mode_is_accepted_and_validated_early(rig):
+    """A bad value fails at the call, while the machine is still IDLE.
+
+    B21 moved this validation forward deliberately: it used to surface at
+    SAVE, which meant a whole recorded trial was lost to a typo made before
+    it started.
+    """
+    _session_with_baseline(rig)
+    status, body = _request(rig, "POST", "/trial/hold/start",
+                            {"speaking_mode": "not-a-mode"})
+    assert status == 409, body
+    assert body["state"] == "IDLE", "the machine should not have moved"
+
+    # A valid one still works.
+    status, body = _request(rig, "POST", "/trial/hold/start",
+                            {"speaking_mode": "silent"})
+    assert status == 200, body
+    assert body["state"] == "CAPTURE"

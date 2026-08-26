@@ -80,6 +80,16 @@ REQUIRED_TRIAL_ATTRS = (
 # `KeyError`——這是刻意的：大聲失敗，而不是安靜地給錯誤答案。
 OPTIONAL_VAD_TIMING_ATTRS = ("vad_start_us", "vad_end_us", "lip_onset_us", "voice_onset_us")
 
+# 雙感測器 VAD 融合（調度員裁決採用 union_min：兩顆都測到取較早的，只有
+# 一顆測到就用那顆）。`lip_onset_us` 維持是**融合後**的單一結果；這兩個
+# 存的是**融合前、各感測器獨立的** onset，理由是融合策略目前是拿合成資料
+# 選出來的，E05 的主資料集是唯一一次真實資料，錄完不會重錄——如果只存
+# 融合後的數字，「當初選 union_min 對不對」這個問題錄完就永遠回答不了了。
+# 跟上面四個 VAD 時間戳同一個原則：沒偵測到就整個 attr 不寫入。**B 缺席
+# 是 union_min 設計本身就假設的正常狀況**（B 感測器可能整段都瞎，不是
+# 損毀），所以「有 lip_onset_us、沒有 lip_onset_us_B」是合法狀態。
+OPTIONAL_PER_SENSOR_LIP_ONSET_ATTRS = ("lip_onset_us_A", "lip_onset_us_B")
+
 VALID_SPEAKING_MODES = ("normal", "whisper", "silent")
 
 VALID_QUALITY_VALUES = ("ok", "low", "rejected")
@@ -239,6 +249,7 @@ class SessionWriter:
         wear_id, mode, valid_zone_ratio: float, drop_count: int,
         vad_start_us: Optional[int] = None, vad_end_us: Optional[int] = None,
         lip_onset_us: Optional[int] = None, voice_onset_us: Optional[int] = None,
+        lip_onset_us_A: Optional[int] = None, lip_onset_us_B: Optional[int] = None,
         speaking_mode: Optional[str] = None, vad_confidence: Optional[float] = None,
         comparable: Optional[bool] = None,
         quality: str,
@@ -255,6 +266,14 @@ class SessionWriter:
         0/-1/capture 視窗邊界（B17 的調度決議）——這四個時間戳不保證同時
         存在，`silent` 模式下 `voice_onset_us` 必然缺席，但 `lip_onset_us`
         仍應該有；呼叫端不要假設四個一起有、一起沒有。
+
+        `lip_onset_us_A`/`lip_onset_us_B`：雙感測器融合前、各自獨立的唇動
+        onset（調度員裁決融合策略採 `union_min`：兩顆都測到取較早的）。
+        `lip_onset_us` 本身維持是**融合後**的單一結果——這兩個是為了讓
+        `E05` 錄完之後還能回頭檢驗融合策略選得對不對，同樣是沒偵測到就
+        整個 attr 不寫入；`lip_onset_us_B` 缺席是 `union_min` 設計本身就
+        假設的正常狀況（B 感測器整段偵測不到，不代表資料損毀），不要跟
+        `lip_onset_us_A` 綁在一起檢查。
 
         `comparable`（4f 的 `measure_lip_lead()`）：這個 trial 的
         `lip_lead_us`（唇動比出聲早多少）**能不能拿去平均**——`silent` 模式
@@ -329,6 +348,7 @@ class SessionWriter:
         for key, value in (
             ("vad_start_us", vad_start_us), ("vad_end_us", vad_end_us),
             ("lip_onset_us", lip_onset_us), ("voice_onset_us", voice_onset_us),
+            ("lip_onset_us_A", lip_onset_us_A), ("lip_onset_us_B", lip_onset_us_B),
         ):
             if value is not None:
                 grp.attrs[key] = np.int64(value)

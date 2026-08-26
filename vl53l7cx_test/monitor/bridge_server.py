@@ -1753,11 +1753,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _dispatch_trial(self, machine, action, body):
         """Map one /trial/<action> to the state machine. Returns its events."""
         device_t_us = device_clock["last_t_us"]
+        # speaking_mode (B21) is validated at the call, not at save time, so
+        # a bad value comes back as a 409 while the machine is still IDLE
+        # rather than taking down a trial that has already been recorded.
         if action == "start":
-            return as_trial_events(machine.start_trial(label=body.get("label")))
+            return as_trial_events(machine.start_trial(
+                label=body.get("label"), speaking_mode=body.get("speaking_mode")))
         if action == "hold/start":
-            return as_trial_events(
-                machine.hold_start(device_t_us=device_t_us, label=body.get("label")))
+            return as_trial_events(machine.hold_start(
+                device_t_us=device_t_us, label=body.get("label"),
+                speaking_mode=body.get("speaking_mode")))
         if action == "hold/stop":
             return as_trial_events(machine.hold_stop(device_t_us=device_t_us))
         if action == "confirm":

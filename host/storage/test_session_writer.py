@@ -829,3 +829,53 @@ def test_comparable_raw_h5py_read_is_numpy_bool_not_python_bool(tmp_path):
         assert isinstance(raw, np.bool_)
         assert raw == True  # noqa: E712 -- 值本身是對的
         assert (raw is True) is False  # 陷阱本身：身分比較會静默失效
+
+
+# -- lip_onset_us_A/B (union_min 融合前的各感測器 onset) -------------------
+
+
+def test_lip_onset_per_sensor_omitted_when_none(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        attrs = f["trial_000"].attrs
+        assert "lip_onset_us_A" not in attrs
+        assert "lip_onset_us_B" not in attrs
+
+
+def test_lip_onset_per_sensor_written_when_given(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs["lip_onset_us"] = 1500       # 融合後結果
+        kwargs["lip_onset_us_A"] = 1500
+        kwargs["lip_onset_us_B"] = 1620
+        w.write_trial(0, **kwargs)
+
+    with h5py.File(path, "r") as f:
+        attrs = f["trial_000"].attrs
+        assert attrs["lip_onset_us"] == 1500
+        assert attrs["lip_onset_us_A"] == 1500
+        assert attrs["lip_onset_us_B"] == 1620
+
+
+def test_lip_onset_b_missing_is_a_legal_state_not_corruption(tmp_path):
+    """union_min 的設計本身就假設 B 感測器可能整段偵測不到——`lip_onset_us`
+    (融合後) 跟 `lip_onset_us_A` 都在，`lip_onset_us_B` 缺席，這是合法組合，
+    不是三個欄位必須綁在一起有/一起沒有。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs["lip_onset_us"] = 1500
+        kwargs["lip_onset_us_A"] = 1500
+        # lip_onset_us_B 不給
+        w.write_trial(0, **kwargs)
+
+    with h5py.File(path, "r") as f:
+        attrs = f["trial_000"].attrs
+        assert attrs["lip_onset_us_A"] == 1500
+        assert "lip_onset_us_B" not in attrs
+        with pytest.raises(KeyError):
+            attrs["lip_onset_us_B"]  # noqa: B018 -- 故意觸發，驗證「大聲失敗」
