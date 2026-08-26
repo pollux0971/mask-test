@@ -66,8 +66,46 @@
 // in CONTRACTS.md's table). This file calls proposed endpoints
 // POST /trial/confirm/keep and POST /trial/confirm/discard -- same
 // propose-now-ratify-later pattern as C11's baseline progress shape.
+//
+// C13 adds: progress bar + n/N + ETA, a per-label count bar chart, a
+// recent-10 list with quality lights, and a click-to-preview overlay
+// (ToF Δ heatmap + mic envelope) for one of those 10. Two gaps looked like
+// they might need new backend surface; neither did:
+//
+//   1. Full vocab list (to show labels with a ZERO count, not just ones
+//      already seen): `bridge_server.py`'s load_vocab() is server-side
+//      only (grepped, no /vocab route) -- but quiz.js (C15/16) already
+//      fetches the same word list client-side from the static file
+//      panel/data/vocab.json (see its VOCAB_URL). Reused verbatim here
+//      (loadVocab() below) -- no new endpoint, no CONTRACTS change.
+//      Falls back to "labels seen so far" if that fetch ever fails.
+//
+//   2. Per-trial preview data (Δ heatmap + waveform for one of the last
+//      10 trials): no CONTRACTS endpoint exists for reading back a past
+//      trial's raw frames (grepped -- confirmed absent). Rather than
+//      propose one, this reuses bus.js's existing dataStore, which
+//      already buffers 65s of raw tof/mic SSE events by browser receive
+//      time for every mode (C03). At CAPTURE-entry this file records
+//      performance.now(); at the matching SAVE it slices
+//      dataStore.getRecent("tofA"/"tofB"/"mic") to that window and copies
+//      the result into recentTrials[] (has to be a copy, not a live
+//      reference -- the ring buffer keeps trimming, and 10 trials'
+//      worth of session time can easily exceed the 65s retention
+//      window). No backend change, no new wire shape.
+//
+// ⚠ Honesty note on "波形" (waveform): CONTRACTS.md's `mic` SSE event
+// only carries `rms`/`peak` per sample window, never raw PCM -- that's
+// true of the live stream everywhere in this app, not something this
+// file chose to downsample. The preview renders an rms/peak envelope
+// bar chart, not a literal waveform; labelled as such rather than
+// implying more precision than the wire format has.
+//
+// "每詞目標次數" (target reps per label) defaults to 8, matching E06's
+// own "8 詞 × 8 樣板 + 靜止 × 8 = 72 筆" convention -- editable in the UI
+// since nothing in CONTRACTS freezes this number for every session.
 
 import { registerMode } from "../shell.js";
+import { dataStore } from "../bus.js";
 
 const TRIAL_STATE_LABEL = {
   IDLE: "準備下一個",
@@ -114,6 +152,49 @@ function zoneListText(zones) {
   return zones.length ? zones.join(", ") : "無";
 }
 
+// --- C13: progress dashboard constants -----------------------------------
+
+const DEFAULT_TARGET_PER_LABEL = 8; // E06 convention: "8 詞 × 8 樣板 + 靜止 × 8"
+const RECENT_TRIALS_MAX = 10;
+const ETA_SAMPLES_MAX = 8; // rolling window for the "actual average" ETA estimate
+const QUALITY_DOT_LABEL = { ok: "●", low: "●", rejected: "●" };
+
+// Small self-contained z-score color, deliberately not imported from
+// monitor.js (nothing there is exported for reuse) -- same thresholds and
+// meaning as monitor.js's zscoreColor() so a red/blue cell means the same
+// thing in both places, just a smaller copy scoped to this file's preview.
+const PREVIEW_Z_CLAMP = 3;
+const PREVIEW_Z_DEADZONE = 0.5;
+const PREVIEW_Z_NEG = [64, 140, 226];
+const PREVIEW_Z_POS = [226, 87, 76];
+const PREVIEW_Z_NEUTRAL = [43, 50, 45];
+
+function previewLerp(a, b, t) {
+  const r = Math.round(a[0] + (b[0] - a[0]) * t);
+  const g = Math.round(a[1] + (b[1] - a[1]) * t);
+  const bl = Math.round(a[2] + (b[2] - a[2]) * t);
+  return { rgb: `rgb(${r},${g},${bl})`, luminance: (0.299 * r + 0.587 * g + 0.114 * bl) / 255 };
+}
+
+function previewZscoreColor(z) {
+  const clamped = Math.max(-PREVIEW_Z_CLAMP, Math.min(PREVIEW_Z_CLAMP, z));
+  const target = clamped < 0 ? PREVIEW_Z_NEG : PREVIEW_Z_POS;
+  const abs = Math.abs(clamped);
+  if (abs <= PREVIEW_Z_DEADZONE) {
+    return previewLerp(PREVIEW_Z_NEUTRAL, target, (abs / PREVIEW_Z_DEADZONE) * 0.3);
+  }
+  const t = 0.3 + 0.7 * ((abs - PREVIEW_Z_DEADZONE) / (PREVIEW_Z_CLAMP - PREVIEW_Z_DEADZONE));
+  return previewLerp(PREVIEW_Z_NEUTRAL, target, t);
+}
+
+function fmtEtaSeconds(s) {
+  if (s == null || !isFinite(s)) return "—";
+  if (s < 60) return `約 ${Math.ceil(s)} 秒`;
+  const m = Math.floor(s / 60);
+  const rem = Math.ceil(s % 60);
+  return `約 ${m} 分 ${rem} 秒`;
+}
+
 registerMode("record", (() => {
   let root = null;
   let screen = "form"; // "form" | "baseline" | "trial"
@@ -135,6 +216,18 @@ registerMode("record", (() => {
   let holdKeyDown = false; // debounce: OS key-repeat fires keydown many times per real press
   let beepEnabled = true;
   let audioCtx = null; // created lazily on first real user gesture (browser autoplay policy)
+
+  // --- C13: progress dashboard state ---
+  let vocabWords = null; // [{id,text,..}] from data/vocab.json, or null if unavailable
+  let vocabReject = null; // {id:"_reject", text:"..."} from the same file
+  let targetPerLabel = DEFAULT_TARGET_PER_LABEL;
+  let labelCounts = {}; // label id -> saved-trial count (any quality), dynamic-discovery fallback too
+  let savedTrialTotal = 0;
+  let recentTrials = []; // newest first, capped at RECENT_TRIALS_MAX
+  let captureWindowStartMs = null; // performance.now() at this trial's CAPTURE-entry
+  let etaSamplesMs = []; // recent inter-SAVE wall-clock gaps, rolling window
+  let lastSaveAtMs = null;
+  let previewTrialIdx = null; // idx of the recentTrials entry open in the preview overlay
 
   function fmtMissingFieldsMessage(fields) {
     const labels = fields.map((f) => {
@@ -441,6 +534,241 @@ registerMode("record", (() => {
     }
   }
 
+  // --- C13: progress dashboard --------------------------------------------
+
+  async function loadVocab() {
+    try {
+      const res = await fetch("data/vocab.json");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      vocabWords = Array.isArray(data.words) ? data.words : null;
+      vocabReject = data.reject || null;
+    } catch (err) {
+      // Falls back to dynamic discovery (labelCounts grows as SAVE events
+      // arrive) -- see file-top note. Not fatal, just less complete until
+      // every label has appeared at least once.
+      console.warn("[record] data/vocab.json unavailable, falling back to dynamic label discovery:", err);
+      vocabWords = null;
+      vocabReject = null;
+    }
+    renderLabelBars();
+    renderProgressDash();
+  }
+
+  function allLabelEntries() {
+    if (vocabWords) {
+      const entries = vocabWords.map((w) => ({ id: w.id, text: w.text || w.id }));
+      if (vocabReject) entries.push({ id: vocabReject.id, text: vocabReject.text || vocabReject.id });
+      return entries;
+    }
+    // Fallback: whatever labels have actually been saved so far, in first-
+    // seen order -- can't show a zero-count label that hasn't appeared yet
+    // without the real vocab list, so the bar chart is incomplete until it
+    // has (flagged in the completion report, not silently pretended away).
+    return Object.keys(labelCounts).map((id) => ({ id, text: id }));
+  }
+
+  function computeTargetTotal() {
+    const n = allLabelEntries().length;
+    return n > 0 && vocabWords ? n * targetPerLabel : null;
+  }
+
+  function computeEtaText(targetTotal) {
+    if (targetTotal == null) return "剩餘時間：—（字彙表未知，無法估計總數）";
+    const remaining = targetTotal - savedTrialTotal;
+    if (remaining <= 0) return "已達目標筆數";
+    if (etaSamplesMs.length === 0) return "剩餘時間：—（尚無足夠資料估計）";
+    const avgMs = etaSamplesMs.reduce((a, b) => a + b, 0) / etaSamplesMs.length;
+    return `剩餘時間：${fmtEtaSeconds((avgMs * remaining) / 1000)}（依實際平均耗時估計）`;
+  }
+
+  function renderProgressDash() {
+    const targetTotal = computeTargetTotal();
+    els.progressSummary.textContent = targetTotal != null
+      ? `第 ${savedTrialTotal} / ${targetTotal} 筆`
+      : `已錄 ${savedTrialTotal} 筆`;
+    const pct = targetTotal ? Math.min(100, (savedTrialTotal / targetTotal) * 100) : 0;
+    els.progressBarFill.style.width = `${pct}%`;
+    els.progressEta.textContent = computeEtaText(targetTotal);
+  }
+
+  function renderLabelBars() {
+    const entries = allLabelEntries();
+    const maxCount = Math.max(targetPerLabel, ...entries.map((e) => labelCounts[e.id] || 0), 1);
+    els.labelBars.innerHTML = entries.map((e) => {
+      const count = labelCounts[e.id] || 0;
+      const pct = Math.min(100, (count / maxCount) * 100);
+      const done = count >= targetPerLabel;
+      return `
+        <div class="label-bar ${done ? "done" : ""}">
+          <span class="label-bar-name">${e.text}</span>
+          <div class="label-bar-track"><div class="label-bar-fill" style="width:${pct}%"></div></div>
+          <span class="label-bar-count mono">${count}/${targetPerLabel}</span>
+        </div>`;
+    }).join("");
+  }
+
+  function renderRecentList() {
+    if (!recentTrials.length) {
+      els.recentList.innerHTML = `<div class="recent-empty">尚無已存檔的 trial</div>`;
+      return;
+    }
+    els.recentList.innerHTML = recentTrials.map((t) => `
+      <div class="recent-item" data-recent-idx="${t.idx}" tabindex="0" role="button">
+        <span class="quality-dot quality-${t.quality}" title="${t.quality}">${QUALITY_DOT_LABEL[t.quality] || "●"}</span>
+        <span class="recent-label">${t.label}</span>
+        <span class="recent-meta mono">#${t.idx} · ${t.n_frames}幀</span>
+      </div>`).join("");
+  }
+
+  function snapshotPreviewFrames(startMs, endMs) {
+    // Copy out of the shared ring buffer now -- it keeps trimming by age,
+    // so a live reference would silently go stale/empty by the time this
+    // trial scrolls out of the recent-10 list (see file-top note).
+    const within = (arr) => arr.filter((e) => e._recvMs >= startMs && e._recvMs <= endMs);
+    return {
+      tofA: within(dataStore.getRecent("tofA")),
+      tofB: within(dataStore.getRecent("tofB")),
+      mic: within(dataStore.getRecent("mic")),
+    };
+  }
+
+  function finalizeSavedTrial(evt) {
+    const nowMs = performance.now();
+    savedTrialTotal += 1;
+    labelCounts[evt.label] = (labelCounts[evt.label] || 0) + 1;
+
+    if (lastSaveAtMs != null) {
+      etaSamplesMs.push(nowMs - lastSaveAtMs);
+      if (etaSamplesMs.length > ETA_SAMPLES_MAX) etaSamplesMs.shift();
+    }
+    lastSaveAtMs = nowMs;
+
+    const preview = captureWindowStartMs != null
+      ? snapshotPreviewFrames(captureWindowStartMs, nowMs)
+      : { tofA: [], tofB: [], mic: [] };
+    captureWindowStartMs = null;
+
+    recentTrials.unshift({
+      idx: evt.idx, label: evt.label, quality: evt.quality, n_frames: evt.n_frames,
+      valid_zone_ratio: evt.valid_zone_ratio, drop_count: evt.drop_count, seed: evt.seed,
+      preview,
+    });
+    if (recentTrials.length > RECENT_TRIALS_MAX) recentTrials.length = RECENT_TRIALS_MAX;
+
+    renderProgressDash();
+    renderLabelBars();
+    renderRecentList();
+  }
+
+  function buildPreviewGrid(container, dim) {
+    const side = Math.round(Math.sqrt(dim));
+    container.innerHTML = "";
+    container.style.gridTemplateColumns = `repeat(${side}, 1fr)`;
+    const cells = [];
+    for (let i = 0; i < dim; i++) {
+      const c = document.createElement("div");
+      c.className = "preview-cell";
+      container.appendChild(c);
+      cells.push(c);
+    }
+    return cells;
+  }
+
+  function renderPreviewHeatmap(container, label, frames, mu, sigma) {
+    const wrap = document.createElement("div");
+    wrap.className = "preview-heatmap";
+    const title = document.createElement("div");
+    title.className = "preview-heatmap-title";
+    const frame = frames.length ? frames[frames.length - 1] : null; // last frame in the capture window
+    if (!frame) {
+      title.textContent = `${label}：擷取視窗內沒有收到資料（可能是 65s 保留窗已過期，見完成回報）`;
+      wrap.appendChild(title);
+      container.appendChild(wrap);
+      return;
+    }
+    const dim = frame.dist.length;
+    const hasBaseline = Array.isArray(mu) && mu.length === dim;
+    title.textContent = hasBaseline
+      ? `${label}：Δ（相對 baseline，最後一幀）`
+      : `${label}：原始距離（baseline zone 數不符，${dim} vs ${mu ? mu.length : "—"}）`;
+    wrap.appendChild(title);
+    const grid = document.createElement("div");
+    grid.className = "preview-grid";
+    wrap.appendChild(grid);
+    const cells = buildPreviewGrid(grid, dim);
+    for (let z = 0; z < dim; z++) {
+      const v = frame.dist[z];
+      const invalid = v == null || v < 0 || (frame.valid && frame.valid[z] === false);
+      const c = cells[z];
+      if (invalid) {
+        c.classList.add("invalid");
+        c.textContent = "·";
+        continue;
+      }
+      if (hasBaseline && sigma && sigma[z] > 0) {
+        const z_score = (v - mu[z]) / sigma[z];
+        const { rgb, luminance } = previewZscoreColor(z_score);
+        c.style.background = rgb;
+        c.style.color = luminance > 0.55 ? "#10140f" : "#f3f6f2";
+        c.textContent = (v - mu[z]).toFixed(0);
+      } else {
+        c.textContent = v.toFixed(0);
+      }
+    }
+    container.appendChild(wrap);
+  }
+
+  function renderPreviewWaveform(container, micFrames) {
+    container.innerHTML = "";
+    const title = document.createElement("div");
+    title.className = "preview-waveform-title";
+    title.textContent = "麥克風 RMS/峰值包絡（不是原始波形，見完成回報）";
+    container.appendChild(title);
+    if (!micFrames.length) {
+      const empty = document.createElement("div");
+      empty.className = "preview-empty";
+      empty.textContent = "擷取視窗內沒有收到 mic 資料";
+      container.appendChild(empty);
+      return;
+    }
+    const bars = document.createElement("div");
+    bars.className = "preview-waveform-bars";
+    const maxRms = Math.max(...micFrames.map((f) => f.rms || 0), 1);
+    micFrames.forEach((f) => {
+      const bar = document.createElement("div");
+      bar.className = "preview-waveform-bar";
+      bar.style.height = `${Math.max(2, ((f.rms || 0) / maxRms) * 100)}%`;
+      bars.appendChild(bar);
+    });
+    container.appendChild(bars);
+  }
+
+  function renderPreview(trial) {
+    els.previewTitle.textContent = `#${trial.idx} ${trial.label} — ${trial.quality} · ${trial.n_frames} 幀`;
+    els.previewHeatmaps.innerHTML = "";
+    const mu = baselineOutcome ? baselineOutcome.baseline_mu_A : null;
+    const sigma = baselineOutcome ? baselineOutcome.baseline_sigma_A : null;
+    const muB = baselineOutcome ? baselineOutcome.baseline_mu_B : null;
+    const sigmaB = baselineOutcome ? baselineOutcome.baseline_sigma_B : null;
+    renderPreviewHeatmap(els.previewHeatmaps, "Sensor A", trial.preview.tofA, mu, sigma);
+    renderPreviewHeatmap(els.previewHeatmaps, "Sensor B", trial.preview.tofB, muB, sigmaB);
+    renderPreviewWaveform(els.previewWaveform, trial.preview.mic);
+  }
+
+  function openPreview(idx) {
+    const trial = recentTrials.find((t) => t.idx === idx);
+    if (!trial) return;
+    previewTrialIdx = idx;
+    renderPreview(trial);
+    els.previewOverlay.style.display = "flex";
+  }
+
+  function closePreview() {
+    previewTrialIdx = null;
+    els.previewOverlay.style.display = "none";
+  }
+
   function setTrialError(text) {
     els.trialError.textContent = text || "";
     els.trialError.style.display = text ? "block" : "none";
@@ -484,6 +812,13 @@ registerMode("record", (() => {
 
   function onTrialEvent(evt) {
     lastTrialEvent = evt;
+    // C13: mark the start of the capture window (browser receive time) the
+    // moment CAPTURE is entered, before trialState gets overwritten below --
+    // this is what lets finalizeSavedTrial() slice the right span out of
+    // bus.js's dataStore once SAVE arrives.
+    if (evt.state === "CAPTURE" && trialState !== "CAPTURE") {
+      captureWindowStartMs = performance.now();
+    }
     trialState = evt.state;
     trialLabel = evt.label != null ? evt.label : trialLabel;
     trialIdx = evt.idx != null ? evt.idx : trialIdx;
@@ -492,6 +827,7 @@ registerMode("record", (() => {
 
     if (trialState === "COUNTDOWN") playBeep(BEEP_GET_READY_HZ);
     if (trialState === "CAPTURE") playBeep(BEEP_GO_HZ);
+    if (trialState === "SAVE") finalizeSavedTrial(evt);
 
     renderTrialCard();
   }
@@ -557,6 +893,17 @@ registerMode("record", (() => {
     if (!isRecordTrialScreenActive()) return;
     if (isTypingTarget(e.target)) return; // no text inputs on this screen, but stay consistent with C02's rule
     if (e.altKey || e.ctrlKey || e.metaKey) return;
+
+    if (previewTrialIdx != null) {
+      // C13 preview overlay is open -- ESC closes *that*, not the current
+      // trial. Every other key is ignored so a stray Space/Enter behind the
+      // overlay can't start a hold or confirm a decision the user can't see.
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closePreview();
+      }
+      return;
+    }
 
     if (e.code === "Space" || e.key === " ") {
       if (trialState === "CONFIRM") return; // space shouldn't start a new hold while a decision is pending
@@ -690,37 +1037,70 @@ registerMode("record", (() => {
           </section>
 
           <section class="record-screen trial-screen" data-screen="trial" style="display:none">
-            <div class="trial-topbar">
-              <label class="beep-toggle">
-                <input type="checkbox" data-beep-toggle checked /> 🔊 嗶聲
+            <div class="trial-main">
+              <div class="trial-topbar">
+                <label class="beep-toggle">
+                  <input type="checkbox" data-beep-toggle checked /> 🔊 嗶聲
+                </label>
+                <div class="trial-meta mono">
+                  <span data-trial-idx>—</span>
+                  <span data-trial-seed></span>
+                </div>
+              </div>
+
+              <div class="trial-card state-idle" data-trial-card>
+                <div class="trial-prev-label" data-trial-prev-label style="display:none"></div>
+                <div class="trial-word" data-trial-word>—</div>
+                <div class="trial-state-label" data-trial-state-label>準備中</div>
+              </div>
+
+              <div class="trial-confirm-box" data-trial-confirm style="display:none">
+                <div class="trial-confirm-title">⚠ 尚未存檔 —— 請選擇</div>
+                <div class="trial-confirm-reason" data-trial-confirm-reason></div>
+                <div class="trial-confirm-buttons">
+                  <button type="button" class="confirm-keep-btn" data-confirm-keep>✅ 保留（Enter）</button>
+                  <button type="button" class="confirm-discard-btn" data-confirm-discard>⏭ 跳過此詞（Esc）</button>
+                </div>
+              </div>
+
+              <div class="trial-error" data-trial-error style="display:none"></div>
+
+              <div class="trial-hint mono">
+                按住空白鍵開始錄音、放開結束　｜　Esc 放棄（跳過此詞）　｜　R 重來（保留此詞）
+              </div>
+            </div>
+
+            <aside class="progress-dash" data-progress-dash>
+              <div class="section-label">進度（C13）</div>
+              <label class="target-per-label-field mono">
+                每詞目標 <input type="number" min="1" step="1" data-target-per-label value="${DEFAULT_TARGET_PER_LABEL}" /> 次
               </label>
-              <div class="trial-meta mono">
-                <span data-trial-idx>—</span>
-                <span data-trial-seed></span>
+              <div class="progress-summary mono" data-progress-summary>已錄 0 筆</div>
+              <div class="progress-bar-track">
+                <div class="progress-bar-fill" data-progress-bar-fill style="width:0%"></div>
               </div>
-            </div>
+              <div class="progress-eta" data-progress-eta></div>
 
-            <div class="trial-card state-idle" data-trial-card>
-              <div class="trial-prev-label" data-trial-prev-label style="display:none"></div>
-              <div class="trial-word" data-trial-word>—</div>
-              <div class="trial-state-label" data-trial-state-label>準備中</div>
-            </div>
+              <div class="section-label dash-subsection">各詞數量</div>
+              <div class="label-bars" data-label-bars></div>
 
-            <div class="trial-confirm-box" data-trial-confirm style="display:none">
-              <div class="trial-confirm-title">⚠ 尚未存檔 —— 請選擇</div>
-              <div class="trial-confirm-reason" data-trial-confirm-reason></div>
-              <div class="trial-confirm-buttons">
-                <button type="button" class="confirm-keep-btn" data-confirm-keep>✅ 保留（Enter）</button>
-                <button type="button" class="confirm-discard-btn" data-confirm-discard>⏭ 跳過此詞（Esc）</button>
-              </div>
-            </div>
-
-            <div class="trial-error" data-trial-error style="display:none"></div>
-
-            <div class="trial-hint mono">
-              按住空白鍵開始錄音、放開結束　｜　Esc 放棄（跳過此詞）　｜　R 重來（保留此詞）
-            </div>
+              <div class="section-label dash-subsection">最近 10 筆（點擊可預覽）</div>
+              <div class="recent-list" data-recent-list></div>
+            </aside>
           </section>
+
+          <div class="trial-preview-overlay" data-preview-overlay style="display:none">
+            <div class="trial-preview-box">
+              <div class="trial-preview-header">
+                <span data-preview-title class="mono"></span>
+                <button type="button" class="preview-close-btn" data-preview-close>✕ 關閉</button>
+              </div>
+              <div class="trial-preview-body">
+                <div class="preview-heatmaps" data-preview-heatmaps></div>
+                <div class="preview-waveform" data-preview-waveform></div>
+              </div>
+            </div>
+          </div>
         </div>
       `;
 
@@ -767,6 +1147,17 @@ registerMode("record", (() => {
         confirmKeepBtn: root.querySelector("[data-confirm-keep]"),
         confirmDiscardBtn: root.querySelector("[data-confirm-discard]"),
         trialError: root.querySelector("[data-trial-error]"),
+        targetPerLabelInput: root.querySelector("[data-target-per-label]"),
+        progressSummary: root.querySelector("[data-progress-summary]"),
+        progressBarFill: root.querySelector("[data-progress-bar-fill]"),
+        progressEta: root.querySelector("[data-progress-eta]"),
+        labelBars: root.querySelector("[data-label-bars]"),
+        recentList: root.querySelector("[data-recent-list]"),
+        previewOverlay: root.querySelector("[data-preview-overlay]"),
+        previewTitle: root.querySelector("[data-preview-title]"),
+        previewClose: root.querySelector("[data-preview-close]"),
+        previewHeatmaps: root.querySelector("[data-preview-heatmaps]"),
+        previewWaveform: root.querySelector("[data-preview-waveform]"),
       };
 
       els.form.addEventListener("submit", (e) => {
@@ -791,9 +1182,31 @@ registerMode("record", (() => {
       document.addEventListener("keydown", onTrialKeydown);
       document.addEventListener("keyup", onTrialKeyup);
 
+      els.targetPerLabelInput.addEventListener("change", () => {
+        const v = parseInt(els.targetPerLabelInput.value, 10);
+        targetPerLabel = v > 0 ? v : DEFAULT_TARGET_PER_LABEL;
+        renderProgressDash();
+        renderLabelBars();
+      });
+      // Event delegation -- recent-list items are re-rendered wholesale on
+      // every SAVE, so binding once here (instead of per-item) means new
+      // items are clickable without re-attaching anything.
+      els.recentList.addEventListener("click", (e) => {
+        const item = e.target.closest("[data-recent-idx]");
+        if (item) openPreview(Number(item.dataset.recentIdx));
+      });
+      els.previewClose.addEventListener("click", closePreview);
+      els.previewOverlay.addEventListener("click", (e) => {
+        if (e.target === els.previewOverlay) closePreview(); // click on the dim backdrop
+      });
+
       updateWearIdUI();
       showScreen("form");
       loadPrefill();
+      loadVocab();
+      renderProgressDash();
+      renderLabelBars();
+      renderRecentList();
     },
 
     onEnter() {
@@ -811,6 +1224,7 @@ registerMode("record", (() => {
       // hold_start() on this device never gets stuck open server-side with
       // nothing left to send its matching hold_stop().
       if (holdKeyDown) triggerHoldStop();
+      closePreview(); // don't leave the overlay stuck open over another mode
     },
 
     onData(evt) {

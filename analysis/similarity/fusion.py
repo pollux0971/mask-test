@@ -65,6 +65,12 @@ class TriResult:
     theta_reject_tof: float  # ToF 專屬的拒識閾值（見下方 CONTRACTS 疑問說明）
     theta_reject_mel: float  # Mel 專屬的拒識閾值
     tau: float = DEFAULT_TAU
+    # 原始（未正規化）距離，只給 fused_reject()/theta_reject_fused() 用，
+    # 不是 CONTRACTS §4.3 JSON 的一部分（那兩個公開欄位是正規化後的
+    # d_tof/d_mel）。手動建構的 TriResult（例如舊測試）留 None 也能用
+    # fuse()/top1()，只有呼叫 fused 拒識時才會需要它們。
+    d_tof_raw: np.ndarray = None
+    d_mel_raw: np.ndarray = None
 
     def fuse(self, w):
         """d_fused = w*d_tof + (1-w)*d_mel，轉成 softmax 分數。
@@ -82,6 +88,39 @@ class TriResult:
         """回傳給定 w 下分數最高的類別名稱。"""
         scores = self.fuse(w)
         return self.classes[int(np.argmax(scores))]
+
+    def theta_reject_fused(self, w):
+        """融合後的拒識閾值：`w*theta_reject_tof + (1-w)*theta_reject_mel`
+        （CONTRACTS §4.3）。
+
+        線性內插：融合距離本身就是 `w*d_tof + (1-w)*d_mel`，門檻用同一組
+        權重才自洽，而且 `w=1`/`w=0` 兩端恰好精確退化成
+        `theta_reject_tof`/`theta_reject_mel`——拖滑桿到底不會有行為跳變。
+        """
+        if not (0.0 <= w <= 1.0):
+            raise ValueError(f"w 應在 [0, 1] 之間，收到 {w}")
+        return w * self.theta_reject_tof + (1 - w) * self.theta_reject_mel
+
+    def reject_fused(self, w):
+        """融合後的拒識判定：融合後的最小距離 > `theta_reject_fused(w)`
+        （CONTRACTS §4.3）。
+
+        **用原始（未正規化）距離算融合最小距離，不是用 `d_tof`/`d_mel`**——
+        那兩個已經正規化過，`min()` 恆為 0，拿來判斷拒識沒有意義（任何
+        正的門檻都不會被超過）。用原始距離也是 `w=1`/`w=0` 兩端會精確
+        退化成 `reject_tof`/`reject_mel` 的原因：兩者本來就是同一組原始
+        距離、同樣的比較方式算出來的，不是碰巧一致。
+        """
+        if self.d_tof_raw is None or self.d_mel_raw is None:
+            raise ValueError(
+                "reject_fused 需要原始距離（d_tof_raw/d_mel_raw）——"
+                "這個 TriResult 沒有帶原始距離（手動建構或舊呼叫端），"
+                "用 compute_tri_result() 產生的 TriResult 才支援 reject_fused"
+            )
+        if not (0.0 <= w <= 1.0):
+            raise ValueError(f"w 應在 [0, 1] 之間，收到 {w}")
+        d_fused_raw = w * self.d_tof_raw + (1 - w) * self.d_mel_raw
+        return bool(d_fused_raw.min() > self.theta_reject_fused(w))
 
 
 def compute_tri_result(
@@ -141,4 +180,6 @@ def compute_tri_result(
         theta_reject_tof=theta_tof,
         theta_reject_mel=theta_mel,
         tau=tau,
+        d_tof_raw=d_tof_raw,
+        d_mel_raw=d_mel_raw,
     )

@@ -204,3 +204,54 @@ def test_reject_tof_still_works_after_wiring_into_d07():
         rest_rejects.append(tri.reject_tof)
     rest_reject_rate = np.mean(rest_rejects)
     assert rest_reject_rate > 0.80, f"靜止的 ToF 拒識率只有 {rest_reject_rate:.1%}"
+
+
+def test_theta_reject_fused_linear_interpolation_and_endpoints():
+    """CONTRACTS §4.3：theta_reject_fused(w) = w*theta_tof + (1-w)*theta_mel，
+    w=1/w=0 精確退化成單模態閾值。"""
+    tri = _tri([0.0, 1.0], [1.0, 0.0])
+    tri.theta_reject_tof = 4.0
+    tri.theta_reject_mel = 2.0
+
+    assert tri.theta_reject_fused(1.0) == pytest.approx(4.0)
+    assert tri.theta_reject_fused(0.0) == pytest.approx(2.0)
+    assert tri.theta_reject_fused(0.5) == pytest.approx(3.0)
+
+
+def test_theta_reject_fused_rejects_invalid_w():
+    tri = _tri([0.0, 1.0], [1.0, 0.0])
+    with pytest.raises(ValueError):
+        tri.theta_reject_fused(1.5)
+
+
+def test_reject_fused_without_raw_distances_raises_clear_error():
+    """手動建構（沒有 d_tof_raw/d_mel_raw）的 TriResult 不支援 reject_fused，
+    要明確報錯而不是靜默算出錯的答案。"""
+    tri = _tri([0.0, 1.0], [1.0, 0.0])
+    with pytest.raises(ValueError):
+        tri.reject_fused(0.5)
+
+
+def test_reject_fused_degenerates_exactly_to_reject_tof_and_reject_mel_at_endpoints():
+    """調度員定義的核心性質：w=1 時 reject_fused 必須跟 reject_tof 完全一樣
+    （不只是「差不多」），w=0 時跟 reject_mel 完全一樣——因為兩者理當是
+    用同一組原始距離、同一個比較方式算出來的，不是碰巧一致。"""
+    rng = np.random.default_rng(0)
+    slices, templates_by_class, class_bases, reject_templates = _synthetic_templates(rng)
+
+    for query_class in ("class_0", "class_2"):
+        query = _make_seq(class_bases[query_class], rng)
+        tri = compute_tri_result(query, templates_by_class, reject_templates, slices, cosine_dist)
+
+        assert tri.reject_fused(1.0) == tri.reject_tof
+        assert tri.reject_fused(0.0) == tri.reject_mel
+
+
+def test_reject_fused_rejects_invalid_w():
+    rng = np.random.default_rng(1)
+    slices, templates_by_class, class_bases, reject_templates = _synthetic_templates(rng)
+    query = _make_seq(class_bases["class_1"], rng)
+    tri = compute_tri_result(query, templates_by_class, reject_templates, slices, cosine_dist)
+
+    with pytest.raises(ValueError):
+        tri.reject_fused(-0.1)

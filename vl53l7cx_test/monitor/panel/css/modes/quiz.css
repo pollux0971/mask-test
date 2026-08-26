@@ -175,6 +175,60 @@
   width: fit-content;
 }
 
+/* --- C17: fusion weight slider --- */
+.quiz-w-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+  padding: 10px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.quiz-w-end-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+.quiz-w-slider {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  outline: none;
+}
+.quiz-w-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--surface);
+  cursor: pointer;
+}
+.quiz-w-slider::-moz-range-thumb {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--surface);
+  cursor: pointer;
+}
+/* w 的當前值要大字顯示（C17.md 明確驗收條件），不是塞在小字狀態列裡 */
+.quiz-w-value {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--accent);
+  min-width: 5.5em;
+  text-align: right;
+  flex-shrink: 0;
+}
+
 .quiz-results {
   flex: 1;
   min-height: 0;

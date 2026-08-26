@@ -96,6 +96,47 @@ function flipAnimate(container, updateFn) {
   });
 }
 
+// --- C17: fusion weight slider ---
+//
+// esp-mask-test-ad's ruling on reject_fused (CONTRACTS.md 4.3, corrected
+// after C16 -- esp-mask-test-59 caught the first version being silently
+// wrong): theta_reject_fused(w) = w*theta_reject_tof + (1-w)*theta_reject_mel,
+// reject_fused(w) = (min fused distance > theta_reject_fused(w)) -- computed
+// here live, never stored in TriResult, since it depends on w which only
+// exists client-side.
+//
+// IMPORTANT, and easy to "helpfully" break: the reject check MUST use
+// d_tof_raw/d_mel_raw (unnormalized), not d_tof/d_mel. normalize_distances()
+// subtracts the min, so d_tof.min() is always exactly 0 and a raw-vs-
+// normalized mixup makes reject_fused permanently False -- no error, it
+// just silently never rejects. fuseScores() above is correct to use the
+// normalized d_tof/d_mel (softmax needs comparable scale); the reject
+// threshold needs the absolute (raw) scale instead. Two different distance
+// arrays for two different purposes, on purpose -- not an inconsistency to
+// "clean up".
+//
+// C17.md's own keyboard shortcuts are T/M/F, not the 0/1-endpoint keys
+// esp-mask-test-ad's message mentioned as an example -- and T/M/F happen
+// to dodge the collision problem entirely (shell.js's global shortcuts are
+// 1-5 for modes and \ for collapse; T/M/F share none of those).
+const SNAP_POINTS = [0, 0.5, 1];
+const SNAP_THRESHOLD = 0.03;
+
+function snapW(raw) {
+  for (const p of SNAP_POINTS) {
+    if (Math.abs(raw - p) <= SNAP_THRESHOLD) return p;
+  }
+  return raw;
+}
+
+function computeFusedReject(triResult, w) {
+  const { d_tof_raw, d_mel_raw, theta_reject_tof, theta_reject_mel } = triResult;
+  const combined = d_tof_raw.map((d, i) => w * d + (1 - w) * d_mel_raw[i]);
+  const minDist = Math.min(...combined);
+  const thetaFused = w * theta_reject_tof + (1 - w) * theta_reject_mel;
+  return minDist > thetaFused;
+}
+
 const SPEAKING_MODES = [
   { key: "normal", label: "正常" },
   { key: "whisper", label: "氣音" },
@@ -106,6 +147,22 @@ const TRIGGER_SOURCES = [
   { key: "either", label: "任一（ToF 或音訊）" },
 ];
 const EXPECT_LABEL = { "ToF": "ToF", "音訊": "音訊", "雙模態": "雙模態" };
+
+// A focused range slider isn't "typing" -- unlike C02/C06/C07/C09's own
+// copies of this check, a range <input> must NOT block T/M/F, or dragging
+// the slider then immediately reaching for a shortcut key would silently
+// do nothing until the user clicks elsewhere first.
+function isTypingTarget(el) {
+  if (!el) return false;
+  const tag = el.tagName;
+  if (tag === "INPUT") return el.type !== "range";
+  return tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
+}
+
+function isQuizModeActive() {
+  const section = document.getElementById("mode-quiz");
+  return !!section && section.classList.contains("active");
+}
 
 registerMode("quiz", (() => {
   let cardsEl = null;
@@ -118,11 +175,14 @@ registerMode("quiz", (() => {
   let triggerSource = "tof";
   let vocab = FALLBACK_VOCAB;
 
-  // --- C16: three-track result bars ---
+  // --- C16/C17: three-track result bars + fusion weight slider ---
   let recognizeBtn = null, resultStatusEl = null, resultsAreaEl = null, disagreeBannerEl = null;
   const barsEl = { tof: null, mel: null, fused: null };
-  const rejectBadgeEl = { tof: null, mel: null };
+  const rejectBadgeEl = { tof: null, mel: null, fused: null };
   let lastTriResult = null;
+  let tofTopCache = null, melTopCache = null;
+  let currentW = DEFAULT_FUSED_W;
+  let wSliderEl = null, wValueEl = null;
 
   function renderColumn(el, classes, scores, rejected) {
     const entries = sortedEntries(classes, scores);
@@ -136,32 +196,101 @@ registerMode("quiz", (() => {
     return entries[0];
   }
 
+  // Disagreement compares only the tracks that actually have an opinion --
+  // a rejected track saying "nothing" isn't disagreement, it's just
+  // silence (esp-mask-test-ad, written into CONTRACTS.md after C16: "拒識
+  // 不是分歧，是沉默"). Otherwise C15's Demo step 4 (ToF alone, correctly
+  // rejecting) would falsely light up the disagreement banner too.
+  function updateDisagreement(fusedTop, rejectFused) {
+    const tops = [];
+    if (!lastTriResult.reject_tof) tops.push(tofTopCache.cls);
+    if (!lastTriResult.reject_mel) tops.push(melTopCache.cls);
+    if (!rejectFused) tops.push(fusedTop.cls);
+    const disagree = new Set(tops).size > 1;
+    resultsAreaEl.classList.toggle("results-disagree", disagree);
+    disagreeBannerEl.style.display = disagree ? "block" : "none";
+  }
+
+  // Recomputes and repaints ONLY the Fused column -- ToF-only/Mel-only
+  // never change with w (they're fuse(1)/fuse(0) always), and this never
+  // touches d_tof/d_mel or re-fetches: C17.md's "不需重念" and D07/D09's
+  // pinned "11 種 w 全程距離沒被動過" property. Also always updates the
+  // w-value readout, even before any result exists, so moving the slider
+  // ahead of the first "觸發辨識" still shows a sane number.
+  function renderFusedColumn() {
+    wValueEl.textContent = `w = ${currentW.toFixed(2)}`;
+    if (!lastTriResult) return;
+
+    const t0 = performance.now();
+    const fusedScores = fuseScores(lastTriResult, currentW);
+    const rejectFused = computeFusedReject(lastTriResult, currentW);
+
+    // Sanity check, not just a one-off manual test: theta_reject_fused(1)
+    // = theta_reject_tof and combined(w=1) = d_tof exactly (0*d_mel term
+    // vanishes), so reject_fused(1) must equal reject_tof bit-for-bit. A
+    // mismatch here means this formula and whatever D09 actually does for
+    // reject_tof have drifted apart -- worth knowing loudly, not silently.
+    if (currentW === 1 && rejectFused !== lastTriResult.reject_tof) {
+      console.error("[quiz] reject_fused(w=1) != reject_tof -- formula/backend mismatch", {
+        rejectFused, reject_tof: lastTriResult.reject_tof,
+      });
+    }
+    if (currentW === 0 && rejectFused !== lastTriResult.reject_mel) {
+      console.error("[quiz] reject_fused(w=0) != reject_mel -- formula/backend mismatch", {
+        rejectFused, reject_mel: lastTriResult.reject_mel,
+      });
+    }
+
+    let fusedTop;
+    flipAnimate(barsEl.fused, () => {
+      fusedTop = renderColumn(barsEl.fused, lastTriResult.classes, fusedScores, rejectFused);
+    });
+    rejectBadgeEl.fused.style.display = rejectFused ? "inline-block" : "none";
+    updateDisagreement(fusedTop, rejectFused);
+
+    const elapsed = performance.now() - t0;
+    if (elapsed > 50) {
+      console.warn(`[quiz] fused recompute took ${elapsed.toFixed(1)}ms, over the 50ms budget`);
+    }
+  }
+
+  function setW(w) {
+    currentW = w;
+    wSliderEl.value = String(w);
+    renderFusedColumn();
+  }
+
+  function onSliderInput() {
+    currentW = snapW(parseFloat(wSliderEl.value));
+    wSliderEl.value = String(currentW); // reflect the snap visually, not just internally
+    renderFusedColumn();
+  }
+
+  // T = 純 ToF (w=1), M = 純音訊 (w=0), F = 平衡 (w=0.5) -- C17.md's exact
+  // three shortcuts. Global (document-level, like C05/C07's S/D/B), so a
+  // presenter doesn't need the slider focused or even visible on screen.
+  function onKeydown(e) {
+    if (isTypingTarget(e.target) || e.altKey || e.ctrlKey || e.metaKey) return;
+    if (!isQuizModeActive()) return;
+    const key = e.key.toLowerCase();
+    if (key === "t") { e.preventDefault(); setW(1); }
+    else if (key === "m") { e.preventDefault(); setW(0); }
+    else if (key === "f") { e.preventDefault(); setW(0.5); }
+  }
+
   function renderResult(triResult) {
     lastTriResult = triResult;
     const classes = triResult.classes;
     const tofScores = fuseScores(triResult, 1);
     const melScores = fuseScores(triResult, 0);
-    const fusedScores = fuseScores(triResult, DEFAULT_FUSED_W);
 
-    let tofTop, melTop, fusedTop;
-    flipAnimate(barsEl.tof, () => { tofTop = renderColumn(barsEl.tof, classes, tofScores, triResult.reject_tof); });
-    flipAnimate(barsEl.mel, () => { melTop = renderColumn(barsEl.mel, classes, melScores, triResult.reject_mel); });
-    flipAnimate(barsEl.fused, () => { fusedTop = renderColumn(barsEl.fused, classes, fusedScores, false); });
+    flipAnimate(barsEl.tof, () => { tofTopCache = renderColumn(barsEl.tof, classes, tofScores, triResult.reject_tof); });
+    flipAnimate(barsEl.mel, () => { melTopCache = renderColumn(barsEl.mel, classes, melScores, triResult.reject_mel); });
 
     rejectBadgeEl.tof.style.display = triResult.reject_tof ? "inline-block" : "none";
     rejectBadgeEl.mel.style.display = triResult.reject_mel ? "inline-block" : "none";
 
-    // Disagreement compares only the tracks that actually have an opinion
-    // -- a rejected track saying "nothing" isn't disagreement, it's just
-    // silence (D22 note: reject is a normal outcome, not treated as an
-    // error state to fold into this comparison).
-    const tops = [];
-    if (!triResult.reject_tof) tops.push(tofTop.cls);
-    if (!triResult.reject_mel) tops.push(melTop.cls);
-    tops.push(fusedTop.cls); // no reject_fused in CONTRACTS 4.3; fused always has an opinion here
-    const disagree = new Set(tops).size > 1;
-    resultsAreaEl.classList.toggle("results-disagree", disagree);
-    disagreeBannerEl.style.display = disagree ? "block" : "none";
+    renderFusedColumn(); // uses currentW (whatever the slider is already at) and the caches just set above
 
     resultStatusEl.textContent = "已顯示辨識結果";
   }
@@ -172,7 +301,8 @@ registerMode("quiz", (() => {
       const res = await fetch("/recognize", { method: "POST" });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const triResult = await res.json();
-      if (!triResult || !Array.isArray(triResult.classes) || !Array.isArray(triResult.d_tof) || !Array.isArray(triResult.d_mel)) {
+      if (!triResult || !Array.isArray(triResult.classes) || !Array.isArray(triResult.d_tof) || !Array.isArray(triResult.d_mel)
+          || !Array.isArray(triResult.d_tof_raw) || !Array.isArray(triResult.d_mel_raw)) {
         throw new Error("malformed TriResult");
       }
       renderResult(triResult);
@@ -273,6 +403,12 @@ registerMode("quiz", (() => {
         <div class="quiz-disagree-banner" data-disagree-banner style="display:none">
           ⚠ 三軌判斷不一致
         </div>
+        <div class="quiz-w-slider-row">
+          <span class="quiz-w-end-label">ToF</span>
+          <input type="range" class="quiz-w-slider" data-w-slider min="0" max="1" step="0.01" value="${DEFAULT_FUSED_W}">
+          <span class="quiz-w-end-label">音訊</span>
+          <span class="quiz-w-value mono" data-w-value>w = ${DEFAULT_FUSED_W.toFixed(2)}</span>
+        </div>
         <div class="quiz-results" data-results>
           <div class="quiz-result-col">
             <div class="quiz-result-col-head">ToF only
@@ -287,7 +423,9 @@ registerMode("quiz", (() => {
             <div class="quiz-bars" data-bars="mel"></div>
           </div>
           <div class="quiz-result-col fused">
-            <div class="quiz-result-col-head">Fused ★</div>
+            <div class="quiz-result-col-head">Fused ★
+              <span class="quiz-reject-badge" data-reject-badge="fused" style="display:none">拒識</span>
+            </div>
             <div class="quiz-bars" data-bars="fused"></div>
           </div>
         </div>
@@ -316,7 +454,13 @@ registerMode("quiz", (() => {
       barsEl.fused = root.querySelector('[data-bars="fused"]');
       rejectBadgeEl.tof = root.querySelector('[data-reject-badge="tof"]');
       rejectBadgeEl.mel = root.querySelector('[data-reject-badge="mel"]');
+      rejectBadgeEl.fused = root.querySelector('[data-reject-badge="fused"]');
       recognizeBtn.addEventListener("click", onRecognizeClick);
+
+      wSliderEl = root.querySelector("[data-w-slider]");
+      wValueEl = root.querySelector("[data-w-value]");
+      wSliderEl.addEventListener("input", onSliderInput);
+      document.addEventListener("keydown", onKeydown);
     },
 
     onData(evt) {

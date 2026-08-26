@@ -275,11 +275,29 @@
   width: 100%;
   min-height: 85vh;
   display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 32px;
+  position: relative;
+}
+
+/* C13's dashboard must stay visible at all times (per its own acceptance
+   condition, "隨時看到進度"), including during CAPTURE -- so it lives
+   beside the trial card, not hidden/collapsed behind it. .trial-main wraps
+   what used to be the trial-screen's direct children so the countdown/
+   capture visuals (peripheral-vision requirement, C12.md) keep their own
+   centered column instead of being centered against the dashboard's width
+   too. */
+#mode-record .trial-main {
+  flex: 1 1 auto;
+  min-height: 85vh;
+  display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 24px;
-  position: relative;
+  position: relative; /* anchors .trial-topbar, moved here from .trial-screen */
 }
 
 #mode-record .trial-topbar {
@@ -465,4 +483,253 @@
 #mode-record .trial-hint {
   color: var(--text-dim);
   font-size: 13px;
+}
+
+/* --- C13: progress dashboard --------------------------------------------
+   Sits beside the trial card (see .trial-screen/.trial-main above), not
+   below it -- must stay visible through every trial state, not just at
+   rest, per the story's "隨時看到進度" acceptance condition. */
+
+#mode-record .progress-dash {
+  width: 300px;
+  flex: 0 0 300px;
+  align-self: flex-start;
+  margin-top: 40px; /* roughly clears .trial-topbar's absolute height */
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+
+#mode-record .dash-subsection {
+  margin-top: 14px;
+}
+
+#mode-record .target-per-label-field {
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+#mode-record .target-per-label-field input {
+  width: 56px;
+  padding: 2px 6px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+}
+
+#mode-record .progress-summary {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+#mode-record .progress-bar-track {
+  height: 8px;
+  background: var(--surface-2);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+#mode-record .progress-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s linear;
+}
+
+#mode-record .progress-eta {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+#mode-record .label-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#mode-record .label-bar {
+  display: grid;
+  grid-template-columns: 56px 1fr 44px;
+  align-items: center;
+  gap: 6px;
+}
+
+#mode-record .label-bar-name {
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#mode-record .label-bar-track {
+  height: 6px;
+  background: var(--surface-2);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+#mode-record .label-bar-fill {
+  height: 100%;
+  background: var(--accent);
+}
+
+#mode-record .label-bar.done .label-bar-fill {
+  background: var(--good);
+}
+
+#mode-record .label-bar-count {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: right;
+}
+
+#mode-record .recent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+#mode-record .recent-empty {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+#mode-record .recent-item {
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+#mode-record .recent-item:hover,
+#mode-record .recent-item:focus {
+  outline: 1px solid var(--accent);
+}
+
+#mode-record .quality-dot {
+  font-size: 14px;
+  line-height: 1;
+}
+
+#mode-record .quality-dot.quality-ok { color: var(--good); }
+#mode-record .quality-dot.quality-low { color: var(--accent); }
+#mode-record .quality-dot.quality-rejected { color: var(--warn); }
+
+#mode-record .recent-label {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#mode-record .recent-meta {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* --- C13: trial preview overlay ----------------------------------------- */
+
+#mode-record .trial-preview-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+
+#mode-record .trial-preview-box {
+  width: min(90%, 800px);
+  max-height: 85vh;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+}
+
+#mode-record .trial-preview-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+  font-size: 15px;
+}
+
+#mode-record .preview-close-btn {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+#mode-record .preview-heatmaps {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+
+#mode-record .preview-heatmap {
+  flex: 1 1 260px;
+}
+
+#mode-record .preview-heatmap-title,
+#mode-record .preview-waveform-title {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+#mode-record .preview-grid {
+  display: grid;
+  gap: 2px;
+  aspect-ratio: 1;
+}
+
+#mode-record .preview-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  background: var(--cell-invalid);
+  border-radius: 2px;
+  aspect-ratio: 1;
+}
+
+#mode-record .preview-cell.invalid {
+  color: var(--text-dim);
+}
+
+#mode-record .preview-empty {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+#mode-record .preview-waveform-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 80px;
+  background: var(--surface-2);
+  border-radius: 6px;
+  padding: 4px;
+}
+
+#mode-record .preview-waveform-bar {
+  flex: 1 1 auto;
+  background: var(--accent);
+  min-width: 1px;
+  border-radius: 1px 1px 0 0;
 }

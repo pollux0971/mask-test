@@ -212,6 +212,50 @@
   pointer-events: none;
 }
 
+/* --- C08: Mel spectrogram waterfall --- */
+#mode-monitor .mel-waterfall-panel {
+  flex: 2;
+  min-height: 160px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+}
+.mel-waterfall-badge {
+  font-size: 11px;
+  letter-spacing: normal;
+  text-transform: none;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.mel-waterfall-badge.degraded { color: var(--warn); }
+.mel-waterfall-hz {
+  font-size: 11px;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text-dim);
+  margin-left: auto;
+}
+#mode-monitor .mel-waterfall-canvas-wrap {
+  flex: 1;
+  min-height: 0;
+  border-radius: 6px;
+  overflow: hidden;
+}
+#mode-monitor .mel-waterfall-canvas-wrap canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  /* Backing bitmap is a small fixed grid (MEL_HISTORY_COLUMNS x MEL_BANDS,
+     one pixel per band per frame) stretched to fill the panel -- keep band
+     boundaries crisp instead of blurring across neighboring bands. */
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
 /* --- C09: quality dashboard --- */
 #mode-monitor .quality-panel {
   flex: 3;

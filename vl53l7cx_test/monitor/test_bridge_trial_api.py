@@ -146,36 +146,58 @@ def test_hold_capture_is_not_ended_by_the_ticker(rig):
     """Its length is the user's to decide; only hold_stop ends it."""
     _session_with_baseline(rig)
     _request(rig, "POST", "/trial/hold/start", {})
-    time.sleep(2.0)  # longer than the fixed-duration CAPTURE
-    assert _request(rig, "GET", "/session/current")[0] == 200
+    time.sleep(2.0)  # longer than the fixed-duration CAPTURE would allow
     status, body = _request(rig, "POST", "/trial/hold/stop")
     assert status == 200, body
-    # B12 stops into CONFIRM: computed, but deliberately not yet on disk.
-    assert body["state"] in ("CONFIRM", "SAVE", "REST"), body
+    # 2 s is inside B12's [0.3, 5.0] window, so it saves straight through.
+    assert body["state"] == "REST", body
 
 
-def test_hold_stop_then_confirm_keeps_the_trial(rig):
+def test_an_in_range_hold_saves_without_asking(rig):
     _session_with_baseline(rig)
     _request(rig, "POST", "/trial/hold/start", {})
     time.sleep(1.0)
-    stopped = _request(rig, "POST", "/trial/hold/stop")[1]
-    if stopped["state"] != "CONFIRM":
-        pytest.skip(f"machine stopped into {stopped['state']}, not CONFIRM")
+    body = _request(rig, "POST", "/trial/hold/stop")[1]
+    states = [e["state"] for e in body["events"]]
+    assert "SAVE" in states, states
+    assert body["state"] == "REST"
+
+
+def test_a_too_short_hold_goes_to_confirm_instead_of_guessing(rig):
+    """B12: out-of-range holds are neither saved nor dropped automatically.
+
+    A 0.1 s press is almost certainly a slip, but "almost certainly" is not
+    good enough to throw away a trial the person may have meant -- nor to
+    keep one that would quietly pollute the dataset. The data stays in
+    memory and the operator decides.
+    """
+    _session_with_baseline(rig)
+    _request(rig, "POST", "/trial/hold/start", {})
+    time.sleep(0.1)  # below the 0.3 s floor
+    status, body = _request(rig, "POST", "/trial/hold/stop")
+    assert status == 200, body
+    assert body["state"] == "CONFIRM", body
+
+
+def test_confirm_keeps_a_pending_trial(rig):
+    _session_with_baseline(rig)
+    _request(rig, "POST", "/trial/hold/start", {})
+    time.sleep(0.1)
+    assert _request(rig, "POST", "/trial/hold/stop")[1]["state"] == "CONFIRM"
     status, body = _request(rig, "POST", "/trial/confirm")
     assert status == 200, body
-    assert body["state"] in ("REST", "IDLE", "SAVE")
+    assert body["state"] in ("REST", "IDLE")
+    assert "SAVE" in [e["state"] for e in body["events"]] or body["state"] == "REST"
 
 
-def test_hold_stop_then_discard_drops_it(rig):
+def test_discard_drops_a_pending_trial(rig):
     _session_with_baseline(rig)
     _request(rig, "POST", "/trial/hold/start", {})
-    time.sleep(1.0)
-    stopped = _request(rig, "POST", "/trial/hold/stop")[1]
-    if stopped["state"] != "CONFIRM":
-        pytest.skip(f"machine stopped into {stopped['state']}, not CONFIRM")
+    time.sleep(0.1)
+    assert _request(rig, "POST", "/trial/hold/stop")[1]["state"] == "CONFIRM"
     status, body = _request(rig, "POST", "/trial/discard")
     assert status == 200, body
-    assert body["state"] in ("IDLE", "REST")
+    assert body["state"] == "IDLE"
 
 
 def test_confirm_outside_confirm_state_is_409(rig):
@@ -198,14 +220,18 @@ def test_a_saved_trial_does_not_destroy_the_baseline(rig):
     _session_with_baseline(rig)
     _request(rig, "POST", "/trial/hold/start", {})
     time.sleep(1.2)
-    stopped = _request(rig, "POST", "/trial/hold/stop")[1]
-    if stopped["state"] == "CONFIRM":
-        _request(rig, "POST", "/trial/confirm")
-    time.sleep(1.0)
+    assert _request(rig, "POST", "/trial/hold/stop")[1]["state"] == "REST"
+
+    # End the session first: the writer holds the file open for the whole
+    # session, and HDF5 takes an exclusive lock on it.
+    assert _request(rig, "POST", "/session/end")[0] == 200
+    time.sleep(0.5)
 
     files = list((rig.workdir / "sessions").glob("*.h5"))
     assert files, "no session file"
     with h5py.File(files[0], "r") as f:
         trials = sorted(k for k in f if k.startswith("trial"))
         assert "trial_000" in trials, f"the baseline was destroyed: {trials}"
-        assert f["trial_000"].attrs.get("label") in ("_baseline", b"_baseline")
+        assert "trial_001" in trials, f"the trial was not saved: {trials}"
+        label = f["trial_000"].attrs.get("label")
+        assert label in ("_baseline", b"_baseline"), label

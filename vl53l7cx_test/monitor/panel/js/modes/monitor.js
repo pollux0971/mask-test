@@ -250,6 +250,49 @@ function renderDistanceChannel(cells, dValues, validArr, sensor, displayMode, ba
   }
 }
 
+// --- C08: Mel spectrogram waterfall -----------------------------------
+//
+// Value range is FIXED, not auto-normalized: CONTRACTS.md §3.1 wire format
+// is int16 = round(log_mel * 100); measured live against the mock's
+// formant model, silence sits around -606 and speech around -122. A
+// fixed scale is the whole point of the story -- auto-normalizing to
+// whatever's currently on screen would make "the sound stopped" look
+// identical to "the sound is just quiet", which is exactly the contrast
+// Demo step 3 (氣音「四」→ Mel 崩潰、ToF 仍對) needs to be visible.
+const MEL_MIN = -1000, MEL_MAX = 0;
+const MEL_BANDS = 40;
+const MEL_HISTORY_COLUMNS = 320; // backing canvas width; ~5s at 62.5Hz, ~10s at 31.25Hz either way "至少幾秒"
+const RMS_MAX = 32767; // CONTRACTS.md §1.1 $M's rms range (16-bit PCM amplitude)
+const MEL_BG = [10, 8, 20];
+const MEL_ENABLED_TIMEOUT_MS = 3000; // no $STATUS + no traffic this long -> treat mel as off
+
+// Monotonic-luminance magma-ish ramp (C08.md: "viridis 或 magma"), hand-coded
+// the same way distColor/signalColor/zscoreColor above are -- no charting
+// library, zero build per this project's standing rule. Multi-stop version
+// of the file's existing 2-stop lerpColor().
+const MEL_STOPS = [
+  [10, 8, 20],     // near-black violet: silence / noise floor
+  [82, 18, 92],
+  [163, 33, 91],
+  [230, 79, 58],
+  [251, 159, 32],
+  [252, 253, 191], // near-white yellow: loudest
+];
+
+function melColorRgb(int16Value) {
+  const t = Math.max(0, Math.min(1, (int16Value - MEL_MIN) / (MEL_MAX - MEL_MIN)));
+  const segs = MEL_STOPS.length - 1;
+  const scaled = t * segs;
+  const i = Math.min(segs - 1, Math.floor(scaled));
+  const localT = scaled - i;
+  const a = MEL_STOPS[i], b = MEL_STOPS[i + 1];
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * localT),
+    Math.round(a[1] + (b[1] - a[1]) * localT),
+    Math.round(a[2] + (b[2] - a[2]) * localT),
+  ];
+}
+
 let warnedBadLength = false;
 
 // --- C10: live PCA trajectory --------------------------------------------
@@ -645,6 +688,14 @@ registerMode("monitor", (() => {
   let lastFitAt = 0;
   let lastServerCheckAt = 0;
 
+  // --- C08: Mel spectrogram waterfall state ---
+  let melCanvas = null, melCtx = null, melBadgeEl = null, melHzEl = null;
+  let pendingMelColumns = []; // Int16Array/number[40][], queued in onData, drained in paint()
+  let pendingRmsColumns = []; // number[] (rms), same queue discipline for the degraded view
+  let lastMelEventAt = 0;
+  let melActive = null; // null = not painted yet; true/false = which view was last drawn
+  let melCanvasReady = false;
+
   function combinedVectorNow() {
     const a = latestFrame.A, b = latestFrame.B;
     if (!a || !b || a.dim !== b.dim) return null;
@@ -760,6 +811,118 @@ registerMode("monitor", (() => {
     pcaCtx.stroke();
   }
 
+  // --- C08: Mel spectrogram waterfall --------------------------------
+  //
+  // Backing canvas is MEL_HISTORY_COLUMNS x MEL_BANDS pixels (one pixel
+  // per band per frame), scaled up with CSS + image-rendering:pixelated
+  // (monitor.css) so band boundaries stay crisp instead of blurring --
+  // cheap because the actual pixel-pushing work is 40 pixels per new
+  // frame via putImageData, not a redraw of the visible (much larger)
+  // element size.
+  function resizeMelCanvas() {
+    if (!melCanvas) return;
+    melCanvas.width = MEL_HISTORY_COLUMNS;
+    melCanvas.height = MEL_BANDS;
+    melCtx.fillStyle = `rgb(${MEL_BG[0]},${MEL_BG[1]},${MEL_BG[2]})`;
+    melCtx.fillRect(0, 0, MEL_HISTORY_COLUMNS, MEL_BANDS);
+    melCanvasReady = true;
+  }
+
+  // C08.md's own implementation hint, applied here:
+  //   ctx.putImageData(ctx.getImageData(1, 0, w-1, h), 0, 0);
+  //   drawColumn(w - 1, melFrame);
+  // Shifts existing pixels one column left, then paints only the new
+  // rightmost column -- never a full-canvas redraw.
+  function shiftMelCanvasLeft() {
+    const w = MEL_HISTORY_COLUMNS, h = MEL_BANDS;
+    melCtx.putImageData(melCtx.getImageData(1, 0, w - 1, h), 0, 0);
+  }
+
+  // bands[0] is the lowest mel band (fmin=80Hz, CONTRACTS.md §3.1); drawn
+  // at the bottom row so the image reads like a conventional spectrogram
+  // (frequency increases upward).
+  function drawMelColumn(bands) {
+    shiftMelCanvasLeft();
+    const h = MEL_BANDS;
+    const col = melCtx.createImageData(1, h);
+    for (let b = 0; b < h; b++) {
+      const rowFromTop = h - 1 - b;
+      const [r, g, bl] = melColorRgb(bands[b]);
+      const idx = rowFromTop * 4;
+      col.data[idx] = r; col.data[idx + 1] = g; col.data[idx + 2] = bl; col.data[idx + 3] = 255;
+    }
+    melCtx.putImageData(col, MEL_HISTORY_COLUMNS - 1, 0);
+  }
+
+  // Degraded view (no $F): a solid-color column per $M frame, brightness =
+  // loudness. Deliberately a different texture (flat bar vs. banded
+  // spectrogram) from the real waterfall so the degraded state is visibly,
+  // not just textually, distinct -- on top of the badge text below.
+  function drawRmsColumn(rms) {
+    shiftMelCanvasLeft();
+    const h = MEL_BANDS;
+    const t = Math.max(0, Math.min(1, rms / RMS_MAX));
+    const [r, g, bl] = melColorRgb(MEL_MIN + t * (MEL_MAX - MEL_MIN));
+    const col = melCtx.createImageData(1, h);
+    for (let row = 0; row < h; row++) {
+      const idx = row * 4;
+      col.data[idx] = r; col.data[idx + 1] = g; col.data[idx + 2] = bl; col.data[idx + 3] = 255;
+    }
+    melCtx.putImageData(col, MEL_HISTORY_COLUMNS - 1, 0);
+  }
+
+  // $STATUS's `mel` field (CONTRACTS.md §1.1.2) is the authoritative source
+  // once it has arrived. Before the first $STATUS (or on firmware too old
+  // to send the field -- it's optional per §1.1.2), fall back to "have we
+  // actually seen a $F frame recently" -- real data outranks absent
+  // metadata. A12 may never ship at all (depends on A10's spike result,
+  // per A12.md), so this must default to the degraded view, not to "on".
+  function isMelEnabled() {
+    const status = dataStore.getLatestStatus();
+    if (status && typeof status.mel === "boolean") return status.mel;
+    return lastMelEventAt > 0 && (performance.now() - lastMelEventAt) < MEL_ENABLED_TIMEOUT_MS;
+  }
+
+  // §1.1.2 exists precisely so this doesn't have to guess: A14 changed $F
+  // from 31.25 to 62.5 Hz without changing the wire shape, so the rate is
+  // read from sr/mel_hop every time, never assumed.
+  function melRateLabel() {
+    const status = dataStore.getLatestStatus();
+    if (status && typeof status.sr === "number" && typeof status.mel_hop === "number" && status.mel_hop > 0) {
+      return (status.sr / status.mel_hop).toFixed(1) + " Hz";
+    }
+    return "幀率未知（等待 $STATUS）";
+  }
+
+  function paintMelWaterfall() {
+    if (!melCanvas || !melCanvasReady) return;
+    const enabled = isMelEnabled();
+    if (enabled !== melActive) {
+      // View switch: clear so the outgoing view's pixels don't linger
+      // underneath the incoming one, and drop any queued backlog from the
+      // view we're leaving -- it belongs to a different visualization.
+      melCtx.fillStyle = `rgb(${MEL_BG[0]},${MEL_BG[1]},${MEL_BG[2]})`;
+      melCtx.fillRect(0, 0, MEL_HISTORY_COLUMNS, MEL_BANDS);
+      pendingMelColumns = [];
+      pendingRmsColumns = [];
+      melActive = enabled;
+    }
+
+    if (enabled) {
+      for (const bands of pendingMelColumns) drawMelColumn(bands);
+      pendingMelColumns = [];
+    } else {
+      for (const rms of pendingRmsColumns) drawRmsColumn(rms);
+      pendingRmsColumns = [];
+    }
+
+    if (melBadgeEl) {
+      melBadgeEl.textContent = enabled ? "Mel 頻譜（62.5 Hz 前為 31.25 Hz，見右側幀率）" : "⚠ Mel 未啟用 — 顯示 RMS 包絡";
+      melBadgeEl.className = "mel-waterfall-badge mono" + (enabled ? "" : " degraded");
+    }
+    if (melHzEl) melHzEl.textContent = enabled ? melRateLabel() : "";
+  }
+
   function ensureGrids(sensor, dim) {
     if (currentDim[sensor] === dim) return;
     const side = Math.round(Math.sqrt(dim));
@@ -824,6 +987,7 @@ registerMode("monitor", (() => {
     }
     updateBaselineStatus(); // elapsed-time text needs to tick even without a new capture
     drawTrail();
+    paintMelWaterfall();
     rafId = requestAnimationFrame(paint);
   }
 
@@ -857,6 +1021,15 @@ registerMode("monitor", (() => {
           <div class="pca-canvas-wrap">
             <canvas data-pca-canvas></canvas>
             <div class="pca-empty-note">尚無 enrollment 樣板可顯示信賴橢圓（等 D08）</div>
+          </div>
+        </div>
+        <div class="mel-waterfall-panel">
+          <div class="section-label">Mel 頻譜瀑布圖
+            <span class="mel-waterfall-badge mono" data-mel-badge></span>
+            <span class="mel-waterfall-hz mono" data-mel-hz></span>
+          </div>
+          <div class="mel-waterfall-canvas-wrap">
+            <canvas data-mel-canvas></canvas>
           </div>
         </div>
         <div class="quality-panel">
@@ -923,6 +1096,16 @@ registerMode("monitor", (() => {
       // no reason to wait 10s if the endpoint already happens to exist.
       tryFetchServerPcaModel("tof_only").then((model) => { if (model) setModel(model); });
 
+      melCanvas = root.querySelector("[data-mel-canvas]");
+      melCtx = melCanvas.getContext("2d");
+      melBadgeEl = root.querySelector("[data-mel-badge]");
+      melHzEl = root.querySelector("[data-mel-hz]");
+      // Fixed logical pixel grid (MEL_HISTORY_COLUMNS x MEL_BANDS), stretched
+      // by CSS -- unlike the PCA canvas, this doesn't depend on
+      // devicePixelRatio or container size, so it's set up once here, not
+      // re-run on window resize or onEnter.
+      resizeMelCanvas();
+
       for (const m of QUALITY_METRICS) {
         qualityEls.value[m.key] = root.querySelector(`[data-quality-value="${m.key}"]`);
         qualityEls.dot[m.key] = root.querySelector(`[data-quality-dot="${m.key}"]`);
@@ -959,6 +1142,25 @@ registerMode("monitor", (() => {
         // once-a-second update to a 60fps loop, and it means the panel
         // stays current even while this mode is hidden.
         handleQualityEvent(evt);
+        return;
+      }
+      if (evt.type === "mel") {
+        // Queued here, drawn in paint() -- accumulates regardless of
+        // visibility (C10's established pattern for this file), only the
+        // actual canvas painting stops while the mode is hidden.
+        const bands = evt.bands;
+        if (Array.isArray(bands) && bands.length === MEL_BANDS) {
+          lastMelEventAt = performance.now();
+          pendingMelColumns.push(bands);
+          if (pendingMelColumns.length > MEL_HISTORY_COLUMNS) pendingMelColumns.shift();
+        }
+        return;
+      }
+      if (evt.type === "mic") {
+        if (typeof evt.rms === "number") {
+          pendingRmsColumns.push(evt.rms);
+          if (pendingRmsColumns.length > MEL_HISTORY_COLUMNS) pendingRmsColumns.shift();
+        }
         return;
       }
       if (evt.type !== "tof") return;
