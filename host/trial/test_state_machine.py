@@ -615,3 +615,183 @@ def test_abort_still_works_mid_hold(tmp_path):
     event = sm.abort()
     assert event["state"] == "IDLE"
     assert sm.state == TrialState.IDLE
+
+
+# ---------------------------------------------------------------------------
+# C12 -- peek_next_label() / next_label in events
+
+
+def test_peek_next_label_does_not_consume_or_change_order_pos(tmp_path):
+    sm, _, _, _, _ = _make_sm(tmp_path, words=("五", "四", "八"), seed=1)
+    first = sm.order[0]
+    assert sm.peek_next_label() == first
+    assert sm.peek_next_label() == first, "peek 兩次應該回同一個詞，不消耗"
+    ev = sm.start_trial()
+    assert ev["label"] == first, "peek 看到的應該跟真的 start_trial() 選到的一致"
+
+
+def test_peek_next_label_wraps_around_cyclically(tmp_path):
+    """詞序是循環的（E05 要遠超過 8 次重複），用完一輪要繞回開頭，不是回 None。"""
+    words = ("五", "四")
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, words=words, seed=1)
+
+    seen = []
+    for _ in range(len(words) * 2 + 1):  # 跑超過兩輪
+        seen.append(sm.peek_next_label())
+        sm.start_trial()
+        sm.abort()  # 跳過，前進到下一個詞，不落盤（不需要真的錄）
+
+    assert seen == [sm.order[i % len(words)] for i in range(len(seen))]
+
+
+def test_next_label_in_idle_and_rest_and_save_events(tmp_path):
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(
+        tmp_path, words=("五", "四", "八"), seed=1, clock=clock
+    )
+    expected_next = sm.order[1]  # order[0] is about to be recorded
+
+    capture_start, capture_end = 1_000_000, 1_000_000 + int(CAPTURE_S * 1e6)
+    _feed_tof(aligner, "A", capture_start - 100_000, capture_end + 100_000)
+    _feed_tof(aligner, "B", capture_start - 100_000, capture_end + 100_000)
+    _feed_mic(sm, capture_start - 100_000, capture_end + 100_000)
+
+    sm.start_trial()
+    clock.advance(PROMPT_S + 0.001)
+    sm.tick()
+    clock.advance(COUNTDOWN_S + 0.001)
+    sm.tick(device_t_us=capture_start)
+    clock.advance(CAPTURE_S + 0.001)
+    save_event, rest_event = sm.tick(device_t_us=capture_end)
+
+    assert save_event["next_label"] == expected_next
+    assert rest_event["next_label"] == expected_next
+
+    clock.advance(REST_S + 0.001)
+    idle_event = sm.tick()[0]
+    assert idle_event["state"] == "IDLE"
+    assert idle_event["next_label"] == expected_next
+
+    # 而且下一次 start_trial() 真的選到 peek 說的那個詞 -- 不只是欄位對，
+    # 行為也要對。
+    ev = sm.start_trial()
+    assert ev["label"] == expected_next
+
+
+def test_abort_advances_next_label_redo_keeps_it(tmp_path):
+    """dispatcher 特別交代要釘死的：abort 之後 next_label 前進，
+    redo 之後 next_label 不變。"""
+    sm, _, _, _, _ = _make_sm(tmp_path, words=("五", "四", "八"), seed=1)
+    first, second = sm.order[0], sm.order[1]
+
+    sm.start_trial()
+    assert sm.peek_next_label() == first  # 還沒 abort/redo 前，「下一個」就是正在錄的這個
+
+    redo_event = sm.redo()
+    assert redo_event["next_label"] == first, "redo 之後應該還是同一個詞"
+    assert sm.peek_next_label() == first
+
+    sm.start_trial()
+    abort_event = sm.abort()
+    assert abort_event["next_label"] == second, "abort 之後應該前進到下一個詞"
+    assert sm.peek_next_label() == second
+
+
+def test_confirm_keep_and_discard_pending_carry_correct_next_label(tmp_path):
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(
+        tmp_path, words=("五", "四", "八"), seed=1, clock=clock
+    )
+    first, second = sm.order[0], sm.order[1]
+
+    capture_start, capture_end = 1_000_000, 1_000_000 + 100_000
+    _feed_tof(aligner, "A", capture_start - 400_000, capture_end + 300_000)
+    _feed_tof(aligner, "B", capture_start - 400_000, capture_end + 300_000)
+    _feed_mic(sm, capture_start - 400_000, capture_end + 300_000)
+
+    sm.hold_start(device_t_us=capture_start)
+    confirm_event = sm.hold_stop(device_t_us=capture_end)  # too short -> CONFIRM
+    assert confirm_event["label"] == first
+
+    save_event, rest_event = sm.confirm_keep()
+    assert save_event["next_label"] == second
+    assert rest_event["next_label"] == second
+
+
+def test_discard_pending_advances_next_label(tmp_path):
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, words=("五", "四", "八"), seed=1)
+    first, second = sm.order[0], sm.order[1]
+
+    sm.hold_start(device_t_us=1_000_000)
+    sm.hold_stop(device_t_us=1_000_000 + 100_000)  # too short -> CONFIRM
+    idle_event = sm.discard_pending()
+    assert idle_event["next_label"] == second
+
+
+# ---------------------------------------------------------------------------
+# C12 -- first_trial_idx (baseline occupies trial_000)
+
+
+def test_first_trial_idx_avoids_colliding_with_baseline(tmp_path):
+    session_dir = tmp_path
+    h5_path = session_dir / "session.h5"
+    manifest_path = session_dir / "manifest.csv"
+    writer = SessionWriter(h5_path, _full_sample_meta())
+    writer.__enter__()
+    aligner = Aligner()
+    clock_ = FakeClock()
+    sm = TrialStateMachine(
+        ("五", "四"), aligner, writer, h5_path, manifest_path,
+        wear_id=3, mode="quiz", seed=1, clock=clock_, manifest_root=session_dir,
+        first_trial_idx=1,  # trial_000 is the baseline, written separately
+    )
+    assert sm.next_trial_idx == 1
+
+    capture_start, capture_end = 1_000_000, 1_000_000 + int(CAPTURE_S * 1e6)
+    _feed_tof(aligner, "A", capture_start - 100_000, capture_end + 100_000)
+    _feed_tof(aligner, "B", capture_start - 100_000, capture_end + 100_000)
+    _feed_mic(sm, capture_start - 100_000, capture_end + 100_000)
+
+    sm.start_trial()
+    clock_.advance(PROMPT_S + 0.001)
+    sm.tick()
+    clock_.advance(COUNTDOWN_S + 0.001)
+    sm.tick(device_t_us=capture_start)
+    clock_.advance(CAPTURE_S + 0.001)
+    save_event = sm.tick(device_t_us=capture_end)[0]
+
+    assert save_event["idx"] == 1
+    writer.__exit__(None, None, None)
+    with h5py.File(h5_path, "r") as f:
+        assert "trial_001" in f
+        assert "trial_000" not in f  # nobody wrote a baseline in this test, just confirming no collision assumption
+
+
+# ---------------------------------------------------------------------------
+# C12 -- abort/redo must not apply to an already-saved (REST) trial
+
+
+def test_abort_raises_during_rest(tmp_path):
+    """B12 修正的邊界案例：REST 代表這個 trial 已經存檔了，abort/redo
+    不該再套用（否則會讓詞指標被多跳過一次）。"""
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
+
+    capture_start, capture_end = 1_000_000, 1_000_000 + int(CAPTURE_S * 1e6)
+    _feed_tof(aligner, "A", capture_start - 100_000, capture_end + 100_000)
+    _feed_tof(aligner, "B", capture_start - 100_000, capture_end + 100_000)
+    _feed_mic(sm, capture_start - 100_000, capture_end + 100_000)
+
+    sm.start_trial()
+    clock.advance(PROMPT_S + 0.001)
+    sm.tick()
+    clock.advance(COUNTDOWN_S + 0.001)
+    sm.tick(device_t_us=capture_start)
+    clock.advance(CAPTURE_S + 0.001)
+    sm.tick(device_t_us=capture_end)
+    assert sm.state == TrialState.REST
+
+    with pytest.raises(RuntimeError):
+        sm.abort()
+    with pytest.raises(RuntimeError):
+        sm.redo()

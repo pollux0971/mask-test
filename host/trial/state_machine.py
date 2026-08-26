@@ -209,6 +209,22 @@ class TrialStateMachine:
     def next_trial_idx(self) -> int:
         return self._next_trial_idx
 
+    def peek_next_label(self) -> Optional[str]:
+        """C12：唯讀，`start_trial()`/`hold_start()` 沒指定 `label` 時會用
+        哪個詞，**不消耗、不改變** `_order_pos`。附在 `IDLE`/`REST`/`SAVE`
+        事件裡，讓前端能在使用者按下去之前就先顯示提示卡（Hold-to-Record
+        的整個互動前提）。
+
+        詞序是**循環的**（`E05` 一個詞要錄遠超過 8 次，用完整輪詞表會繞回
+        第一個），所以正常情況下永遠有值可回。回 `None` 只有 `_order` 本身
+        是空的這個防禦性分支——建構時 `words` 已經擋過空輸入，正常不會走到
+        這裡；不是「詞序用完了」的意思。呼叫端看到 `None` 不用特別處理成
+        錯誤，就是還沒有下一個詞可以預告。
+        """
+        if not self._order:
+            return None
+        return self._order[self._order_pos % len(self._order)]
+
     # -- 即時資料輸入 -------------------------------------------------
 
     def push_mic(self, t_us: int, rms: float, peak: float) -> None:
@@ -271,18 +287,24 @@ class TrialStateMachine:
                 raise ValueError("離開 CAPTURE 需要 device_t_us 標記 capture 終點")
             self._capture_end_t_us = int(device_t_us)
             self.state = TrialState.SAVE
+            # 詞指標在這裡（資料已經鎖定要落盤的當下）就前進，不是等到
+            # REST->IDLE 才動——這樣 SAVE／REST 的事件才能正確 peek 到「下一個」
+            # 詞，而不是剛存好的這個。`_current_label`（顯示用）維持不變，
+            # 讓 REST 畫面還能顯示「剛才錄的是哪個詞」，直到真的進 IDLE 才清掉。
+            self._order_pos += 1
             events.append(self._do_save(now))
-            events.append(self._enter(TrialState.REST, now))
+            events.append(self._enter(TrialState.REST, now, next_label=self.peek_next_label()))
         else:
             if self.state == TrialState.COUNTDOWN:
                 if device_t_us is None:
                     raise ValueError("離開 COUNTDOWN 需要 device_t_us 標記 capture 起點")
                 self._capture_start_t_us = int(device_t_us)
             next_state = _NEXT_STATE[self.state]
-            events.append(self._enter(next_state, now))
             if next_state == TrialState.IDLE:
-                self._order_pos += 1  # 正常跑完一輪 -> 換下一個詞
                 self._current_label = None
+                events.append(self._enter(next_state, now, next_label=self.peek_next_label()))
+            else:
+                events.append(self._enter(next_state, now))
 
         return events
 
@@ -356,12 +378,14 @@ class TrialStateMachine:
 
     def confirm_keep(self, now: Optional[float] = None) -> dict:
         """使用者在 `CONFIRM` 狀態選擇「還是要留」——把 `hold_stop()` 已經
-        算好、暫存在記憶體的視窗正式落盤。"""
+        算好、暫存在記憶體的視窗正式落盤。跟 `tick()` 的 CAPTURE->SAVE 路徑
+        一樣，落盤當下就前進詞指標，讓 SAVE/REST 事件能正確 peek 下一個詞。"""
         if self.state != TrialState.CONFIRM:
             raise RuntimeError(f"狀態 {self.state.value} 沒有待確認的 trial")
         now = self._clock() if now is None else now
         self.state = TrialState.SAVE
-        return [self._do_save(now), self._enter(TrialState.REST, now)]
+        self._order_pos += 1
+        return [self._do_save(now), self._enter(TrialState.REST, now, next_label=self.peek_next_label())]
 
     def discard_pending(self, now: Optional[float] = None) -> dict:
         """使用者在 `CONFIRM` 狀態選擇「不要」——完全不落盤，**跳過**這個詞
@@ -380,10 +404,10 @@ class TrialStateMachine:
 
     # -- 內部 -----------------------------------------------------
 
-    def _enter(self, state: TrialState, now: float) -> dict:
+    def _enter(self, state: TrialState, now: float, **overrides) -> dict:
         self.state = state
         self._state_entered_at = now
-        return self._event()
+        return self._event(**overrides)
 
     def _event(self, **overrides) -> dict:
         payload = {
@@ -397,11 +421,17 @@ class TrialStateMachine:
         return payload
 
     def _cancel(self, now: Optional[float], advance_word: bool) -> dict:
-        if self.state in (TrialState.IDLE, TrialState.CONFIRM):
-            raise RuntimeError(
-                f"狀態 {self.state.value} 不能用 abort/redo 取消"
-                + ("；用 discard_pending() 代替" if self.state == TrialState.CONFIRM else "")
-            )
+        # REST 排除是 C12 這輪補的：REST 代表這個 trial 已經在 tick() 的
+        # CAPTURE 分支裡 _do_save() 存過、詞指標也已經前進了——這時候呼叫
+        # abort/redo 沒有東西可以「取消」（資料已經是既成事實），而且如果
+        # 誤用還會讓詞指標被重複前進一次（`advance_word=True` 時），安靜地
+        # 多跳過一個詞。事後要棄用已存檔的 trial 用 `mark_current_trial_saved_quality()`。
+        if self.state in (TrialState.IDLE, TrialState.CONFIRM, TrialState.REST):
+            reason = {
+                TrialState.CONFIRM: "；用 confirm_keep()/discard_pending() 代替",
+                TrialState.REST: "；這個 trial 已經存檔了，用 mark_current_trial_saved_quality() 事後改標記",
+            }.get(self.state, "")
+            raise RuntimeError(f"狀態 {self.state.value} 不能用 abort/redo 取消{reason}")
         return self._cancel_to_idle(now, advance_word)
 
     def _cancel_confirm(self, now: Optional[float]) -> dict:
@@ -420,7 +450,7 @@ class TrialStateMachine:
         if advance_word:
             self._order_pos += 1
 
-        event = self._enter(TrialState.IDLE, now)
+        event = self._enter(TrialState.IDLE, now, next_label=self.peek_next_label())
         event["idx"] = idx
         event["aborted_label"] = aborted_label
         return event
@@ -495,6 +525,9 @@ class TrialStateMachine:
         return self._event(
             idx=idx, quality=quality, valid_zone_ratio=valid_zone_ratio,
             drop_count=drop_count, n_frames=int(tof_A.shape[0]),
+            # 呼叫端（tick()/confirm_keep()）已經在呼叫這裡之前把 _order_pos
+            # 前進過了，所以此刻 peek 到的就是「下一個」，不是剛存的這個。
+            next_label=self.peek_next_label(),
         )
 
 

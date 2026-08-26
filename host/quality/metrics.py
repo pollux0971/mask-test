@@ -159,6 +159,7 @@ class QualityAggregator:
         baud: int = 460800,
         window_s: float = DEFAULT_WINDOW_S,
         clock=time.monotonic,
+        host_clock=time.time,
     ):
         self.thresholds = thresholds
         self.drop_tracker = drop_tracker
@@ -166,6 +167,14 @@ class QualityAggregator:
         self.window_s = window_s
         self.capacity_bytes_per_s = baud / BITS_PER_BYTE_ON_WIRE
         self._clock = clock
+        # Two clocks, deliberately. Sliding windows use the monotonic one
+        # (an NTP step must not make a window suddenly span an hour), while
+        # clock alignment samples use the wall clock -- because B05's PING
+        # timestamps do, and a fit fed from both at once sees the offset
+        # between them as a colossal slope. That is not hypothetical: it
+        # produced clock_slope = 5.9e7 the first time these two were wired
+        # together (B04 alone had been self-consistent, so nothing showed).
+        self._host_clock = host_clock
         self._lock = threading.Lock()
 
         self._zones = deque()        # (t, n_valid, dim)
@@ -255,7 +264,7 @@ class QualityAggregator:
         t_us = event.get("t_us")
         if t_us is None or not event.get("has_timestamp"):
             return
-        self.clock_aligner.add_sample(t_us, int(now * 1e6))
+        self.clock_aligner.add_sample(t_us, int(self._host_clock() * 1e6))
 
     # -- metrics --------------------------------------------------------
 

@@ -337,7 +337,8 @@ def test_no_alarm_before_any_heartbeat(thresholds):
 
 def test_clock_resid_needs_enough_buckets(thresholds):
     from host.clock.align import ClockAligner
-    agg = QualityAggregator(thresholds, clock_aligner=ClockAligner(), clock=FakeClock())
+    agg = QualityAggregator(thresholds, clock_aligner=ClockAligner(), clock=FakeClock(),
+                            host_clock=FakeClock())
     agg.observe_mic({"type": "mic", "rms": 10, "t_us": 0, "has_timestamp": True})
     assert agg.snapshot()["metrics"]["clock_resid"]["value"] is None
 
@@ -346,7 +347,10 @@ def test_clock_resid_reported_in_seconds(thresholds):
     from host.clock.align import ClockAligner
     clock = FakeClock(0.0)
     aligner = ClockAligner()
-    agg = QualityAggregator(thresholds, clock_aligner=aligner, clock=clock)
+    # host_clock is the wall clock in production; here it is the same fake
+    # so the fit sees a clean linear relationship.
+    agg = QualityAggregator(thresholds, clock_aligner=aligner, clock=clock,
+                            host_clock=clock)
     # A clean, perfectly linear link: device and host tick together with a
     # fixed offset, so the residual should be ~0.
     for i in range(20):
@@ -363,7 +367,8 @@ def test_events_without_timestamps_are_not_fed_to_the_aligner(thresholds):
     """v1 lines carry no t_us; feeding them would poison the fit."""
     from host.clock.align import ClockAligner
     aligner = ClockAligner()
-    agg = QualityAggregator(thresholds, clock_aligner=aligner, clock=FakeClock())
+    agg = QualityAggregator(thresholds, clock_aligner=aligner, clock=FakeClock(),
+                            host_clock=FakeClock())
     for _ in range(10):
         agg.observe_mic({"type": "mic", "rms": 10, "has_timestamp": False})
     assert aligner.n_buckets == 0

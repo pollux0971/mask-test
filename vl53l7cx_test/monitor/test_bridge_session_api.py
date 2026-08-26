@@ -354,3 +354,15 @@ def test_baseline_meta_carries_the_measured_clock_block(rig):
         assert meta["session_start_rtt_min_us"] >= 0
     else:
         assert not meta["clock_sync_confirmed"]
+
+    # B04's regression must be plausible. This is the guard for the two-host
+    # -clock bug: the aligner was being fed monotonic timestamps while B05
+    # fed it wall-clock ones, and the fit read the gap between the two epochs
+    # as slope. It produced clock_slope = 5.9e7 and a residual of 1e15 us --
+    # numbers that are obviously wrong once seen, and completely invisible
+    # while only one of the two sources was wired up.
+    if meta["clock_residual_p95"] != -1:
+        assert 0.9 < meta["clock_slope"] < 1.1, meta["clock_slope"]
+        assert meta["clock_residual_p95"] < 5000, (
+            f"residual {meta['clock_residual_p95']} us exceeds B04's 5 ms bound"
+        )
