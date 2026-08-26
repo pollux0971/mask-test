@@ -225,6 +225,54 @@ def _pair_zones(raw_d, raw_s):
     return distance, signal, valid, pair_violations
 
 
+def _parse_ambient(parts: list[str]) -> dict | None:
+    """`$A,<A|B>,<seq>,<t_us>,<dim>,<a0>..<aN>`（CONTRACTS.md §1.1.3）。
+
+    跟 `$T` 幾乎一樣的外殼（sensor/seq/t_us/dim 自描述），但只有一組值
+    （`ambient_per_spad / 100`），沒有 signal 那組——所以也沒有 `$T` 的
+    「d/s 配對，一邊 -1 兩邊都當無效」那件事：每個 zone 自己的 `-1` 就是
+    自己的無效標記，不需要跟另一個欄位比對，不可以照抄 `_pair_zones()`。
+    """
+    if len(parts) < 5:
+        return None
+    sensor = parts[1].strip()
+    if sensor not in ("A", "B"):
+        return None
+    seq = _u32(parts[2])
+    t_us = _nonneg_i64(parts[3])
+    dim = _to_int(parts[4])
+    if seq is None or t_us is None or dim not in VALID_ZONE_COUNTS:
+        return None
+
+    values = parts[5:]
+    if len(values) < dim:
+        return None  # 被截斷、或兩行黏在一起
+    extra = values[dim:]              # 未來新增的尾端欄位，忽略但不丟棄
+    values = values[:dim]
+
+    nums = [_i16(v) for v in values]
+    if any(n is None for n in nums):
+        return None
+
+    valid = [n >= 0 for n in nums]
+    ambient = [n if ok else None for n, ok in zip(nums, valid)]
+
+    return {
+        "type": "ambient",
+        "proto": 2,
+        "sensor": sensor,
+        "seq": seq,
+        "t_us": t_us,
+        "has_timestamp": True,
+        "dim": dim,
+        "ambient": ambient,            # 無效 zone 為 None
+        "valid": valid,
+        "n_valid": sum(valid),
+        "raw_ambient": nums,           # 原始值（含 -1），給要自己判斷的下游
+        "extra": extra,
+    }
+
+
 def _parse_mic(parts: list[str]) -> dict | None:
     """`$M,<seq>,<t_us>,<rms:i16>,<peak:i16>`
 
@@ -393,6 +441,7 @@ def _parse_record(parts: list[str]) -> dict | None:
 
 _HANDLERS = {
     "$T": _parse_tof,
+    "$A": _parse_ambient,
     "$M": _parse_mic,
     "$F": _parse_mel,
     "$H": _parse_heartbeat,
@@ -432,7 +481,7 @@ V1_TOF_SIDES = (4, 8)
 
 # v1 專屬與 v2 專屬的行前綴。`$STATUS` / `$REC` 兩版格式相同，是共用的。
 V1_ONLY_PREFIXES = frozenset({"$TOF", "$MIC"})
-V2_ONLY_PREFIXES = frozenset({"$T", "$M", "$F", "$H"})
+V2_ONLY_PREFIXES = frozenset({"$T", "$A", "$M", "$F", "$H"})
 SHARED_PREFIXES = frozenset({"$STATUS", "$REC"})
 
 
@@ -540,7 +589,7 @@ def parse_line(line: str | bytes | bytearray) -> dict | None:
 
     回傳：
       * `dict` —— 認得且欄位合法。`type` 是
-        `tof` / `mic` / `mel` / `heartbeat` / `status` / `record`。
+        `tof` / `ambient` / `mic` / `mel` / `heartbeat` / `status` / `record`。
       * `None` —— 不是 `$` 開頭（裝置的 log、base64 payload、空行），
         或是 `$` 開頭但畸形（欄位數不對、整數解析失敗、被截斷、亂碼）。
 

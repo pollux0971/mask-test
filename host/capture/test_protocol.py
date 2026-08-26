@@ -36,6 +36,8 @@ TOF_B = (
     "300,450,600,750,80,120,90,60,900,1100,1300,1500,1600,1700,1800,1900,"
     "110,95,130,75,88,70,60,50,45,40,35,30,20,15,10,5"
 )
+# 4x4，感測器 A：ambient_per_spad/100，zone 3 無效（§1.1.3）
+AMB_A = "$A,A,42,1737863421123456,16,120,80,95,-1,150,110,130,88,200,175,160,140,300,260,220,190"
 MIC_QUIET = "$M,3150,1737863421124800,12,340"          # 接近靜音
 MIC_CLAP = "$M,3151,1737863421126400,28901,32767"      # 拍手，16-bit 滿刻度
 HB_OK = "$H,1737863421130000,0,0,0,142300,42"          # 一切正常
@@ -79,6 +81,82 @@ def test_parse_tof_b_all_valid():
     assert e["n_valid"] == 16
     assert all(e["valid"])
     assert None not in e["distance"] and None not in e["signal"]
+
+
+# ------------------------------------------------------- 1.5 `$A`（ambient）
+
+
+def test_parse_ambient_a_extreme_values():
+    e = parse_line(AMB_A)
+    assert e["type"] == "ambient"
+    assert e["proto"] == 2
+    assert e["sensor"] == "A"
+    assert e["seq"] == 42
+    assert e["t_us"] == 1737863421123456
+    assert e["has_timestamp"] is True
+    assert e["dim"] == 16
+    assert len(e["ambient"]) == 16
+    assert e["ambient"][0] == 120
+    assert e["ambient"][3] is None        # -1 -> 無效，跟 $T 一樣是 None 不是 -1
+    assert e["valid"][3] is False
+    assert e["n_valid"] == 15
+    assert e["raw_ambient"][3] == -1      # 原始值保留給要自己判斷的下游
+    assert e["extra"] == []
+
+
+def test_parse_ambient_no_pairing_with_signal():
+    """`$A` 沒有 signal 欄位可以配對——只有一組值，不能照抄 `_pair_zones()`
+    那套「d/s 一邊 -1 兩邊都當無效」的邏輯（`$A` 根本沒有第二個欄位）。"""
+    e = parse_line(AMB_A)
+    assert "signal" not in e
+    assert "pair_violations" not in e
+
+
+def test_parse_ambient_sensor_b():
+    line = "$A,B," + AMB_A.split(",", 2)[2]
+    e = parse_line(line)
+    assert e["sensor"] == "B"
+
+
+@pytest.mark.parametrize("line", [
+    pytest.param("$A,A,42,1737863421123456,16," + ",".join(["1"] * 15), id="amb-one-short"),
+    pytest.param("$A,C,42,1737863421123456,16," + ",".join(["1"] * 16), id="amb-bad-sensor"),
+    pytest.param("$A,A,42,1737863421123456,17," + ",".join(["1"] * 17), id="amb-bad-dim"),
+])
+def test_ambient_truncated_or_malformed_is_rejected(line):
+    assert parse_line(line) is None
+
+
+def test_ambient_trailing_fields_are_ignored_not_fatal():
+    """§1.1 前向相容通則：多出來的尾端欄位忽略，但不丟棄。"""
+    e = parse_line(AMB_A + ",999")
+    assert e is not None and e["type"] == "ambient"
+    assert e["extra"] == ["999"]
+    assert len(e["ambient"]) == 16        # 多出來的那個沒被誤當成第 17 個 zone
+
+
+def test_ambient_is_v2_only_and_triggers_version_mismatch_without_status():
+    """`$A` 是 v2 專屬前綴——沒談定版本時預設當 v2 解，版本不符時要跟其他
+    v2 資料行一樣被擋掉，不能繞過版本協商悄悄混進去。"""
+    p = ProtocolParser()
+    e = p.feed(AMB_A)
+    assert e is not None and e["type"] == "ambient"
+    assert p.stats.v2_lines == 1
+
+    p2 = ProtocolParser()
+    p2.feed("$STATUS,res=4,proto=3,fw=deadbee")   # 版本不符
+    assert p2.feed(AMB_A) is None
+    assert p2.stats.dropped_version_mismatch == 1
+    assert p2.stats.malformed == 0
+
+
+def test_ambient_counts_as_parsed_not_malformed_in_parser_stats():
+    p = ProtocolParser()
+    p.feed(STATUS_V2)
+    p.feed(AMB_A)
+    assert p.stats.parsed == 2
+    assert p.stats.malformed == 0
+    assert p.stats.malformed_by_prefix == {}
 
 
 def test_parse_mic_full_scale():
