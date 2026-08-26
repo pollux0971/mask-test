@@ -135,6 +135,12 @@
   color: var(--status-good);
   font-size: 0.6875rem;
 }
+.validate-grouping-blocked a,
+.validate-grouping-ok a,
+.pending-note a {
+  color: inherit;
+  text-decoration: underline;
+}
 
 .validate-crosschecks-area,
 .validate-extras-area {

@@ -371,11 +371,12 @@ registerMode("validate", (() => {
     `;
   }
 
-  // 🔴 esp-mask-test-ad 明確要求：`ungrouped_single_group`（要求了分組驗證
-  // 但只戴一次做不到）**這句話不能被摺起來或縮小**——沒看到這句話，
-  // 委員會以為分組驗證真的做了，而 7c [c32fd9] 實測證明沒分組會讓準確率
-  // 灌水 29 個百分點。所以這裡直接輸出、跟 blocking banner 同等視覺份量，
-  // 不用 <details>。
+  // D19 消融的每個模態結果（run_ablation() 內部呼叫 run_permutation_test()）
+  // 也帶 grouping 欄位，但讀 analysis/run_all.py 確認 run_ablation() 從來
+  // 沒有把 wear_id 當 groups 傳進去（設計上如此：D19 問的是「第二顆 ToF
+  // 有沒有用」，不是分類顯著性本身）——所以這裡的 grouping 永遠是
+  // "ungrouped_no_groups_given"，這個分支多半用不到，留著只是防禦性的
+  // （哪天 D19 也接了 groups，不用改這裡）。
   function groupingHtml(result) {
     if (result.grouping === "ungrouped_single_group") {
       return `<div class="validate-grouping-blocked">🔴 分組驗證無法進行：${mdBold(result.grouping_note || "")}</div>`;
@@ -384,6 +385,33 @@ registerMode("validate", (() => {
       return `<div class="validate-grouping-ok">✅ 已依 wear_id 分組驗證（${result.n_groups} 組），避免組內洩漏灌水。</div>`;
     }
     // "ungrouped_no_groups_given" -- 沒人要求過分組，不是缺口，不用講。
+    return "";
+  }
+
+  // 🔴 這才是使用者要的「這不是運氣」+「分組驗證做了沒有」證據的真正
+  // 來源：analysis/run_all.py 的 run_d18_permutation()，回傳給 extras 的
+  // `d18_grouping` 只是分組狀態字串本身（"grouped"/"ungrouped_single_
+  // group"/"ungrouped_no_groups_given"），真正的 p 值/信賴區間/效果量
+  // 數字只寫進 d18_permutation.md（side report），JSON 裡沒有結構化欄位
+  // ——讀 run_d18_permutation() 原始碼確認過，不是猜的。所以這裡顯示狀態
+  // 本身（跟 must-pass blocking 同等視覺份量，尤其 single_group 那句話
+  // 不能摺起來），數字用連結導去那份報告，不是編造假欄位硬塞進來。
+  function d18GroupingHtml(grouping, runId) {
+    const reportLink = runId
+      ? `<a href="/verify/reports/${runId}/d18_permutation.md" target="_blank" rel="noopener">查看完整 p 值／信賴區間／效果量報告 →</a>` : "";
+    if (grouping === "ungrouped_single_group") {
+      return `<div class="validate-grouping-blocked">🔴 D18 置換檢定：分組驗證無法進行——這批資料只有
+        1 個 wear_id（例如只戴過一次），這一輪的準確率與 p 值可能被
+        同一次戴上的組內洩漏灌水。${reportLink}</div>`;
+    }
+    if (grouping === "grouped") {
+      return `<div class="validate-grouping-ok">✅ D18 置換檢定：已用 wear_id 做分組驗證
+        （StratifiedGroupKFold），同一次戴上的樣本不會同時出現在訓練與
+        測試集。${reportLink}</div>`;
+    }
+    if (grouping === "ungrouped_no_groups_given") {
+      return `<div class="pending-note">D18 置換檢定：未做分組驗證（沒有提供 wear_id）。${reportLink}</div>`;
+    }
     return "";
   }
 
@@ -409,8 +437,15 @@ registerMode("validate", (() => {
     }
     const d19 = extras.d19_dual_matrix;
     const d16 = extras.d16_gain;
+    const d18 = extras.d18_grouping;
     extrasEl.innerHTML = `
-      <div class="section-label">補充分析（D16 互資訊 / D19 消融，側邊實驗，非五張主卡的結論）</div>
+      <div class="section-label">補充分析（D16/D18/D19，側邊實驗，非五張主卡的結論）</div>
+      ${d18 ? `
+        <div class="validate-extras-block">
+          <div class="validate-extras-title">D18 置換檢定：這批資料的分類顯著性可信嗎？</div>
+          ${d18GroupingHtml(d18, lastRun.run_id)}
+        </div>
+      ` : ""}
       ${d19 ? `
         <div class="validate-extras-block">
           <div class="validate-extras-title">D19 消融：雙 ToF 合併是否比單顆更好
@@ -427,8 +462,8 @@ registerMode("validate", (() => {
           <span class="mono">${typeof d16 === "number" ? d16.toFixed(4) : d16}</span>
         </div>
       ` : ""}
-      ${!d19 && d16 == null && !unknownExtrasHtml(extras)
-        ? `<div class="pending-note">這輪沒有足夠特徵跑 D16/D19（需要至少 2 個類別的資料）。</div>` : ""}
+      ${!d18 && !d19 && d16 == null && !unknownExtrasHtml(extras)
+        ? `<div class="pending-note">這輪沒有足夠特徵跑 D16/D18/D19（需要至少 2 個類別的資料）。</div>` : ""}
       ${unknownExtrasHtml(extras)}
     `;
   }
@@ -440,7 +475,7 @@ registerMode("validate", (() => {
   // 分組警語），但如果以後 extras 多一把 d16/d19 以外的鑰匙，不該無聲
   // 消失 -- 通用列出來，總比讀者以為「這裡就只有這兩個」來得誠實。
   function unknownExtrasHtml(extras) {
-    const known = new Set(["d19_dual_matrix", "d16_gain"]);
+    const known = new Set(["d19_dual_matrix", "d16_gain", "d18_grouping"]);
     const rest = Object.keys(extras).filter((k) => !known.has(k));
     if (!rest.length) return "";
     const rows = rest.map((k) => {
