@@ -958,6 +958,9 @@ registerMode("monitor", (() => {
   return {
     init(root) {
       root.innerHTML = `
+        <div class="stale-data-banner" data-stale-banner style="display:none">
+          ⚠ 資料已停止 —— 畫面停在斷線前最後收到的值，不是即時資料
+        </div>
         <div class="section-label">ToF depth / signal grids
           <span class="assumed-badge" title="zone 的實體排列方式（row-major）是未驗證的假設，見 D11 -- 距離與訊號兩種畫面皆適用">
             ⚠ zone 佈局 row-major — ASSUMED, unverified（距離／訊號皆適用）

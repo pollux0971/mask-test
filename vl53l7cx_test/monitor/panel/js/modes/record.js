@@ -260,7 +260,7 @@ registerMode("record", (() => {
   let speakingMode = "normal"; // B21: separate axis from `mode` -- one of SPEAKING_MODES
   let currentSession = null;
   let baselineStartedAt = null; // performance.now(), for the local pacing countdown
-  let baselineWaitTimer = null;
+  let baselineCaptureTimer = null; // fires requestBaselineCapture() once the local countdown ends
   let baselineOutcome = null; // last BaselineOutcome.to_dict(), or null
 
   // --- C12: trial screen state ---
@@ -432,10 +432,22 @@ registerMode("record", (() => {
       renderTargetCheck(currentSession);
       enterBaselineScreen();
     } catch (err) {
-      // Expected right now (route not wired yet, see file-top note).
-      setFormError(
-        "無法連上 /session/start（後端路由尚未接上，見完成回報「需要人工驗證的項目」）：" + err.message
-      );
+      // This try block also covers renderTargetCheck()/enterBaselineScreen()
+      // (run right after a *successful* fetch), so a real JS bug in either
+      // of those landed here too and got mislabeled as "backend not
+      // connected" -- a fetch() network failure is specifically a
+      // TypeError; anything else is a real code bug, not a connectivity
+      // issue, and saying so (plus logging the full error/stack) matters --
+      // ca's audit lost real time to exactly this ambiguity ("後端路由尚未接上"
+      // reads as one of this project's many known-unwired routes, so a real
+      // bug hiding behind it goes uninvestigated). Not a full
+      // error-handling rewrite, just telling the two cases apart.
+      console.error("[record] submitForm failed:", err);
+      if (err instanceof TypeError) {
+        setFormError("無法連上 /session/start（後端路由尚未接上，見完成回報「需要人工驗證的項目」）：" + err.message);
+      } else {
+        setFormError("送出後處理失敗（程式錯誤，不是連線問題，已印出完整訊息到 console）：" + err.message);
+      }
     } finally {
       els.submitBtn.disabled = false;
       els.submitBtn.textContent = "開始 Session";
@@ -476,16 +488,48 @@ registerMode("record", (() => {
     updateBaselineCountdown();
     showScreen("baseline");
 
-    clearTimeout(baselineWaitTimer);
-    baselineWaitTimer = setTimeout(() => {
-      // No real {"type":"session","state":"baseline",...} SSE event showed
-      // up -- almost certainly because bridge_server.py doesn't emit it yet
-      // (see file-top note). Say so plainly instead of leaving a countdown
-      // frozen with no explanation.
-      if (screen === "baseline" && baselineOutcome === null) {
-        els.baselineWaitingNote.style.display = "block";
+    // The 30s is a local pacing countdown for the person ("hold still for
+    // this long"); the actual capture is a single POST once that's done --
+    // bridge_server.py's capture_session_baseline() looks at the device
+    // clock's already-buffered last BASELINE_DURATION_S, it doesn't stream
+    // progress. Missing this call entirely (this screen used to just show
+    // the countdown UI and never call anything) is exactly the "stuck on
+    // baseline forever, no error, looks like it's still counting down" bug
+    // ca's audit caught.
+    clearTimeout(baselineCaptureTimer);
+    baselineCaptureTimer = setTimeout(requestBaselineCapture, BASELINE_DURATION_S * 1000);
+  }
+
+  async function requestBaselineCapture() {
+    if (screen !== "baseline") return; // navigated away before the countdown finished
+    try {
+      const res = await fetch("/session/baseline", { method: "POST" });
+      const body = await res.json().catch(() => ({}));
+      if (res.status === 200 || res.status === 422) {
+        // Both carry a real BaselineOutcome -- renderBaselineOutcome()
+        // itself branches on body.ok (422 = quality gate failed, still a
+        // real, fully-computed outcome, not an error to retry).
+        renderBaselineOutcome(body);
+        return;
       }
-    }, BASELINE_WAIT_GRACE_MS);
+      if (res.status === 409) {
+        // "not enough buffered data yet" -- device clock hasn't caught up
+        // to a full BASELINE_DURATION_S, or a brief link hiccup. Not a hard
+        // failure: retry shortly instead of stranding the person here with
+        // no explanation (see file-top note on this exact bug).
+        showBaselineWaiting(body.error || "尚未收集到足夠的裝置資料，重試中…");
+        baselineCaptureTimer = setTimeout(requestBaselineCapture, BASELINE_POST_RETRY_MS);
+        return;
+      }
+      showBaselineWaiting(body.error || `送出失敗：HTTP ${res.status}`);
+    } catch (err) {
+      showBaselineWaiting("無法連上 /session/baseline：" + err.message);
+    }
+  }
+
+  function showBaselineWaiting(text) {
+    els.baselineWaitingNote.textContent = text;
+    els.baselineWaitingNote.style.display = "block";
   }
 
   function updateBaselineCountdown() {
@@ -502,7 +546,6 @@ registerMode("record", (() => {
       baselineStartedAt = performance.now() - progress.elapsed_s * 1000; // resync to server's clock
     }
     els.baselineWaitingNote.style.display = "none";
-    clearTimeout(baselineWaitTimer);
 
     const renderSigma = (arr, el) => {
       if (!Array.isArray(arr)) {
@@ -553,17 +596,14 @@ registerMode("record", (() => {
     els.baselineUnstableBox.style.display = "block";
   }
 
-  async function retryBaseline() {
-    // No documented retry endpoint exists yet either (same gap as the rest
-    // of the baseline wire format) -- proposed as POST /session/baseline/retry.
-    // Until it's wired, this just re-arms the local countdown/waiting UI so
-    // the "可重錄" affordance is visibly real even though the network call
-    // will 404; see completion report.
-    try {
-      await fetch("/session/baseline/retry", { method: "POST" });
-    } catch {
-      // expected for now
-    }
+  function retryBaseline() {
+    // An unstable outcome means the *previous* 30s window had real motion/
+    // noise in it -- re-POSTing against that same buffered window would
+    // just fail again for the same reason. There's no separate "retry"
+    // endpoint (grepped: only POST /session/baseline exists); re-running
+    // the normal 30s countdown gives the person a fresh still window to
+    // capture, then requestBaselineCapture() calls the same real endpoint
+    // again once it's elapsed.
     enterBaselineScreen();
   }
 
@@ -915,10 +955,15 @@ registerMode("record", (() => {
   function renderPreview(trial) {
     els.previewTitle.textContent = `#${trial.idx} ${trial.label} — ${trial.quality} · ${trial.n_frames} 幀`;
     els.previewHeatmaps.innerHTML = "";
-    const mu = baselineOutcome ? baselineOutcome.baseline_mu_A : null;
-    const sigma = baselineOutcome ? baselineOutcome.baseline_sigma_A : null;
-    const muB = baselineOutcome ? baselineOutcome.baseline_mu_B : null;
-    const sigmaB = baselineOutcome ? baselineOutcome.baseline_sigma_B : null;
+    // bridge_server.py's real POST /session/baseline response (_baseline_payload())
+    // uses mu_A/sigma_A/mu_B/sigma_B, not baseline_mu_A/etc -- this file's
+    // earlier C13 work assumed the latter (BaselineOutcome.to_dict()'s own
+    // naming) since baselineOutcome was only ever populated by hand-built
+    // test events before this story's fix actually wired the real endpoint.
+    const mu = baselineOutcome ? baselineOutcome.mu_A : null;
+    const sigma = baselineOutcome ? baselineOutcome.sigma_A : null;
+    const muB = baselineOutcome ? baselineOutcome.mu_B : null;
+    const sigmaB = baselineOutcome ? baselineOutcome.sigma_B : null;
     renderPreviewHeatmap(els.previewHeatmaps, "Sensor A", trial.preview.tofA, mu, sigma);
     renderPreviewHeatmap(els.previewHeatmaps, "Sensor B", trial.preview.tofB, muB, sigmaB);
     renderPreviewWaveform(els.previewWaveform, trial.preview.mic);
@@ -1271,10 +1316,7 @@ registerMode("record", (() => {
             <div class="baseline-bar-track">
               <div class="baseline-bar-fill" data-baseline-elapsed-bar></div>
             </div>
-            <div class="baseline-waiting-note" data-baseline-waiting style="display:none">
-              尚未收到伺服器的即時基線進度事件（後端路由/SSE 尚未接上，見完成回報）——
-              倒數是本地估計，不是真實擷取進度。
-            </div>
+            <div class="baseline-waiting-note" data-baseline-waiting style="display:none"></div>
             <div class="live-sigma">
               <div>Sensor A 即時 σ (mm)：<span class="mono" data-live-sigma-a>—</span></div>
               <div>Sensor B 即時 σ (mm)：<span class="mono" data-live-sigma-b>—</span></div>
