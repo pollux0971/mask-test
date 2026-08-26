@@ -1341,6 +1341,20 @@ registerMode("quiz", (() => {
       setMarkingMode("posthoc");
       renderMatrix();
       renderStats();
+
+      // Projector mode (C25, shell.js) flips html[data-projector-mode] and
+      // scales every DOM font-size via CSS -- canvas text/cell sizing
+      // doesn't participate in that at all (see currentMatrixCellSize()'s
+      // comment above), so without this the matrix would silently keep
+      // its old size until the next unrelated redraw (a new recognize
+      // result), which reads as "the toggle didn't work" rather than "it
+      // worked, just hasn't repainted yet" -- worse than not scaling at
+      // all. Watching the attribute directly (not shell.js's toggle
+      // function, which isn't ours to touch) keeps this decoupled from
+      // shell.js's own code.
+      new MutationObserver(renderMatrix).observe(document.documentElement, {
+        attributes: true, attributeFilter: ["data-projector-mode"],
+      });
     },
 
     onData(evt) {

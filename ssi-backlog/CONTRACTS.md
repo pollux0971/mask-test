@@ -357,6 +357,9 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
     distance_mm, angle_deg, ambient, notes,
     fw_sha, proto_version, tof_dim,
     sensors_enabled,        # "AB" | "A" | "B" —— 擷取當下哪幾顆在 ranging
+    sensors_enabled_confirmed,  # bool，選填，跟 sensors_enabled 成對；幾乎
+                                 # 永遠是 False——見 §4.1.2，這是主機端的指令
+                                 # 不是裝置確認過的狀態
     source,                 # live | mock | replay-log | replay-session —— 見下
     clock_slope, clock_offset, clock_residual_p95,
     clock_drift_us, clock_drift_ppm, clock_sync_span_us, clock_sync_confirmed,

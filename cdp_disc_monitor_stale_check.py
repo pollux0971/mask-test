@@ -22,7 +22,7 @@ async def main():
             return v.get("value") if "value" in v else v
         await call("Page.enable")
         await call("Page.navigate", {"url": f"http://127.0.0.1:{BRIDGE_HTTP_PORT}/panel/#/monitor"})
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(3.0)
         print("sidebar Hz before:", await ev("document.querySelector('[data-status-fps]')?.textContent"))
         print("panel Hz A before:", await ev("document.querySelector('[data-rate=\"A\"]')?.textContent"))
         pids = subprocess.run(["pgrep", "-f", f"http-port {BRIDGE_HTTP_PORT}"], capture_output=True, text=True).stdout.split()
