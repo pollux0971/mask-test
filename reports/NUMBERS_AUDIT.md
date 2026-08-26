@@ -4,6 +4,10 @@
 > 從 7% 升到 15%」）。這份稽核逐一核對 `reports/` 底下十四份報告裡
 > 重複出現的量，確認哪些一致、哪些不一致，以及不一致時是「兩種方法都對」
 > 還是「其中一份過時了」——兩者處理方式不同，見下方各項。
+>
+> **第二輪（同一天，後續）**：同樣的問題又發生第三次，這次是使用者要
+> 拿去口試的 `DEFENSE_QA.md`。範圍延伸到當天新產生、涉及九份報告的
+> 一批數字，見文末「第二輪稽核」一節。
 
 ## 方法
 
@@ -144,6 +148,11 @@
 沒有修改任何被判定為「方法不同但都對」的數字（`D09` vs `D22` 舊方法
 掃描的小數點差異）——那是兩個獨立實驗的正常抽樣雜訊，不是錯誤。
 
+**第二輪（今天新增的數字）：這輪只編輯這份檔案本身**，`STATISTICAL_
+RIGOR.md`／`DEFENSE_QA.md`／`ALIGNMENT_MISMATCH.md` 等九份報告即使
+查到問題也只寫進上面「第二輪稽核」那節回報，沒有動手改——邊界這次
+明確只開放 `reports/NUMBERS_AUDIT.md`。
+
 ---
 
 ## 回報給調度員的項目（三份不能碰的檔案裡發現的問題）
@@ -186,3 +195,119 @@ pytest 行程會讓時間敏感測試假性失敗，所以只做了不執行測�
 唯獨 n=40 不是精確的 0（雖然仍然很低）。這是小地方，不影響任何決策，
 但嚴格來說不是「n≥30 全部是 0」，是「n≥30 大致落在 0~1.1%」。一併回報，
 是否需要改由你判斷。
+
+---
+
+## 第二輪稽核：今天新增的數字（`0.917`/`0.625`、時長洩漏、模態尺度、
+`D21` 可分性、`11` 個檢定、真板子 RMS）
+
+> 這輪範圍是今天新產生、散在 `STATISTICAL_RIGOR.md`、`DEFENSE_QA.md`、
+> `ALIGNMENT_MISMATCH.md`、`MODALITY_SCALE_AUDIT.md`、
+> `DISTANCE_COMPARISON.md`、`D21_signal_ablation.md`、
+> `THRESHOLD_DIRECTIONS.md`、`FIRST_REAL_DATA.md`、`E01_bringup_checklist.md`
+> 九份報告裡的數字。**這輪只有 `reports/NUMBERS_AUDIT.md` 可以編輯**——
+> 其他八份即使查到問題也只回報、不動手，跟這份稽核的上一輪處理
+> `HANDOFF.md`/`C_monitor_perf.md`/`E2E_PIPELINE.md` 是同一個原則，
+> 只是這輪禁改清單更長。
+
+### ✅ 一致：`0.917`/`0.625`（分組驗證灌水）
+
+`STATISTICAL_RIGOR.md`（"同一批資料，未分組準確率 0.917，按 wear_id
+分組後 0.625"）與 `DEFENSE_QA.md` Q6（"灌水幅度是 29 個百分點
+（0.917 → 0.625）"）逐字一致，同一組合成資料實測。
+
+### ✅ 一致：`5.18x`/`1.28x`（ToF/Mel 模態尺度）與拒識率 `66.7%`/`33.3%`/`46.7%`
+
+`MODALITY_SCALE_AUDIT.md` 的 `cvn=False`（現行預設）那一列——`5.18x`、
+cosine 正確拒識率 `66.7%`、euclidean 正確拒識率 `33.3%`——跟
+`DISTANCE_COMPARISON.md`「發現 2」表格的對應欄位逐字對得上（同一組
+合成資料的同一次量測，`MODALITY_SCALE_AUDIT.md` 只是把它跟 `cvn=True`
+的新實驗並排列出）。`cvn=True` 那一列（`1.28x`、euclidean 拒識率回升到
+`46.7%`）是 `MODALITY_SCALE_AUDIT.md` 這次新做的實驗，`DISTANCE_
+COMPARISON.md` 目前沒有這個組態不是矛盾，是後者還沒收錄這個新結果——
+不需要回填，`MODALITY_SCALE_AUDIT.md` 自己已經清楚標示這是延伸實驗。
+`DEFENSE_QA.md` 引用的 `5.18` 倍也跟這兩份一致。
+
+### ✅ 一致：`11` 個檢定（`D18` 2 + `D19` 6 + `D21` 3）與 p 下限 `0.005`
+
+`STATISTICAL_RIGOR.md` 第 1 節與 `DEFENSE_QA.md` Q6 對「11 個檢定」的
+拆解逐字一致（`D18` 的 `all`/`tof_only` 2 個、`D19` 的
+`all`/`mel`/`tof_combined`/`tof_l`/`tof_r`/`random_channel` 6 個、`D21`
+3 個），跟 `analysis/experiments/d19_ablation_suite.py`（今天稍早親自
+確認過）的 6 個 `_run()` 呼叫也對得上，不是憑印象數的。置換次數 200
+時 p 下限 `1/201≈0.005`，兩份報告數字一致。
+
+### ✅ 一致：真板子 RMS `4-6` 與門檻 `300`
+
+`E01_bringup_checklist.md`、`FIRST_REAL_DATA.md`、`THRESHOLD_DIRECTIONS.md`
+（我自己這輪寫的，今天稍早）三份對真板子實測 RMS 4-6、
+`config/quality_thresholds.json` 的 `noise_floor.green=300` 描述一致。
+**這是一個知識正確傳遞的正面案例**：`THRESHOLD_DIRECTIONS.md` 設計
+「只抓恆為 0、不訂 >0 的下限」這個判準，直接引用了 `E01`/
+`FIRST_REAL_DATA` 記錄的這個真實案例，沒有自己重新假設一個門檻。
+
+### 🔴 已過時：`DEFENSE_QA.md` 附錄問答表「時長洩漏還沒修」
+
+附錄表格（文末，上台前快速掃一眼用的那張）第 223 行寫：
+
+> 「樣板品質怎麼確保？ | ⚠️ 對齊邏輯已修好，時長洩漏還沒修，靠人工控制」
+
+但 `ALIGNMENT_MISMATCH.md` 開頭明白寫著「✅ 已修（調度員核准後）：VAD
+裁切」，並附上實測：同一詞不同長度的最大距離從 0.9985 降到 0.3069，
+「長度效應／詞義效應」比例從 99.7%（幾乎打平）降到 30.7%，`464` 個
+測試通過。**這不是「完全沒做」，是「做了、量過、有真的改善，但沒有
+完全消除」**——`ALIGNMENT_MISMATCH.md` 自己也誠實寫「30.7% 仍然不是
+0，現階段仍建議人工控制時長」，所以「靠人工控制」這個**建議本身**
+沒有錯，錯的是「時長洩漏還沒修」這句話本身，讓人以為連
+`speech_window` 這個裁切都還沒做。
+
+比較細看的話，Q10 完整版的回答（附錄表格上方那一節，第 189-207 行）
+其實已經比附錄表格精確一些——它有提到「`live_pipeline.py` 已經加了
+一個可選的 `speech_window` VAD 裁切參數作為長期解法，但還沒有用真實
+資料驗證過」，只是**沒有引用 `ALIGNMENT_MISMATCH.md` 現在已經有的
+量化結果**（99.7%→30.7% 那組數字）——如果委員追問「修了多少」，
+照現在 Q10 的答案會答不出來，但證據其實已經在報告裡。
+
+**建議**（只回報，沒有動手）：附錄表格那一格改成類似「⚠️ 對齊邏輯已修好，
+時長洩漏用 VAD 裁切改善了 69 個百分點（99.7%→30.7%），但沒有完全消除，
+仍靠人工控制輔助」；Q10 的完整答案加一句引用 `ALIGNMENT_MISMATCH.md`
+的量化結果。
+
+### 🔴 已過時（部分）：`STATISTICAL_RIGOR.md` 第 157 行「`run_all` 還沒有把
+`wear_id` 傳下去」
+
+原文（第 3 節「已修」的說明框裡）：
+
+> 「⚠️ `run_all` 還沒有把 `wear_id` 傳下去（那個檔案由別人在改）。
+> 介面已經備好，接上去只要多傳一個參數。」
+
+實際去讀 `analysis/run_all.py` 源碼確認：**`D18` 這條線已經接上了**
+——`run_d18_permutation()`（第 668 行）被真的呼叫時傳了
+`wear_ids_for_features`（第 843 行），不是只是「介面備好、還沒接」。
+**但 `D19`（消融套件）確實還沒接**——`run_d19_ablation()` 呼叫
+`mod.run_ablation_suite()` 時沒有傳 `groups`（今天稍早我讀源碼確認過
+這件事，也是這輪順帶把 `d19_ablation_suite.py` 的六個檢定＋時間反轉
+測試都補上 `groups=` 支援的原因——介面現在真的備好了，包含比原本
+更完整的時間反轉測試分組）。
+
+**這行陳述現在只對一半**：對 `D19` 還成立，對 `D18` 已經不成立。
+`8f` 正在 `analysis/run_all.py`／`analysis/reporting/` 裡持續接
+`effect_size`，這條線很可能很快也會接上 `D19`，屆時這句話要整段改成
+「已修」——先回報現況，不猜測接下來會不會改。
+
+### ⚠️ 沒找到出處：`D21` 可分性 `1.0–1.09`／`1.23–1.37`
+
+逐一讀了 `D21_signal_ablation.md`（signal 通道消融，CV 準確率
+0.625–0.850，跟這組數字對不上）、`DEFENSE_QA.md`、`STATISTICAL_RIGOR.md`
+——三份都只提到「`D21` 3 個檢定」這個**數量**，沒有找到 `1.0–1.09`／
+`1.23–1.37` 這組具體數值，逐字比對跟近似範圍比對都沒有命中。
+
+`git status` 顯示 `analysis/similarity/closed_set_probe.py`、
+`analysis/experiments/exp_d21_closed_set_probe.py`、
+`analysis/similarity/test_closed_set_probe.py` 目前都是這輪新增／修改
+的檔案（`7c [4bedc9]` 正在裡面），**這組數字很可能是還沒寫進任何報告
+的即時結果**，或者程式碼變動後已經跟目前版本對不上——邊界規定
+`analysis/similarity/` 這輪只能讀不能動，我沒有進一步深入那支還在變動
+的程式碼去反推數字，怕讀到的是中間狀態。**如果這組數字要拿去對委員
+講，需要先確認它現在寫在哪一份報告裡（可能還沒寫）**，不能假設它已經
+有一個穩定的出處。
