@@ -507,7 +507,7 @@ def _make_trial(**attrs):
         quality="ok",
         tof_a=empty2d, tof_b=empty2d,
         tof_valid_a=empty2d.astype(bool), tof_valid_b=empty2d.astype(bool),
-        tof_t_us=empty1d.astype(np.int64), mic_rms=empty1d,
+        tof_t_us=empty1d.astype(np.int64), mic_rms=empty1d, mic_t_us=empty1d.astype(np.int64),
         mel=None, attrs=attrs,
     )
 

@@ -46,6 +46,7 @@ class Trial:
     tof_valid_b: np.ndarray
     tof_t_us: np.ndarray
     mic_rms: np.ndarray
+    mic_t_us: np.ndarray         # (M,) int64，跟 mic_rms/mic_peak 同軸，必填
     mel: Optional[np.ndarray]    # (F, 40) 或 None（選填）
     # §2 選填：`tof_ambient_A/B` 是 (Ta, Z)，無效 zone 已經是 NaN。
     # `D10` 明訂 ambient 是 crosstalk 最靈敏的指標。
@@ -185,6 +186,7 @@ def load_session(path):
                 tof_valid_b=np.asarray(group["tof_valid_B"], dtype=bool),
                 tof_t_us=np.asarray(group["tof_t_us"], dtype=np.int64),
                 mic_rms=np.asarray(group["mic_rms"], dtype=np.float64),
+                mic_t_us=np.asarray(group["mic_t_us"], dtype=np.int64),
                 mic_peak=np.asarray(group["mic_peak"], dtype=np.int64),
                 mel=(np.asarray(group["mel"], dtype=np.float64)
                      if "mel" in group else None),

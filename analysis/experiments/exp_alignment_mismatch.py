@@ -140,7 +140,7 @@ def run_offline_path(record: dict) -> np.ndarray:
         quality="ok",
         tof_a=record["tof_A"], tof_b=record["tof_B"],
         tof_valid_a=record["tof_valid_A"], tof_valid_b=record["tof_valid_B"],
-        tof_t_us=record["tof_t_us"], mic_rms=np.zeros(1),
+        tof_t_us=record["tof_t_us"], mic_rms=np.zeros(1), mic_t_us=np.zeros(1, dtype=np.int64),
         mel=record["mel"],
     )
     meta = {

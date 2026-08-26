@@ -32,6 +32,17 @@
 - `59` 同一輪把 `d14_viseme_sensitivity.py` 接上 `lip_onset_us`/
   `comparable` 等 7 個欄位，從情況二移到情況一，是這份報告目前唯一真正
   升級到「有寫有讀」的一批。
+- 🔴 **第四輪更新：`mic_t_us` 是原本掃漏的第四個「結構性讀不到」**——
+  跟 `mic_peak`/`mel_t_us`/`tof_ambient_t_us` 同一類問題，但當時只掃了
+  `mel`/`tof_ambient_*` 這兩組「跟選填 dataset 成對」的時間軸，漏掉了
+  `mic_rms`/`mic_peak` 這組**必填**的。`8f` 做語音 VAD 裁切時卡在這裡
+  （見下方詳細說明），這輪已修，並照調度員要求把 `CONTRACTS.md` §2 裡
+  每一個 `*_t_us` 欄位都對過一次——`tof_t_us`/`mel_t_us`/`tof_ambient_t_us`
+  三個都已經讀得到，`mic_t_us` 是最後一個，這次補完後**沒有第五個了**。
+  修 `Trial` dataclass（在中間插入一個必填欄位）連帶讓兩個既有的直接
+  建構 `Trial(...)` 的呼叫點（`exp_alignment_mismatch.py`、
+  `test_d14_viseme_sensitivity.py`）漏了新欄位而炸掉，已一併補上（兩者
+  都是合成測試資料，加一個空/零陣列即可，沒有動到测试本身要驗的邏輯）。
 
 ---
 
@@ -149,7 +160,7 @@
 | `speaking_mode` | `write_trial()`（選填，B21 已接線，目前固定 `"normal"`——見 `E2E_PIPELINE.md`） | `Trial.speaking_mode`（曝露了，但下面歸類在情況二：D-track 還沒有任何程式碼真的讀它） |
 | `vad_start_us`, `vad_end_us`, `lip_onset_us`, `voice_onset_us`, `lip_onset_us_A`, `lip_onset_us_B`, `comparable` | `write_trial()`（選填；`vad_*`/`lip_onset_us`/`voice_onset_us` 見上方已知缺口，`lip_onset_us_A/B`/`comparable` 是這輪剛加、`4f` 剛接的） | **這輪剛接上**：`analysis/experiments/d14_viseme_sensitivity.py` 新增 `lip_lead_samples()`/`compare_lip_lead_versions()`，走 `Trial.attrs`（不直接開 h5py，`comparable` 的 `numpy.bool_` 陷阱由 `session_loader._as_scalar()` 擋掉）。只納入 `comparable is True` 且 `voice_onset_us` 存在的 trial；`lip_onset_us_B` 缺席（`union_min` 設計本身允許）只影響 `single_b` 這個版本，不影響 `fused`/`single_a`。**目前只用合成資料測過篩選邏輯本身正確，真實資料到手前不產出任何「哪個版本比較好」的結論**（`reports/VAD_FUSION_OPTIONS.md` 問題 4） |
 
-### 情況二：有寫、沒人讀（浪費但無害）——9 筆
+### 情況二：有寫、沒人讀（浪費但無害）——10 筆
 
 | 欄位 | 誰在寫 | 為什麼現在沒人讀 |
 |---|---|---|
@@ -162,6 +173,7 @@
 | `tof_ambient_t_us` | `write_trial()`，跟 `tof_ambient_*` 成對必寫 | 同上，這輪加進 `Trial.ambient_t_us` |
 | `audio`, `audio_t0_us` | `write_trial()`，選填 | `Trial` dataclass完全沒有 `audio` 欄位；目前沒有任何錄音管線真的餵 `audio` 給 `write_trial()`（`schema_example.py` 的範例檔是唯一寫過的地方），純示範用途 |
 | `source` | `SessionWriter._write_meta()`，選填——**這輪加了**（原本是情況四，見下方「已解決」） | 呼叫端（`bridge_server.py`）一直都在傳，現在寫入端接住了；`analysis/` 目前還沒有人讀，跟上面幾筆一樣屬於「接口通了、還沒被用」 |
+| `mic_t_us` | `write_trial()`，必填 dataset | **第四輪剛把結構性缺口解掉**（`Trial` dataclass 原本完全沒有這個欄位，`mic_rms` 有卻沒有配對的時間軸）。跟其他幾筆不同：**這筆有明確、當下就在等的消費者**——`8f` 的語音 VAD 裁切卡在這裡，沒有 `mic_t_us` 就只能做唇動-only 裁切，會跟線上唇動+語音聯集裁切用不同的窗口定義，造成訓練/推論不一致。這一項預期很快就會從情況二移到情況一，不是長期停留的暫態 |
 
 `mic_peak`/`mel_t_us`/`tof_ambient_t_us`/`source` 這四筆**這輪把「讀不到」
 的技術缺口解掉了，但沒有升級成情況一**——情況一要求真的有消費者，這四筆
