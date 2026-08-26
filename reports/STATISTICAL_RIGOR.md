@@ -154,8 +154,22 @@ run_all.py --ablation-permutations 預設 200
 > ——回傳 `grouping="ungrouped_single_group"`，報告明印
 > 「**分組驗證無法進行**……結果可能被組內洩漏灌水」。
 >
-> ⚠️ **`run_all` 還沒有把 `wear_id` 傳下去**（那個檔案由別人在改）。
-> 介面已經備好，接上去只要多傳一個參數。
+> **接線狀態**（2026-08-26 稍晚重新讀源碼確認，**不是轉述**）：
+>
+> | 路徑 | 狀態 | 依據 |
+> |---|---|---|
+> | `run_all` → `D18` 置換檢定 | ✅ **已接** | `run_all.py:962` 傳 `wear_ids_for_features`，`:814` 傳給 `permutation_report(groups=...)` |
+> | `d19_ablation_suite` 模組本身 | ✅ **已支援** | `run_ablation_suite(..., groups=None)`（`d19:95`），五項消融都吃 |
+> | `run_all` → `D19` 消融 | 🔴 **還沒接** | `run_all.py:773` 的 `run_ablation()` 簽章沒有 `groups`，`:782` 呼叫時也沒傳 |
+>
+> 🔴 **所以 `D19` 的那幾個檢定目前仍是未分組的**——`d19` 那一側的能力已經
+> 備好，缺的只是 `run_all.py` 這一行把 `wear_ids_for_features` 傳過去。
+>
+> ⚠️ **報告上看得出來嗎？** `d19` 重用 `D18` 的三態回報，所以它的 `grouping`
+> 會是 `"ungrouped_no_groups_given"`（**沒有要求過**），不是
+> `"ungrouped_single_group"`（要求了但做不到）。**兩者在報告裡的文字不同**
+> ——所以這個缺口**看得出來，不會被誤讀成「做了分組」**。那正是當初把
+> 「沒要求過」與「做不到」分成兩種狀態的用意。
 
 ### 現況（修正前）
 

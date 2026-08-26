@@ -284,15 +284,24 @@ def _check_skips(outcomes):
     skipped = [o for o in outcomes if o.status == STATUS_SKIPPED]
     if not skipped:
         return []
-    names = "、".join(f"{o.key} {o.name}" for o in sort_outcomes(skipped))
+    ordered = sort_outcomes(skipped)
+    names = "、".join(f"{o.key} {o.name}" for o in ordered)
+    message = (
+        f"{names} 因資料不足而未執行。**「沒跑」不是「通過」也不是「失敗」**"
+        "——在補齊資料之前，這份報告對這幾項沒有任何結論。"
+    )
+    # 每一項各自的原因（例如 `reports/DEGRADED_SESSION.md` 那種「感測器
+    # 全程沒有資料」的具體理由）原本只留在 `outcome.reason` 裡，
+    # `summary.md` 只印一句集合名稱，看不到理由——這裡直接列出來，
+    # 使用者才不用另外去翻個別實驗的報告或程式回傳值才找得到原因。
+    reason_lines = [f"* **{o.key} {o.name}**：{o.reason}" for o in ordered if o.reason]
+    if reason_lines:
+        message += "\n\n" + "\n".join(reason_lines)
     return [{
         "topic": "有實驗沒有跑",
         "severity": "note",
-        "sources": [o.key for o in sort_outcomes(skipped)],
-        "message": (
-            f"{names} 因資料不足而未執行。**「沒跑」不是「通過」也不是「失敗」**"
-            "——在補齊資料之前，這份報告對這幾項沒有任何結論。"
-        ),
+        "sources": [o.key for o in ordered],
+        "message": message,
     }]
 
 
