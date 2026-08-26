@@ -12,13 +12,19 @@
 
 🔴 **每一筆樣板都用跟 `POST /recognize` 完全同一條路組出來**：
 `host/align/aligner.Aligner` + `host/features/live_pipeline.
-assemble_query_from_aligned_frames`——**不是** `analysis/run_all.py` 的
-`build_feature_seqs()`。兩者的對齊邏輯不一樣：`run_all.py` 直接把
-`tof_a`/`tof_b`/`mel` 截斷到最短長度（幀數對齊），`Aligner` 用 `t_us` 做
-真正的時間對齊（`bisect_left` + nearest/線性內插）。`$T` 跟 `$F` 幀率不同
+assemble_query_from_aligned_frames`。`$T` 跟 `$F` 幀率不同
 （`CONTRACTS.md` 早就警告過），如果建樣板跟線上推論用不同對齊邏輯，
 準確率會系統性偏差，而且不會有任何錯誤訊息——這正是
 `esp-mask-test-59` 讀程式碼比對兩條路徑後發現的，這支腳本刻意避開它。
+
+⚠️ **這裡原本還寫著「不是 `analysis/run_all.py` 的 `build_feature_seqs()`，
+那邊直接把 tof_a/tof_b/mel 截斷到最短長度」——這句話現在過時了**：
+`run_all.py` 自己後來也改成走 `Aligner`+`assemble_query_from_aligned_frames()`
+這條真正的時間對齊路（見該檔案的 `build_feature_seqs()` 模組說明、
+`reports/ALIGNMENT_MISMATCH.md`），不再是索引截斷。兩支腳本現在用的是
+同一條對齊邏輯，只是各自獨立呼叫，不是同一份程式碼——這句提醒留著是
+為了記錄「兩邊必須用同一種對齊方式」這個要求本身，不是說兩支腳本現在
+還在用不同的方法。
 
 用 `analysis/reporting/session_loader.py` 讀 HDF5（不直接開 `h5py`——那樣
 布林值會變成 `numpy.bool_`，`session_loader` 已經處理過這個轉換）。

@@ -18,10 +18,32 @@ Mel、而另一個相反，多模態就有存在的理由。
 
     sensitivity(sample, modality) = max |z| over (time × channels of that modality)
 
-特徵在 §3.2 就已經是 per-zone z-score（除以 `baseline_sigma`），所以這個
-數字的單位是「偏離自己的靜止基線幾個標準差」，跨模態可比。取 `max` 而不是
-`mean`：一個 viseme 的辨識力來自**動得最多的那個通道**，全部平均會被大量
-沒在動的通道稀釋成噪音。
+取 `max` 而不是 `mean`：一個 viseme 的辨識力來自**動得最多的那個通道**，
+全部平均會被大量沒在動的通道稀釋成噪音。
+
+🔴 **「跨模態可比」曾經是這裡宣稱的，但不是事實——已修正。** ToF 那 64 維
+是 §3.2 的 per-zone z-score（`(x-baseline_mu)/baseline_sigma`，D01），
+單位確實是「偏離自己的靜止基線幾個標準差」。**但 Mel 那 40 維預設只做
+CMN（`mel_features(cvn=False)`，D02 現行預設，減平均、沒有除以標準差）
+——舊版文件說「特徵已經是 per-zone z-score，跨模態可比」這句話對 ToF
+對，對 Mel 錯**，是一個寫在文件裡但程式碼從沒做到的保證（`ad`/使用者
+2026-08-26 模態尺度稽核找到的，見 `reports/MODALITY_SCALE_AUDIT.md`）。
+
+**修法（`sensitivity_with_excess()` 內部，`_locally_standardize()`）：**
+只對 Mel 那 64→104 的切片，逐通道除以**這筆樣本自己的標準差**（沿時間軸，
+`CVN_FLOOR` 保護除以零）——跟 `mel_features(cvn=True)` 做的是同一件事，
+只是在這裡對已經組裝好的 `.data` 局部、事後補做，**不改
+`analysis/features/audio_features.py` 的全域 `cvn=False` 預設**（那是
+D02 共用管線，要不要把它設回 `True` 是另一個決策，牽動比這裡大得多的
+範圍，見 `reports/DISTANCE_COMPARISON.md`/`MODALITY_SCALE_AUDIT.md`；
+這個模組只需要自己算出來的敏感度數字能跨模態比較，用不著等那個決策）。
+
+⚠️ **這仍然不是完全對等的正規化**：ToF 的 z-score 除以的是**外部量測的
+靜止基線標準差**（這顆感測器平常有多穩），Mel 除以的是**這筆樣本自己
+的標準差**（這段錄音裡這個 band 自己動了多少）——概念上不是同一件事
+（Mel 沒有對應 ToF baseline 的「安靜時基線變異數」量測機制）。但兩者現在
+都是「相對於自己一個自然波動尺度的偏離量」，比修正前「ToF 除過、Mel
+完全沒除」要可比得多，也是這個專案目前能拿到的最好近似。
 
 每格回報 `n` 與**標準誤**（`std / sqrt(n)`，`ddof=1`）。`n == 1` 時標準誤是
 `None` 而不是 `0`——單一樣本沒有離散度的資訊，填 0 會讓那一格看起來像
@@ -68,6 +90,7 @@ import numpy as np
 from scipy.special import ndtri
 
 from analysis.experiments.exp_c_silhouette import MODALITIES as _ALL_MODALITIES
+from analysis.features.audio_features import CVN_FLOOR
 from analysis.reporting.plot_style import SEQUENTIAL_CMAP
 
 # 本實驗只比較三個**互斥**的模態。`tof_combined` / `all` 是 D13 的組合式
@@ -123,6 +146,10 @@ UNIFORM_WEAK_LEVEL = "weak"
 #
 # 30 的由來：本模組的 `strong` 門檻是 excess ≥ 9（約 raw 12.4）。30 已經是
 # 它的兩倍多，真實唇動不該達到——`B16` 在合成資料上量到的最大值約 23。
+#
+# 這個檢查現在對 Mel 也有意義：`_locally_standardize()` 用 `CVN_FLOOR`
+# 當除數下限，跟 ToF 的 σ 下限是同一種風險（某個 band 這筆樣本裡幾乎
+# 不變，除下去被放大成離譜的值），不是只有 ToF 才會撞到。
 IMPLAUSIBLE_MAX_ABS_Z = 30.0
 
 
@@ -188,11 +215,24 @@ def chance_max(n_values):
     return float(ndtri(1.0 - 1.0 / (4.0 * n)))
 
 
+def _locally_standardize(values):
+    """逐通道除以**這筆樣本自己**的標準差（沿時間軸）——見模組說明
+    「敏感度的定義」一節：Mel 預設只做過 CMN，沒有除以標準差，這裡補上
+    那一步，跟 `mel_features(cvn=True)` 是同一個運算，只是局部、事後對
+    `.data` 做，不改 D02 的全域預設。`CVN_FLOOR` 保護某個 band 這筆樣本
+    裡完全不變時除以零。
+    """
+    std = np.nanstd(values, axis=0, keepdims=True)
+    return values / np.maximum(std, CVN_FLOOR)
+
+
 def sensitivity(data, modality):
     """單筆樣本在某個模態上的敏感度 = 該模態通道的 `max |z|`（story 的定義）。
 
-    `data` 是 `FeatureSeq.data`，`(T, 104)`。§3.2 已經 z-score 過，所以
-    這個數字是「偏離靜止基線幾個 sigma」，跨模態可比。
+    `data` 是 `FeatureSeq.data`，`(T, 104)`。ToF 那 64 維本來就是 §3.2 的
+    z-score；Mel 那 40 維會先經過 `_locally_standardize()` 補齊「除以
+    標準差」這一步，兩者才是同一個單位、能放在同一張表裡比大小（見模組
+    說明的完整理由與已知限制）。
 
     無效 zone 在特徵裡是 `NaN`（§2），用 `nanmax` 忽略；整個模態全 `NaN`
     （例如那顆感測器整段沒有效回波）回 `NaN` 而不是 0——**0 會被讀成
@@ -205,10 +245,16 @@ def sensitivity(data, modality):
 def sensitivity_with_excess(data, modality):
     """回傳 `(raw_max_abs_z, excess_above_chance)`。
 
-    `raw` 是 story 定義的敏感度，照實回報；`excess` 扣掉該模態通道數對應
-    的機率地板（見 `chance_max()`），是強度分級真正該看的量。
+    `raw` 是 story 定義的敏感度（Mel 已經過 `_locally_standardize()`，
+    見 `sensitivity()`），照實回報；`excess` 扣掉該模態通道數對應的機率
+    地板（見 `chance_max()`），是強度分級真正該看的量——`chance_max()`
+    的推導假設輸入近似 N(0,1)，Mel 沒先標準化的話這個假設本來就不成立，
+    這也是為什麼標準化要做在這裡、影響 `raw` 本身，不能只在算 `excess`
+    時才臨時補。
     """
     values = np.asarray(data, dtype=np.float64)[:, MODALITIES[modality]]
+    if modality == "mel":
+        values = _locally_standardize(values)
     finite = np.isfinite(values)
     n_finite = int(finite.sum())
     if n_finite == 0:

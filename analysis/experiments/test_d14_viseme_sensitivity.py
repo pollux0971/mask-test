@@ -13,6 +13,7 @@ from analysis.experiments.d14_viseme_sensitivity import (
     MODALITIES,
     MODALITY_ORDER,
     STRENGTH_ORDER,
+    _locally_standardize,
     chance_max,
     compare_lip_lead_versions,
     compare_to_expected,
@@ -29,17 +30,34 @@ from analysis.experiments.d14_viseme_sensitivity import (
     uniform_weak_tof,
     viseme_sensitivity_report,
 )
+from analysis.features.audio_features import mel_features
 from analysis.reporting.session_loader import Trial
 
 T_FIXED = 24
 N_DIMS = 104
 
 
-def sample(rng, *, tof_gain=1.0, mel_gain=1.0):
-    """一筆合成的 `FeatureSeq.data`（(24, 104)，已是 z-score 單位）。"""
+def sample(rng, *, tof_gain=1.0, mel_gain=1.0, mel_excursion_frames=6):
+    """一筆合成的 `FeatureSeq.data`（(24, 104)）。
+
+    `tof_gain`：ToF 那 64 維整段均勻放大——ToF 沒有局部標準化
+    （`sensitivity_with_excess()` 只對 mel 做 `_locally_standardize()`），
+    均勻放大會直接反映在 `max|z|` 上，舊寫法在這裡仍然成立。
+
+    `mel_gain`：**改成只在其中 `mel_excursion_frames` 幀注入偏移，其餘
+    幀維持純雜訊**——舊寫法是整段 40 維均勻乘上 `mel_gain`，這在 `d14`
+    修正前沒問題（那時 mel 沒有局部標準化，均勻放大直接可見），但修正
+    之後 `_locally_standardize()` 會除以這筆樣本自己的標準差，均勻放大
+    整段噪音幾乎會被自己的標準差除掉、量不出差異（放大兩倍的雜訊，
+    自己的標準差也放大兩倍）。真實的擦音訊號本來就是「大部分時間安靜、
+    講到那個音的瞬間才動」——局部激烈波動才是這個修正後真正該測的案例，
+    也更貼近真實生理訊號的形狀。
+    """
     data = rng.normal(0.0, 1.0, (T_FIXED, N_DIMS))
     data[:, 0:64] *= tof_gain
-    data[:, 64:104] *= mel_gain
+    if mel_gain != 1.0:
+        frames = rng.choice(T_FIXED, size=mel_excursion_frames, replace=False)
+        data[np.ix_(frames, range(64, 104))] += mel_gain * rng.normal(0.0, 1.0, (mel_excursion_frames, 40))
     return data
 
 
@@ -103,14 +121,68 @@ def test_sensitivity_with_excess_reports_both():
 # ------------------------------------------------------------ 敏感度定義
 
 
+def test_locally_standardize_matches_mel_features_cvn_true():
+    """`_locally_standardize()` 存在的理由：Mel 預設（`cvn=False`）只做
+    CMN，跟 ToF 的 z-score 不是同一個正規化程度（`ad`/使用者 2026-08-26
+    模態尺度稽核找到的問題，見 `reports/MODALITY_SCALE_AUDIT.md`）。
+    這裡直接驗證它做的事跟 `mel_features(cvn=True)` 的除以標準差那一步
+    完全一樣（差別只在 `mel_features` 還會先做 CMN 減平均，這裡吃的
+    `.data` 已經是 D02 CMN 過的輸出，不用再減一次）。
+    """
+    rng = np.random.RandomState(5)
+    raw_mel = rng.normal(-3.0, 1.0, (24, 40)) * np.array([1.0, 5.0] * 20)  # 每個 band 尺度不同
+    cmn_only = mel_features(raw_mel, cvn=False)   # d14 實際吃到的東西（D02 現行預設）
+    cmn_and_cvn = mel_features(raw_mel, cvn=True)  # 兩者都做，當作正確答案的參照
+
+    standardized = _locally_standardize(cmn_only)
+    np.testing.assert_allclose(standardized, cmn_and_cvn, atol=1e-9)
+
+
+def test_locally_standardize_makes_cross_modal_comparison_meaningful():
+    """修正前的核心問題重現：兩個模態各自的『偏離幅度』如果尺度不同，
+    直接比大小會誤導。這裡用貼近真實的尺度構造：ToF z-score 幅度小
+    （典型偏離基線 2-3 個 sigma），Mel CMN-only 幅度大很多（log10 mel
+    power 常見的量級，減完平均還有好幾個單位）——**修正前**，Mel 的
+    `raw` 數字會單純因為尺度大而系統性看起來比 ToF 敏感，跟嘴巴動得多
+    少無關；**修正後**，兩者都被自己的標準差正規化，比較才有意義。
+    """
+    rng = np.random.RandomState(6)
+    data = np.zeros((T_FIXED, N_DIMS))
+    data[:, 0:64] = rng.normal(0.0, 1.0, (T_FIXED, 64)) * 2.5   # ToF：z-score，典型偏離 2.5 個 sigma
+    data[:, 64:104] = rng.normal(0.0, 1.0, (T_FIXED, 40)) * 0.3  # Mel：CMN-only，波動幅度小很多
+
+    tof_sensitivity, _ = sensitivity_with_excess(data, "tof_l")
+    mel_sensitivity, _ = sensitivity_with_excess(data, "mel")
+
+    # 標準化之後，即使原始波動幅度差了將近 10 倍，兩個模態的敏感度應該
+    # 落在同一個量級（都是「離自己典型波動幾個 sigma」），不會有其中一個
+    # 因為原始單位比較大而系統性壓過另一個。
+    assert 0.3 < mel_sensitivity / tof_sensitivity < 3.0, (
+        f"標準化後兩模態的敏感度應該同量級，實際 tof={tof_sensitivity:.2f}, "
+        f"mel={mel_sensitivity:.2f}"
+    )
+
+
 def test_sensitivity_is_max_abs_over_the_modality_slice():
+    """`tof_l`/`tof_r` 沒有局部標準化，`max|z|` 直接等於注入的值。
+
+    `mel` 現在會先除以**這個通道自己（沿時間軸）的標準差**（見
+    `_locally_standardize()`）——這裡獨立用 numpy 算一次同樣的公式當
+    期望值（不是呼叫被測函式本身，避免測試變成套套邏輯）：欄位 70 這
+    24 幀裡只有 1 筆是 2.0、其餘是 0，母體標準差 `std([2,0*23])`，
+    2.0 除以那個標準差就是修正後該有的 `max|z|`。
+    """
     data = np.zeros((T_FIXED, N_DIMS))
     data[3, 5] = -7.5                 # tof_l
     data[9, 40] = 4.0                 # tof_r
     data[1, 70] = 2.0                 # mel
     assert sensitivity(data, "tof_l") == pytest.approx(7.5)
     assert sensitivity(data, "tof_r") == pytest.approx(4.0)
-    assert sensitivity(data, "mel") == pytest.approx(2.0)
+
+    mel_column = np.zeros(T_FIXED)
+    mel_column[1] = 2.0
+    expected_mel = 2.0 / mel_column.std()
+    assert sensitivity(data, "mel") == pytest.approx(expected_mel)
 
 
 def test_modality_slices_come_from_d13():
