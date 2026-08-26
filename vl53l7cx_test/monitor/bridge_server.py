@@ -196,6 +196,7 @@ quality = QualityAggregator(
     # same seq gap as a frame that never arrived, so without it the transport
     # alarm cannot tell the two apart.
     parser_stats=current_parser_stats,
+    sensors_seen=lambda: sensors_seen_string(),
 )
 
 
@@ -243,6 +244,8 @@ def to_sse_event(event):
         else:
             out["dim"] = event.get("dim")
         out["source"] = link_source["value"]
+        out["sensors_seen"] = sensors_seen_string()
+        out["sensors_enabled"] = sensors_enabled_string() or ""
         return out
     elif kind == "record":
         return {"type": "record", "state": event["state"], "seconds": event["seconds"]}
@@ -303,11 +306,18 @@ def publish_status_if_changed():
     state = parser.state()
     signature = (state.get("protocol_version"), state.get("degraded"),
                  state.get("version_mismatch"), state.get("recording_allowed"),
-                 state.get("dim"), state.get("fw"), state.get("mel"))
+                 state.get("dim"), state.get("fw"), state.get("mel"),
+                 # A sensor appearing or going quiet is a status change too.
+                 # Without it the panel keeps showing whatever was true when
+                 # it connected -- and on a one-sensor board that is wrong.
+                 sensors_seen_string())
     if signature == protocol_state.get("last_status_signature"):
         return
     protocol_state["last_status_signature"] = signature
-    broadcaster.publish({"type": "status", "source": link_source["value"], **state})
+    broadcaster.publish({"type": "status", "source": link_source["value"],
+                         "sensors_seen": sensors_seen_string(),
+                         "sensors_enabled": sensors_enabled_string() or "",
+                         **state})
 
 
 def observe_for_quality(event):
@@ -640,6 +650,42 @@ device_clock = {"last_t_us": None}
 device_sensor_state = {"A": True, "B": True}
 
 
+#: Frame counts per ToF stream at the moment the current session started, so
+#: `sensors_seen` reflects this session rather than everything the process has
+#: ever received.
+session_frame_baseline = {"tof_A": 0, "tof_B": 0}
+
+
+def snapshot_frame_counts():
+    return {stream: drop_tracker.stats(stream).received for stream in ("tof_A", "tof_B")}
+
+
+def sensors_seen_string(since=None):
+    """Which sensor labels have actually put data on the wire.
+
+    Derived from the stream itself, so it needs nothing from the firmware.
+    That matters: a sensor that fails `is_alive` is reported over ESP_LOGE,
+    which is not a `$` line and never reaches the host at all, and $H's
+    drop_A/drop_B stay at zero because a sensor nobody is reading never
+    fails a read. From the panel, a board with one dead sensor looks exactly
+    like a healthy one.
+
+    ⚠ The value says which labels appeared, NOT which physical sensors work.
+    On the first real board, sensor A failed to initialise and sensor B was
+    the one streaming -- but the frames it emitted were labelled `A`. So
+    `sensors_seen == "A"` truthfully means "one stream arrived, calling
+    itself A", and the host has no way to tell which device that was.
+    Distinguishing them would need `sens_a=`/`sens_b=` in $STATUS, the same
+    gap already noted in CONTRACTS 4.1.2.
+    """
+    since = since or {"tof_A": 0, "tof_B": 0}
+    seen = ""
+    for letter, stream in (("A", "tof_A"), ("B", "tof_B")):
+        if drop_tracker.stats(stream).received > since.get(stream, 0):
+            seen += letter
+    return seen
+
+
 def sensors_enabled_string():
     """"AB" | "A" | "B", or None when neither is enabled.
 
@@ -903,6 +949,17 @@ def build_session_meta_base(info, tof_t_us):
         # starts working with no change on this side.
         "source": link_source["value"],
     }
+    # "What actually arrived", as distinct from sensors_enabled ("what we
+    # asked for"). The two disagreeing is itself the diagnosis -- on the
+    # first real board this reads "A" against an enabled set of "AB".
+    #
+    # ⚠ /meta is written once, at baseline capture, because the schema needs
+    # the baseline statistics. So this records what had been seen up to that
+    # point, not the whole session. Enough for "one sensor never came up",
+    # which is visible from boot; a sensor that drops out mid-session shows
+    # up in the SSE events instead.
+    meta["sensors_seen"] = sensors_seen_string(session_frame_baseline)
+
     enabled = sensors_enabled_string()
     if enabled:
         # D10's crosstalk experiment pairs a "one sensor" recording with a
@@ -1806,8 +1863,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(400, {"error": "這個 session 的 /meta 缺少 subject 或 wear_id，無法決定樣板檔名"})
             return
 
-        from analysis.similarity.enrollment import template_path
-        out_path = template_path(runtime_paths["templates"], subject, wear_id)
+        # Not enrollment.template_path(root, subject, wear_id) -- that helper
+        # expects `root` to be the repo root and appends "templates/" itself
+        # (its own doc: "templates/<subject>_<wear_id>.npz"). runtime_paths
+        # ["templates"] is already the templates directory (see --templates-
+        # dir's help text above), so going through template_path() here
+        # would double it into ".../templates/templates/...". Same filename
+        # convention, applied directly instead.
+        out_path = Path(runtime_paths["templates"]) / f"{subject}_{wear_id}.npz"
 
         with templates_build_lock:
             templates_build_state.update({
@@ -2255,6 +2318,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             session_runtime.update(baseline=None, trial=None,
                                    h5_path=sessions_dir() / f"{info.session_id}.h5",
                                    writer=None)
+        session_frame_baseline.update(snapshot_frame_counts())
         clock_sync[SESSION_START] = None
         clock_sync[SESSION_END] = None
         request_ping_burst(SESSION_START)
@@ -2469,6 +2533,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if parser is not None:
                 initial.update(parser.state())
             initial["source"] = link_source["value"]
+            initial["sensors_seen"] = sensors_seen_string()
+            initial["sensors_enabled"] = sensors_enabled_string() or ""
             opening = [initial, quality.snapshot()]
             # A tab opened mid-session has missed the `session` broadcast
             # that fired at start, and polling /session/current just to find

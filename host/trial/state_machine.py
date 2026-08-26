@@ -483,9 +483,18 @@ class TrialStateMachine:
 
         if HOLD_MIN_DURATION_S <= hold_duration_s <= HOLD_MAX_DURATION_S:
             self.state = TrialState.SAVE
+            # 詞指標要在落盤「當下」前進——跟 tick() 的 CAPTURE->SAVE 路徑、
+            # confirm_keep() 一致（那兩處都有這行）。這裡原本漏掉了：
+            # _next_trial_idx 會在 _do_save() 內部自己前進，掩蓋了
+            # _order_pos 沒動的事實——trial idx 看起來每筆都在長，但
+            # peek_next_label()／下一次 hold_start() 選到的詞卻永遠是
+            # _order[0]，使用者會卡在同一個詞錄到天荒地老（E05 排練時
+            # ca 真的録到；單元測試沒抓到，因為現有測試沒有斷言
+            # hold-to-record 連續存兩筆之間詞真的換了，只測了時長/資料）。
+            self._order_pos += 1
             save_event = self._do_save(now)
             save_event["hold_duration_s"] = hold_duration_s
-            return [save_event, self._enter(TrialState.REST, now)]
+            return [save_event, self._enter(TrialState.REST, now, next_label=self.peek_next_label())]
 
         reason = "too_short" if hold_duration_s < HOLD_MIN_DURATION_S else "too_long"
         event = self._enter(TrialState.CONFIRM, now)

@@ -185,6 +185,7 @@ class QualityAggregator:
         clock=time.monotonic,
         host_clock=time.time,
         parser_stats=None,
+        sensors_seen=None,
     ):
         self.thresholds = thresholds
         self.drop_tracker = drop_tracker
@@ -204,6 +205,12 @@ class QualityAggregator:
         #: parser already counts malformed lines and the count already
         #: reaches this process -- it was simply never read here.
         self._parser_stats = parser_stats
+        #: Callable returning which sensor labels have actually put data on
+        #: the wire. Carried on the quality event because "only one sensor is
+        #: streaming" is a health fact, and it is one the device itself never
+        #: reports: a sensor that fails to initialise is announced over
+        #: ESP_LOGE, which never reaches the host.
+        self.sensors_seen = sensors_seen
         self._lock = threading.Lock()
 
         self._zones = deque()        # (t, n_valid, dim)
@@ -432,6 +439,14 @@ class QualityAggregator:
                 entry["hint"] = alarm["message"]
 
         event = {"type": "quality", "t": time.time(), "metrics": metrics}
+        if self.sensors_seen is not None:
+            try:
+                seen = self.sensors_seen()
+            except Exception:
+                seen = None
+            if seen is not None:
+                event["sensors_seen"] = seen
+
         stats = self.parser_stats()
         if stats:
             # Surfaced because a rejected line is indistinguishable from a

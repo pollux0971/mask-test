@@ -123,9 +123,22 @@ VALID_QUALITY_VALUES = ("ok", "low", "rejected")
 # 出來，而分析時只剩檔案：`E05` 的四小時資料如果不小心錄到 mock 上，這是
 # 唯一能事後發現的地方。跟 `energy_mu` 那次一樣的落差形狀（呼叫端在傳、
 # 寫入端沒接住），差別是這次還沒有人開始讀，抓到得早。
+#
+# `sensors_seen`（真板子上線當天發現，第三種、跟前兩個都不一樣）：
+# ESP32 韌體 A 顆感測器 `is_alive` 失敗，B 顆是活的，但 B 送出來的資料
+# 標籤成 `A`——`sensors_enabled`（指令設成什麼）跟
+# `sensors_enabled_confirmed`（裝置有沒有確認收到指令）兩個都測不出這種
+# 錯誤：`$H` 的 drop_A/drop_B 全是 0（A 根本沒在讀，不是讀取失敗），
+# `$STATUS` 沒有欄位能說哪幾顆真的在跑，韌體的錯誤訊息是 `ESP_LOGE`
+# 不是 `$` 開頭，bridge 的解析器完全看不到。`sensors_seen` 記的是**這個
+# session 期間，實際有資料流過來的感測器標籤**——來自 bridge_server.py
+# 對資料流本身的統計，跟前兩個欄位可以互相不一致，那個不一致本身就是
+# 診斷用的資訊（例如 enabled=AB 但 seen=A，代表韌體回報活著的那顆其實
+# 沒有真的送資料）。選填，理由跟 `sensors_enabled` 一樣：呼叫端才剛在接
+# 這條線。
 OPTIONAL_META_KEYS = (
     "sensors_enabled", "sensors_enabled_confirmed", "energy_mu", "energy_sigma",
-    "source",
+    "source", "sensors_seen",
 )
 
 VALID_SENSORS_ENABLED = ("AB", "A", "B")
@@ -236,6 +249,13 @@ class SessionWriter:
                 self._meta.get("sensors_enabled_confirmed", False))
         elif "sensors_enabled_confirmed" in self._meta:
             raise ValueError("sensors_enabled_confirmed 不能單獨給，沒有 sensors_enabled 就沒有東西可以確認")
+
+        if "sensors_seen" in self._meta:
+            value = self._meta["sensors_seen"]
+            if value not in VALID_SENSORS_ENABLED:
+                raise ValueError(
+                    f"sensors_seen 必須是 {VALID_SENSORS_ENABLED} 之一，收到 {value!r}")
+            meta_group.attrs["sensors_seen"] = value
 
         has_energy_mu = "energy_mu" in self._meta
         has_energy_sigma = "energy_sigma" in self._meta
