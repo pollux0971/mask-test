@@ -429,7 +429,33 @@ def test_extras_are_populated_for_the_three_way_vote(two_sessions):
     # 讀錯鍵名時 `.get()` 會安靜回 None，這一票就沒了。
     assert silhouette.detail["complementary"] in (True, False)
 
-    assert {slug for slug, _ in side} == {"d16_mutual_information", "d19_ablation"}
+    assert {slug for slug, _ in side} == {
+        "d16_mutual_information", "d19_ablation", "d18_permutation",
+    }
+
+
+def test_d18_permutation_uses_wear_id_grouping_when_available(two_sessions):
+    """`two_sessions` 是兩個不同 `wear_id`——`D18` 應該真的做了分組驗證，
+    不是安靜地退回未分組。"""
+    sessions = [session_loader.load_session(p) for p in two_sessions]
+    _, extras, notes, side = run_all.run_experiments(sessions, ablation_permutations=20)
+
+    assert extras["d18_grouping"] == "grouped"
+    assert any("已用 wear_id 做分組驗證" in note for note in notes)
+    d18_report = dict(side)["d18_permutation"]
+    assert "有做分組驗證" in d18_report
+
+
+def test_d18_permutation_flags_a_single_wear_id_loudly(tmp_path):
+    """使用者第一批資料很可能只戴一次——分組驗證做不到時，`summary.md`
+    的 notes 必須明講，不能看起來跟真的分組一樣。"""
+    path = write_session(tmp_path / "single_wear.h5", wear_id=1, seed=1)
+    sessions = [session_loader.load_session(path)]
+    _, extras, notes, side = run_all.run_experiments(sessions, ablation_permutations=20)
+
+    assert extras["d18_grouping"] == "ungrouped_single_group"
+    assert any("分組驗證無法進行" in note for note in notes)
+    assert any("🔴" in note and "D18" in note for note in notes)
 
 
 def test_missing_votes_are_reported_not_silently_empty():

@@ -11,6 +11,31 @@
 一份分類器/CV 邏輯**——每個消融組態都有 p 值，這樣「掉了 3 個百分點」
 才不會只是雜訊（調度員的建議，合理，照做）。
 
+## 🔴 `groups`：六個檢定跟著 `D18` 一起分組，虛無假設也跟著變
+
+`run_ablation_suite()` 支援 `groups=`（每筆 trial 的 `wear_id`），原封不動
+轉傳給底層的六個 `run_permutation_test()` 呼叫（`all`／`mel`／
+`tof_combined`／`tof_l`／`tof_r`／雜訊化後的 `all`）——**同一次呼叫裡
+六個結果永遠拿到同一個分組狀態，不會出現同一份報告裡有些檢定分組了、
+有些沒有這種兩種嚴謹度混在一起的情況**。
+
+這不只是換一種 CV 切法：分組之後 CV 改用 `StratifiedGroupKFold`（同一次
+戴上的樣本不會同時落進訓練跟測試集，堵住 `7c` 實測證明過的洩漏——
+ToF-only 準確率從隨機切的 0.917 掉到分組切的 0.625，那 0.29 就是模型
+靠「認出這是哪一次戴的」拿到的分數），**每個檢定背後的虛無假設也跟著
+改變**：標籤是在同一個 group 內部打亂，不是全體打亂，問的問題變成
+「在同一次戴上之內，這個模態還分得出詞嗎」——細節與理由見
+`d18_permutation_test.py` 的「🔴 分組驗證」章節，這裡不重複一份可能
+對不上的說明。
+
+**時間反轉測試（第 4 項）是唯一的例外**：它自己實作 CV，不經過
+`run_permutation_test()`，`groups` 對它沒有作用，`format_report()`
+會在有分組時明講這件事。
+
+只有一個 group（第一批資料很可能只戴一次）時分組驗證做不到，回傳的
+`grouping` 會是 `"ungrouped_single_group"`，**這個狀態在報告裡只出現
+一次，不是六個小節各講一次同樣的警語**（那樣讀報告的人反而更容易略過）。
+
 ## 本檔實作的五項消融（照 D19.md 驗收條件逐項對應，不多不少）
 
 1. **雙矩陣 vs 單顆**（Sanity #6）：`acc(tof_combined) - max(acc(tof_l), acc(tof_r))`，
@@ -66,12 +91,14 @@ RANDOM_CHANNEL_MAX_RELATIVE_DROP = 0.50
 RANDOM_CHANNEL_OVERRELIANCE_HINT = 0.70  # 描述性門檻，見模組 docstring 第 5 項
 
 
-def _run(feature_seqs, labels, modality, n_permutations, cv, random_state, n_jobs):
+def _run(feature_seqs, labels, modality, n_permutations, cv, random_state, n_jobs,
+          groups=None):
     from analysis.experiments.d18_permutation_test import run_permutation_test
 
     return run_permutation_test(feature_seqs, labels, modality,
                                  n_permutations=n_permutations, cv=cv,
-                                 random_state=random_state, n_jobs=n_jobs)
+                                 random_state=random_state, n_jobs=n_jobs,
+                                 groups=groups)
 
 
 def reverse_time(feature_seqs):
@@ -153,18 +180,40 @@ def time_reversal_ablation(feature_seqs, labels, cv=DEFAULT_CV_FOLDS,
 
 def run_ablation_suite(feature_seqs, labels, n_permutations=DEFAULT_N_PERMUTATIONS,
                         cv=DEFAULT_CV_FOLDS, random_state=DEFAULT_RANDOM_STATE,
-                        n_jobs=-1, noise_modality="mel", is_synthetic=True):
+                        n_jobs=-1, noise_modality="mel", is_synthetic=True,
+                        groups=None):
     """五項消融全部跑一次（驗收條件）。
 
     `r_all`（"all" 模態的 permutation test 結果）在多個消融裡被重用，
     不會為同一組資料重跑三次一模一樣的 CV+permutation。
 
+    `groups`（每筆 trial 的 `wear_id`，見 `d18_permutation_test.py` 的
+    「🔴 分組驗證」說明）：這裡呼叫的六個 `run_permutation_test()`
+    （`all`／`mel`／`tof_combined`／`tof_l`／`tof_r`／雜訊化後的 `all`）
+    全部原封不動轉傳，同一個 `run_ablation_suite()` 呼叫裡的六個結果
+    保證拿到同一個分組狀態——不會有的通過驗證、有的沒有，同一份報告
+    出現兩種嚴謹度。傳了 `groups` 之後**不只是換一種 CV 切法**：
+    每個檢定的準確率會變得比較誠實（同一次戴上的樣本不會又當訓練又當
+    測試），這裡各項消融比的「增益」（`gain`/`relative_drop`）也就跟著
+    變得可信；而每個檢定本身背後的虛無假設也跟著改變（組內打亂而非
+    全體打亂，細節見 `d18_permutation_test.py`），問的問題變成「在同一次
+    戴上之內，這個模態還分得出詞嗎」。
+
+    ⚠️ **`time_reversal`（第 4 項）是例外，不吃 `groups`**：它自己實作
+    CV（`time_reversal_ablation()`，見該函式文件字串），不經過
+    `run_permutation_test()`，這裡沒有跟著補上分組邏輯——傳了 `groups`
+    也不影響它。`format_report()` 在有分組時會明確提醒這件事，不讓它被
+    誤讀成「已經比照其他五項處理過」。
+
     回傳 dict: {"is_synthetic", "dual_matrix_vs_single", "all_vs_mel_only",
-                "all_vs_tof_only", "time_reversal", "random_channel"}
+                "all_vs_tof_only", "time_reversal", "random_channel",
+                "grouping", "n_groups", "grouping_note"}——後三個是六個
+    分組結果共用的那個狀態（拿 `all` 那次的結果代表，六者必然相同）。
     每個消融結果都有 "gain"/"relative_drop" 等數字與 "passed"（`None`
     代表 story 沒有要求 PASS/FAIL，只要求記錄）。
     """
-    kwargs = dict(n_permutations=n_permutations, cv=cv, random_state=random_state, n_jobs=n_jobs)
+    kwargs = dict(n_permutations=n_permutations, cv=cv, random_state=random_state,
+                  n_jobs=n_jobs, groups=groups)
 
     r_all = _run(feature_seqs, labels, "all", **kwargs)
     r_mel = _run(feature_seqs, labels, "mel", **kwargs)
@@ -220,7 +269,37 @@ def run_ablation_suite(feature_seqs, labels, n_permutations=DEFAULT_N_PERMUTATIO
         "all_vs_tof_only": all_vs_tof_only,
         "time_reversal": time_reversal,
         "random_channel": random_channel,
+        # 六個 run_permutation_test() 呼叫共用同一個 groups 引數，這裡拿
+        # r_all 的結果代表整批——_resolve_grouping() 對同樣的 groups/樣本數
+        # 是決定性的，六者必然相同，不需要各自存一份。
+        "grouping": r_all.get("grouping", "ungrouped_no_groups_given"),
+        "n_groups": r_all.get("n_groups"),
+        "grouping_note": r_all.get("grouping_note"),
     }
+
+
+def _ablation_grouping_lines(suite):
+    """分組驗證狀態，**整份報告只講一次**——六個消融背後的六個
+    `run_permutation_test()` 呼叫共用同一個 `groups`，個別小節裡再各講
+    一次同樣的話只是六句一模一樣的警語洗版，讀報告的人反而更容易略過。
+
+    重用 `d18_permutation_test._grouping_lines()` 的三態文字，不是另外
+    寫一份可能對不上的版本。
+    """
+    from analysis.experiments.d18_permutation_test import _grouping_lines
+
+    fake_report = {"all": {"grouping": suite.get("grouping", "ungrouped_no_groups_given"),
+                            "n_groups": suite.get("n_groups"),
+                            "grouping_note": suite.get("grouping_note")}}
+    lines = _grouping_lines(fake_report)
+    if suite.get("grouping") == "grouped":
+        lines.append(
+            "> ⚠️ **例外：第 4 項「時間反轉測試」不吃 `groups`**——它自己"
+            "實作 CV，不經過 `run_permutation_test()`，這裡沒有分組保護，"
+            "讀它的數字時仍要記得同一次戴上的洩漏風險存在。"
+        )
+        lines.append("")
+    return lines
 
 
 def format_report(suite):
@@ -239,6 +318,8 @@ def format_report(suite):
         lines.append("> ⚠️ **假資料（synthetic）產生的分數，不是真實結論。**"
                       " 真實結論待 `E05` 資料蒐集後重跑本模組取得。")
         lines.append("")
+
+    lines += _ablation_grouping_lines(suite)
 
     lines.append("## 1. 雙矩陣 vs 單顆（Sanity #6）")
     lines.append("")

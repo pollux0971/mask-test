@@ -182,8 +182,8 @@ def build_feature_seqs(trials, session_by_trial):
 
     **這裡也裁切到「真的在講話」那一段**（`_speech_window_for_trial()`），
     修 hold-to-record 按鍵按多久會洩漏進固定 `T=24` 幀的問題（同一份報告
-    「按住多久」章節）。`trim_info` 是每筆 trial 的裁切診斷
-    （`key`/`trimmed`/`source`/`reason`）——**裁切與否永遠被記錄**，不會
+    「按住多久」章節）。`trim_info` 是每筆 trial 的診斷
+    （`key`/`trimmed`/`source`/`reason`/`coverage`）——**裁切與否永遠被記錄**，不會
     有「一部分樣板裁過、一部分沒裁但沒人知道」的情況。
 
     ⚠️ **改這裡會讓 `D06`/`D09`/`D22` 的數字跟著變，這是預期的**——
@@ -261,6 +261,20 @@ def build_feature_seqs(trials, session_by_trial):
         trim_info.append({
             "key": trial.key, "trimmed": window_result.trimmed,
             "source": window_result.source, "reason": window_result.reason,
+            # `QueryAssembly.coverage`（`live_pipeline.py` 的 `SensorCoverage`）
+            # 算好了，但沒有任何呼叫端把它接出來——`reports/DEGRADED_SESSION.md`
+            # 指名的第三種失效形態（斷斷續續的感測器）**只有這個欄位看得到**：
+            # 全程無資料看 `/meta` 的 `sensors_seen`，中途掉線看 per-trial
+            # `sensors_seen`，斷斷續續兩者都看不出來，只有這裡的
+            # `present_frames`/`usable_fraction` 才有。這裡只是把它帶出來，
+            # **不訂門檻**——多低算不可用，故意留給看報告的人自己判斷
+            # （見下方 `run_experiments()` 怎麼用它）。
+            "coverage": {
+                "tof_A": seq.coverage.fraction("tof_A"),
+                "tof_B": seq.coverage.fraction("tof_B"),
+                "mel": seq.coverage.fraction("mel"),
+                "usable_fraction": seq.coverage.usable_fraction(),
+            },
         })
     return feature_seqs, labels, skipped, by_trial, trim_info
 
@@ -640,6 +654,32 @@ def run_ablation(feature_seqs, labels, *, n_permutations, cv=3):
     return suite["dual_matrix_vs_single"], ("d19_ablation", mod.format_report(suite))
 
 
+def run_d18_permutation(feature_seqs, labels, wear_ids, *, n_permutations, is_synthetic):
+    """`D18` 置換檢定，**帶 `wear_id` 分組**。
+
+    `esp-mask-test-7c` 已經在 `d18_permutation_test.py` 做好分組驗證
+    （`groups=`），但 `run_all.py` 從來沒有呼叫過這支模組——這裡是第一次
+    接上，不是「修一個接錯的參數」。`wear_ids` 直接傳給
+    `permutation_report(groups=...)`，三種分組狀態（`grouped`／
+    `ungrouped_no_groups_given`／`ungrouped_single_group`）完全由那支
+    模組自己的 `_resolve_grouping()` 決定，這裡不做任何預先判斷或過濾
+    ——**尤其不能因為「看起來只有一個 wear_id」就自己決定不傳，那樣
+    `grouping` 永遠是 `ungrouped_no_groups_given`（沒要求過），會蓋掉
+    `ungrouped_single_group`（要求了但做不到）這個更重要的警訊**。
+
+    置換次數沿用 `--ablation-permutations`（跟 `D19` 共用同一個時間預算
+    旋鈕，理由相同：完整 1000 次要約 70 秒）。
+    """
+    from analysis.experiments import d18_permutation_test as mod
+
+    report = mod.permutation_report(
+        feature_seqs, labels, n_permutations=n_permutations,
+        is_synthetic=is_synthetic, groups=wear_ids,
+    )
+    grouping = report["all"]["grouping"]
+    return grouping, ("d18_permutation", mod.format_report(report))
+
+
 # ------------------------------------------------------------------ 主流程
 
 
@@ -647,9 +687,10 @@ def run_experiments(sessions, *, fast=False, is_synthetic=True,
                     ablation_permutations=200):
     """跑所有跑得動的實驗。回傳 `(outcomes, extras, notes)`。
 
-    `extras` 裝的是**不在通過矩陣裡、但參與跨實驗一致性檢查**的結果
-    （`D16` 的資訊增益、`D19` 的消融）。它們跟五個主實驗分開的理由見
-    `run_mutual_information()`。
+    `extras` 裝的是**不在通過矩陣裡**的側邊結果：`D16` 的資訊增益、`D19`
+    的消融（兩者參與跨實驗一致性檢查，理由見 `run_mutual_information()`）、
+    `D18` 的置換檢定分組狀態（`"d18_grouping"`，不參與那個一致性檢查，
+    純粹是「這一輪的準確率數字能不能信」的旗標——見 `run_d18_permutation()`）。
     """
     available = session_loader.availability(sessions)
     pairs = session_loader.usable_trials(sessions)
@@ -676,6 +717,27 @@ def run_experiments(sessions, *, fast=False, is_synthetic=True,
                 ) + ("…" if len(untrimmed) > 5 else "")
             notes.append(note)
 
+        # `SensorCoverage`（`live_pipeline.py`）算好了三個模態各自的資料
+        # 覆蓋率，這裡只是把它帶出來讓人看得到，**不訂通過/不通過的門檻**
+        # ——`reports/DEGRADED_SESSION.md` 指名「斷斷續續」這種失效形態
+        # 只有這個數字看得出來（全程無資料看 `sensors_seen`、中途掉線看
+        # per-trial `sensors_seen`，兩者都看不出「忽有忽無」）。列最低的
+        # 幾筆，不代表「這幾筆不能用」，只是讓人知道去哪裡看。
+        with_coverage = [t for t in trim_info if t.get("coverage")]
+        if with_coverage:
+            worst = sorted(with_coverage, key=lambda t: t["coverage"]["usable_fraction"])[:5]
+            notes.append(
+                "各 trial 的模態資料覆蓋率（tof_A/tof_B/mel 個別 present 比例、"
+                "usable = 三者同時有資料的比例，1.0 = 全程都有；不代表通過/"
+                "不通過，數字直接列出）：最低的幾筆 " + "；".join(
+                    f"{t['key']}（tof_A={t['coverage']['tof_A']:.0%}, "
+                    f"tof_B={t['coverage']['tof_B']:.0%}, "
+                    f"mel={t['coverage']['mel']:.0%}, "
+                    f"usable={t['coverage']['usable_fraction']:.0%}）"
+                    for t in worst
+                )
+            )
+
     crosstalk, crosstalk_diagnosis = session_loader.crosstalk_pairs(sessions)
     runners = {
         "C0": lambda: run_crosstalk(crosstalk, crosstalk_diagnosis,
@@ -701,30 +763,57 @@ def run_experiments(sessions, *, fast=False, is_synthetic=True,
         except Exception as exc:                     # noqa: BLE001 — 逐實驗容錯
             outcomes.append(_errored(key, exc))
 
+    # `wear_id` 跟 `feature_seqs`/`labels` 對齊：`build_feature_seqs()`
+    # 逐一走訪 `trials`，成功的才 append，順序不變——所以「有成功組出特徵
+    # 的那些 trial」用同樣的過濾條件重建，順序就跟 `feature_seqs` 對得上，
+    # 不需要再讓 `build_feature_seqs()` 多回傳一個列表。
+    wear_ids_for_features = [t.wear_id for t in trials if id(t) in feature_by_trial]
+
     # 側邊實驗需要跟 `C`/`E` 同一批特徵；特徵不足就跳過，並在備註講明
     # ——**不是靜靜地讓一致性檢查永遠只有一票**。
     if len(feature_seqs) >= 2 and len(set(labels)) >= 2:
-        for name, runner in (
-            ("D16 雙矩陣資訊增益", lambda: run_mutual_information(feature_seqs, labels)),
-            ("D19 消融", (lambda: run_ablation(feature_seqs, labels,
-                                               n_permutations=ablation_permutations))
-                          if ablation_permutations > 0 else None),
+        for name, extras_key, skip_consequence, runner in (
+            ("D16 雙矩陣資訊增益", "d16_gain", "「第二顆 ToF 有沒有用」的三方投票少一票",
+             lambda: run_mutual_information(feature_seqs, labels)),
+            ("D19 消融", "d19_dual_matrix", "「第二顆 ToF 有沒有用」的三方投票少一票",
+             (lambda: run_ablation(feature_seqs, labels, n_permutations=ablation_permutations))
+             if ablation_permutations > 0 else None),
+            ("D18 置換檢定", "d18_grouping", "無法確認這批資料的分類顯著性是否可信",
+             (lambda: run_d18_permutation(feature_seqs, labels, wear_ids_for_features,
+                                           n_permutations=ablation_permutations,
+                                           is_synthetic=is_synthetic))
+             if ablation_permutations > 0 else None),
         ):
             if runner is None:
-                notes.append("D19 消融未執行（--ablation-permutations 0）；"
-                             "「第二顆 ToF 有沒有用」的三方投票少一票")
+                notes.append(f"{name}未執行（--ablation-permutations 0）；{skip_consequence}")
                 continue
             try:
                 value, report = runner()
             except Exception as exc:                 # noqa: BLE001 — 側邊實驗容錯
-                notes.append(f"{name} 執行失敗（{type(exc).__name__}: {exc}）；"
-                             "跨實驗一致性檢查會少一個來源")
+                notes.append(f"{name} 執行失敗（{type(exc).__name__}: {exc}）；{skip_consequence}")
                 continue
-            key = "d16_gain" if name.startswith("D16") else "d19_dual_matrix"
-            extras[key] = value
+            extras[extras_key] = value
             side_reports.append(report)
+            if extras_key == "d18_grouping":
+                # 🔴 這個狀態必須在 summary.md 上就看得到，不能只藏在
+                # side report 裡——尤其 `ungrouped_single_group`（要求了
+                # 分組但只戴過一次做不到）是使用者第一批資料最可能落入
+                # 的狀態，而它「看起來」很容易被誤讀成「跟真的分組一樣」。
+                if value == "grouped":
+                    notes.append("D18 置換檢定：已用 wear_id 做分組驗證（StratifiedGroupKFold）。")
+                elif value == "ungrouped_single_group":
+                    notes.append(
+                        "🔴 D18 置換檢定：要求了分組驗證，但這批資料只有 1 個 "
+                        "wear_id（例如只戴過一次），分組驗證無法進行——這一輪"
+                        "的準確率與 p 值可能被同一次戴上的組內洩漏灌水，"
+                        "見 d18_permutation.md。"
+                    )
+                else:
+                    notes.append(
+                        "D18 置換檢定：未做分組驗證（沒有提供 wear_id）。"
+                    )
     else:
-        notes.append("特徵序列不足，`D16`/`D19` 未執行；"
+        notes.append("特徵序列不足，`D16`/`D18`/`D19` 未執行；"
                      "「第二顆 ToF 有沒有用」的三方投票沒有任何來源")
 
     return outcomes, extras, notes, side_reports

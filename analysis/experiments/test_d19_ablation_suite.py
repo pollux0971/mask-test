@@ -324,3 +324,80 @@ def test_run_ablation_suite_is_synthetic_flag_propagates():
     assert suite["is_synthetic"] is True
     text = format_report(suite)
     assert "假資料" in text
+
+
+# ---------------------------------------------------------------------------
+# groups：六個檢定要嘛全部分組、要嘛全部沒分組，不能各講各的
+# ---------------------------------------------------------------------------
+
+
+def test_groups_reach_all_six_underlying_permutation_tests():
+    """`all`/`mel`/`tof_combined`/`tof_l`/`tof_r`/雜訊化後的 `all`——
+    六個 run_permutation_test() 呼叫，同一次 run_ablation_suite() 裡
+    必須拿到同一個分組狀態，不能有的分組了、有的沒有。"""
+    feats, labels = _make_trials(tof_amp=0.15, mel_amp=0.13, noise=1.0)
+    # 兩個 wear_id，各佔一半——不必是真實配戴語意，只需要 >= 2 個 group。
+    groups = [0] * (len(labels) // 2) + [1] * (len(labels) - len(labels) // 2)
+
+    suite = run_ablation_suite(feats, labels, n_permutations=20, cv=5,
+                                random_state=0, groups=groups)
+
+    assert suite["grouping"] == "grouped"
+    assert suite["n_groups"] == 2
+    underlying = [
+        suite["dual_matrix_vs_single"]["tof_l"],
+        suite["dual_matrix_vs_single"]["tof_r"],
+        suite["dual_matrix_vs_single"]["tof_combined"],
+        suite["all_vs_mel_only"]["all"],
+        suite["all_vs_mel_only"]["mel_only"],
+        suite["random_channel"]["noised"],
+    ]
+    assert all(r["grouping"] == "grouped" for r in underlying)
+
+
+def test_groups_default_to_ungrouped_when_not_given():
+    feats, labels = _make_trials(tof_amp=0.15, mel_amp=0.13, noise=1.0)
+    suite = run_ablation_suite(feats, labels, n_permutations=20, cv=5, random_state=0)
+    assert suite["grouping"] == "ungrouped_no_groups_given"
+
+
+def test_groups_with_a_single_group_is_reported_not_silently_dropped():
+    """第一批資料很可能只戴一次——分組驗證要不到，但必須明確說做不到，
+    不能安靜退回未分組的舊行為卻看起來若無其事。"""
+    feats, labels = _make_trials(tof_amp=0.15, mel_amp=0.13, noise=1.0)
+    groups = [0] * len(labels)  # 只有一個 wear_id
+
+    suite = run_ablation_suite(feats, labels, n_permutations=20, cv=5,
+                                random_state=0, groups=groups)
+
+    assert suite["grouping"] == "ungrouped_single_group"
+    assert suite["grouping_note"] is not None
+
+
+def test_report_shows_grouping_status_once_not_six_times():
+    """六個消融小節共用同一個分組結果——狀態只該在報告裡出現一次，
+    六句一模一樣的警語會讓人更容易略過，不是更容易注意到。"""
+    suite = _minimal_suite_for_report()
+    suite["grouping"] = "ungrouped_single_group"
+    suite["n_groups"] = 1
+    suite["grouping_note"] = "要求了分組驗證，但資料裡只有 1 個 group"
+
+    text = format_report(suite)
+    assert text.count("分組驗證無法進行") == 1
+
+
+def test_report_warns_time_reversal_is_not_group_aware_when_grouped():
+    suite = _minimal_suite_for_report()
+    suite["grouping"] = "grouped"
+    suite["n_groups"] = 3
+    suite["grouping_note"] = None
+
+    text = format_report(suite)
+    assert "時間反轉測試" in text.split("## 4.")[0]  # 出現在頂部摘要，不是只在第 4 節標題
+
+
+def test_report_omits_time_reversal_caveat_when_not_grouped():
+    suite = _minimal_suite_for_report()  # 預設沒有 grouping 欄位 -> ungrouped_no_groups_given
+    text = format_report(suite)
+    summary = text.split("## 1.")[0]
+    assert "不吃 `groups`" not in summary
