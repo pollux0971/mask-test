@@ -27,9 +27,27 @@ enrollment 樣板**，不是程式沒接上。連接 `POST /recognize` → 特�
 （`host/features/live_pipeline.py`）→ `RecognitionService` 這整條路徑
 的程式碼都已經存在，只是還沒有樣板可以拿來辨識。
 
-**這一條有機會在今天之內變成過去式**——使用者說要開始跑 E 系列了，
-`E06`（錄 72 筆樣板）一完成，`templates/` 就不再是空的，這整段標記
-就該拿掉。**用「目前」的語氣讀這一段，不要當成永久性的結論。**
+✅ **更正：「錄好的 trial 變成樣板」這一步的工具也已經有了**——實測
+確認 `analysis/similarity/build_templates_from_session.py` 存在且能跑：
+
+```bash
+python3 -m analysis.similarity.build_templates_from_session \
+    --session sessions/<檔案1>.h5 --session sessions/<檔案2>.h5 \
+    --out templates/<subject>_<wear_id>.npz \
+    --subject <subject> --wear-id <wear_id>
+```
+
+錄完 `E06` 的 72 筆之後，跑這一行，`templates/` 就有東西了，`/recognize`
+接下來就能真的辨識。⚠️ **已知風險（還在量，`8f` 正在處理）**：這個工具
+跟 `analysis/run_all.py`（離線分析報告用的路徑）對「ToF 幀數 ≠ Mel
+幀數」的處理方式不一樣——這支工具刻意跟 `/recognize` 走同一條 `Aligner`
+真時間對齊路徑，`run_all.py` 是幀數截斷。兩者理論上可能有小落差，目前
+沒有真實資料上的量測結果，先知道這件事，不代表現在就有問題（細節見
+`reports/DEMO_DRYRUN.md` 第 3 節）。
+
+**這一段的狀態今天已經變了兩次**——使用者一旦錄完 `E06`、跑過上面這行，
+這整段標記就該再檢查一次是不是可以整個拿掉。**用「目前」的語氣讀這一
+段，不要當成永久性的結論。**
 
 **自動觸發仍然沒有接**——`{type:"trial"}` 事件從來沒有任何東西發布過，
 所以即使 `/recognize` 已經能回應，還是要靠手動按「觸發辨識」，不是

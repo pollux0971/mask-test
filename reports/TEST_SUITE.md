@@ -88,6 +88,146 @@ D/C 軌還在開發），完整跑過三種方式，全部 0 失敗：
 - **matplotlib 後端**：所有畫圖的測試檔開頭都已經 `matplotlib.use("Agg")`，
   無頭環境不需要額外設定。
 
+## 🔴 根因：`hold_duration` 用的是**裝置時間戳**，不是牆上時間
+
+`host/trial/state_machine.py:479`：
+
+```python
+hold_duration_s = (device_t_us - self._hold_start_device_t_us) / 1e6
+```
+
+`device_t_us` 來自 `bridge_server.py` 的 `device_clock["last_t_us"]`——
+**最後一次收到的 `$T`/`$M` 行上面的時間戳**，不是主機的時鐘。
+
+所以一個測試寫：
+
+```python
+_request(rig, "POST", "/trial/hold/start", {})
+time.sleep(0.8)                                    # ← 測試這邊過了 0.8 秒
+assert _request(rig, "POST", "/trial/hold/stop")[1]["state"] == "REST"
+```
+
+**測試這邊確實睡了 0.8 秒，但 bridge 那邊的 `last_t_us` 只有在
+serial reader 執行緒拿到 CPU、真的讀到新行時才會前進。**
+機器忙的時候那個執行緒被餓著，`last_t_us` 幾乎不動——
+
+實測到的一次：
+```
+hold_duration_s: 0.128023
+warning: too_short          ← 低於 B12 的 0.3 秒下限
+```
+
+**0.8 秒的按壓被算成 0.128 秒**，於是狀態機正確地判定「太短」，
+走到 `CONFIRM`（問使用者）而不是直接 `SAVE`。**程式完全正確，
+是測試的時間假設不成立。**
+
+極限情況是整段 hold 期間一行都沒讀到，那時 `hold_duration_s` 會是 `0.0`。
+
+### 為什麼「測試變多」本身就是觸發條件
+
+`vl53l7cx_test/monitor/` 的每個測試都要起**一對子行程**（mock device + bridge）。
+原調查時 38 個測試，現在 123 個——**同一個 pytest 行程在 10 分鐘內連續起了
+約 90 對行程**。前面測試留下的行程還在收尾，後面測試的 bridge 就在跟它們搶
+CPU。**不需要第二個 agent，一個 pytest 行程自己就會把自己餓到。**
+
+這也解釋了為什麼原調查沒重現：**當時的規模還不夠。**
+
+### 這不是「慢了一點」
+
+如果只是慢一點，加大容忍窗就好。但 `last_t_us` **完全不前進**時，
+量到的時長跟真實時長之間**沒有比例關係**——sleep 再久也沒用。
+所以修法不能是「睡久一點」。
+
+## 🔴 判準：紅燈是「環境」還是「它就是在測這件事」
+
+**這是這份文件最重要的一段。** 碰到這類偽陽性紅燈時，**不要「紅了就放寬」**。
+
+一開始的判準是「**看那個 hold 時長是不是刻意的**」——但那會誤放行一條：
+
+```python
+def test_an_in_range_hold_saves_without_asking(rig):   # ← 名字就是斷言
+    time.sleep(1.0)                                     # ← 1.0 秒，一點都不「刻意」
+    assert "SAVE" in states
+    assert body["state"] == "REST"
+```
+
+**1.0 秒完全是個普通數字，但這條測試存在的唯一理由就是
+「in-range 的 hold 不會問」。** 放寬成接受 `CONFIRM` = 變成
+「會存，可能先問一下」= **等於刪掉它，只是看起來還在**。
+
+→ **正確的判準不是「時長是不是刻意的」，是「那個斷言本身是不是題目」。**
+
+| 測試 | hold | 斷言是題目嗎 | 處理 |
+|---|---|---|---|
+| `_recorded_session` / `_record_one_in_range_trial` helper | 0.8–1.2s | ❌ 只是為了弄到一筆存好的 trial | 放寬 ✅ |
+| `test_a_saved_trial_does_not_destroy_the_baseline` | 1.2s | ❌ 題目是「baseline 還在」 | 放寬 ✅ |
+| `test_reject_marks_a_saved_trial_without_deleting_it` | 1.2s | ❌ 題目是「拒絕 ≠ 刪除」 | 放寬 ✅ |
+| `test_hold_capture_is_not_ended_by_the_ticker` | 2.0s | ❌ 題目是「ticker 不會替你結束」 | 放寬 ✅ |
+| **`test_an_in_range_hold_saves_without_asking`** | **1.0s** | 🔴 **是**——名字就是斷言 | **不動** |
+| `test_a_too_short_hold_goes_to_confirm_instead_of_guessing` | 0.1s | 🔴 **是** | **不動** |
+| `test_confirm_keeps_a_pending_trial` | 0.1s | 🔴 **是**（硬斷言 `CONFIRM`） | **不動** |
+| `test_discard_drops_a_pending_trial` | 0.1s | 🔴 **是**（硬斷言 `CONFIRM`） | **不動** |
+
+**「放寬」的具體做法**（只套用在 ✅ 那幾列）：
+
+```python
+state = _request(rig, "POST", "/trial/hold/stop")[1]["state"]
+if state == "CONFIRM":
+    assert _request(rig, "POST", "/trial/confirm")[0] == 200
+else:
+    assert state == "REST", f"hold/stop 回到未預期的狀態: {state}"
+```
+
+落在 `CONFIRM` **不是失敗**——狀態機刻意**不猜**、改問使用者，
+確認之後 trial 一樣會存起來，helper 要的東西拿得到。
+
+### 那三條硬斷言 `== "CONFIRM"` 的在高負載下**反而安全**
+
+想一下負載會把結果推向哪個方向：**負載只會讓量到的 hold 更短，
+而更短仍然是 `CONFIRM`**。所以它們不需要處理。
+
+**「時間敏感的測試都危險」是錯的直覺**——要看負載把結果推向哪一邊。
+
+## ⚠️ 殘留：有一條刻意不修
+
+`test_an_in_range_hold_saves_without_asking` **在極高負載下仍會偽陽性失敗**。
+
+**而且這是對的**：它分不出「負載讓 hold 變短」與「in-range 的閘門真的壞了」，
+**而它的職責就是後者**。放寬它就沒有任何測試在守那個閘門了。
+
+根治要把 hold 時長改成從「收到 HTTP 請求的時刻」起算——但那是
+`state_machine.py` 的**語意改動**，與「最小改動」的指示衝突。**刻意留著。**
+
+看到它紅的時候：先確認是不是自己一個人在跑，再判斷。
+
+## ⚠️ 一條通則：fixture setup 失敗會讓一整批測試**從沒被執行過**
+
+修好之前，`test_e2e_pipeline.py` 有 **6 個 `test_session_loader_*`** 卡在
+fixture setup（`_record_one_in_range_trial()` 就是 fixture 的一部分），
+所以**那 6 個測試的程式碼從來沒有被執行過一次**。
+
+**它們在 pytest 報告裡長得像 `ERROR`，不像「從沒跑過」。** 而 `ERROR` 很容易
+被跟 `FAILED` 一起掃過去，或被當成「環境問題，重跑就好」。
+
+修好之後它們**第一次真的跑起來**，而且全過——但
+**「跑起來了而且全過」跟「一直都是綠的」是兩回事**，值得分開講。
+
+> **下次看到一批 `ERROR` 集中在同一個檔案時，先問「這些測試到底有沒有被
+> 執行過」**，而不是先問「它們為什麼失敗」。
+
+## ⚠️ 待觀察：一次 `ConnectionRefusedError`，沒能重現
+
+整套跑的其中一輪，`test_bridge_verify_api.py::test_report_files_are_served_with_the_right_mime`
+出現 `ConnectionRefusedError`（bridge 中途沒回應）。
+
+* **只出現過一次**
+* 該檔案單獨跑 17/17 全綠，之後整套再跑一次也全綠
+* **沒能重現，所以下面是懷疑方向不是結論**
+
+懷疑方向：`POST /verify/run` 的背景執行緒會 `import` sklearn 與 matplotlib，
+**那是 bridge 做過最重的事**。若之後又看到 bridge 中途沒回應，
+這個方向值得先查。
+
 ## 已知的不穩定測試與原因
 
 **目前沒有找到真的會壞的測試**（見上方「結論」）。以下是主動排查過、
@@ -98,6 +238,12 @@ D/C 軌還在開發），完整跑過三種方式，全部 0 失敗：
 | 共用 fixture／全域狀態污染 | `grep` 搜尋 `host/`、`analysis/`、`vl53l7cx_test/monitor/` 底下模組層級的可變狀態（`^_x = `、`@lru_cache`、`_CACHE = ` 等樣式） | 沒找到任何一個；每個模組的狀態都在函式/類別內部，沒有模組層級的可變單例 |
 | 多個 `mock_device` 子行程搶 pty | 讀 `ssi-backlog/tools/mock_device.py:470`，`pty.openpty()` 每次呼叫都由核心配一個新路徑 | pty 配置本身不是固定共用資源；`esp-mask-test-4f` 回報的 `test_session_writer_mock_device.py` 連續單獨重跑 5 次全綠，**這輪沒有重現** |
 | 測試寫到同一個 `data/`／`reports/` 路徑互相覆蓋 | `grep` 所有 `test_*.py` 裡對 `data/`／`reports/`／`/tmp/` 的檔案存取，確認都經過 `tmp_path`／`monkeypatch` | 沒找到任何測試直接寫死路徑，全部用 pytest 的隔離 fixture |
+
+> 🔴 **下面這段推論已被上面的「根因」那節超越。** 它猜的方向（時間敏感 +
+> CPU 競爭）是對的，但**機制猜錯了**：不是「事件到達延遲變大、超出容忍窗」，
+> 而是**裝置時間戳整段不前進，量到的時長跟真實時長沒有比例關係**。
+> 兩者的差別很實際——前者可以靠加大容忍窗解決，後者不行。
+> 保留原文，因為「猜對方向但猜錯機制」本身值得記著。
 
 **最可能的真正根因（推論，非確診）**：`vl53l7cx_test/monitor/test_bridge_sse.py`
 這類測試本質上是**依賴真實時間**的（`quality_event_arrives_at_about_1hz`
@@ -119,11 +265,42 @@ pytest 行程在搶 CPU**，事件到達的實際延遲會變大，容易超出�
 > `pytest --collect-only -q` 拿當下的真實總數，再跟上一次的通過數比較
 > 才有意義。
 
-**基準快照**（本次調查完整跑過、確認 0 失敗的那一輪）：
+**基準快照**（原調查完整跑過、確認 0 失敗的那一輪）：
 
 ```
 843 passed, 14 warnings in 467.42s
 ```
+
+### 2026-08-26 修正後的 `vl53l7cx_test/monitor/` 快照
+
+> ⚠️ 同一條「移動目標」警語適用：**這也是快照，不是常數。**
+> 這個目錄從原調查的 38 個測試長到 123 個，**而它還在長**。
+
+| 時間點 | 結果 | 耗時 |
+|---|---|---|
+| 修之前 | **3 failed, 53 passed, 63 errors** | 316s |
+| 修前三處 helper 之後 | 1 failed, 122 passed, 0 errors | 651s |
+| **修完五處（現況）** | **123 passed, 0 failed, 0 errors** | **627s** |
+
+**怎麼量的**：單一 pytest 行程、`-q`，指令是
+```bash
+.venv/bin/python3 -m pytest vl53l7cx_test/monitor/ -q
+```
+⚠️ **量的當下有其他 agent 在同一台機器上活動**，所以耗時（627s）比乾淨環境
+下應該更長。**通過數是可信的，耗時只能當量級參考。**
+
+⚠️ **中間那一列的「1 failed」是上面「待觀察」那節的
+`ConnectionRefusedError`，不是 helper 的問題**——它在下一輪就消失了。
+
+### ⚠️ 重跑之前先確認機器狀態
+
+`vl53l7cx_test/monitor/` 一輪要 **10 分鐘、起約 90 對子行程**。
+
+**如果使用者正在跑實體量測（`E` 系列，一次連續 4.5 分鐘），或不確定他有沒有
+在跑——不要重跑，用這份文件裡已有的數字。** 搶走 CPU 毀掉的是一次沒辦法
+重來的實體量測。
+
+（而且，照上面的根因，**重跑本身就會製造它想量的那個問題**。）
 
 **14 個 warning 全部檢查過，都是良性的**（不是本次調查引入，附上一併記錄）：
 - `d10_crosstalk` 的 `test_zone_ambient_delta_all_nan_zone_returns_nan`：
@@ -137,9 +314,14 @@ pytest 行程在搶 CPU**，事件到達的實際延遲會變大，容易超出�
 
 **`E01` 上機當天的檢查建議**：跑一次
 `pytest host/ analysis/ ssi-backlog/tools/ vl53l7cx_test/monitor/ -q`，
-比對「跟這次 843/843 比，總數變多是正常的（新 story 加測試），
-**通過數應該等於總數**」——只要出現任何 F，先確認是不是自己一個人在跑
-（沒有其他 agent 同時佔用機器），再判斷是真的迴歸還是環境問題。
+比對「總數變多是正常的（新 story 加測試），**通過數應該等於總數**」——
+只要出現任何 `F` 或 `E`，先照這個順序判斷：
+
+1. **是不是自己一個人在跑？**（其他 agent、使用者的實體量測）
+2. **是不是「判準」那節表格裡標 🔴 的那幾條？** 那些紅了**代表真的有問題**，
+   不可以放寬
+3. **`ERROR` 集中在同一個檔案嗎？** 先問「這些測試有沒有被執行過」，
+   而不是「它們為什麼失敗」
 
 ## 調查方法（供之後的人重現或延伸）
 

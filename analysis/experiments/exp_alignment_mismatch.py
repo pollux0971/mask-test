@@ -48,9 +48,11 @@ if str(ROOT_DIR) not in sys.path:
 
 from analysis.reporting.session_loader import SessionData, Trial  # noqa: E402
 from analysis.run_all import build_feature_seqs  # noqa: E402  只 import，不修改
-from analysis.similarity.cosine_baseline import cosine_dist  # noqa: E402
+from analysis.similarity.cosine_baseline import cosine_dist, modality_cosine_dist  # noqa: E402
 from host.align.aligner import Aligner  # noqa: E402
 from host.features.live_pipeline import assemble_query_from_aligned_frames  # noqa: E402  只 import，不修改
+
+FEATURE_SLICES = {"tof": slice(0, 64), "mel": slice(64, 104)}
 
 N_TOF_ZONES = 16
 N_MEL_BANDS = 40
@@ -177,13 +179,21 @@ def run_online_path(record: dict, tof_rate_hz: float) -> np.ndarray:
 
 
 def compare(offline: np.ndarray, online: np.ndarray) -> dict:
+    """`RecognitionService`（`analysis/similarity/fusion.py`
+    的 `compute_tri_result()`）**分開算 ToF 跟 Mel 的距離**，融合前互不干擾
+    ——所以只看合併後的 104 維向量會**低估**問題：ToF 通道（64/104 維）
+    只要 index 對 index 就自己內部一致（沒被跨模態對齊落差污染），
+    在合併向量的餘弦相似度裡權重又大，容易把 Mel 通道的落差稀釋到看不見。
+    這裡刻意把合併／ToF-only／Mel-only 三個都印出來。"""
     diff = offline - online
     scale = np.abs(online).mean() or 1.0
     return {
         "max_abs_diff": float(np.abs(diff).max()),
         "rms_diff": float(np.sqrt((diff ** 2).mean())),
         "rel_rms_diff_pct": float(np.sqrt((diff ** 2).mean()) / scale * 100),
-        "cosine_dist_offline_vs_online": float(cosine_dist(offline, online)),
+        "cosine_dist_combined": float(cosine_dist(offline, online)),
+        "cosine_dist_tof_only": float(modality_cosine_dist(offline, online, FEATURE_SLICES, "tof")),
+        "cosine_dist_mel_only": float(modality_cosine_dist(offline, online, FEATURE_SLICES, "mel")),
     }
 
 
@@ -215,7 +225,9 @@ def scan_rate_and_duration_scenarios():
 def classification_flip_test(duration_s: float, tof_rate_hz: float = 30.0, mel_rate_hz: float = 62.5):
     """兩個可分辨的合成詞，樣板一律用線上（`Aligner`）路徑建（對應 `7c
     [4bedc9]` 正在寫的建樣板腳本）；查詢分別用線上／離線兩條路徑處理
-    **同一筆錄音**，看 cosine 最近鄰會不會選錯類別。"""
+    **同一筆錄音**，看 cosine 最近鄰會不會選錯類別。**分開測合併向量、
+    ToF-only、Mel-only 三種**——`compute_tri_result()` 實際上是分開判定
+    再融合，只測合併向量會錯過「Mel 這一軌單獨壞掉」這種情況。"""
     templates = {}
     for word in WORD_PATTERNS:
         enroll_record = synth_record(word, duration_s, tof_rate_hz, mel_rate_hz, seed=100)
@@ -226,23 +238,28 @@ def classification_flip_test(duration_s: float, tof_rate_hz: float = 30.0, mel_r
     query_online = run_online_path(query_record, tof_rate_hz)
     query_offline = run_offline_path(query_record)
 
-    def _nearest(query):
-        dists = {w: float(cosine_dist(query, t)) for w, t in templates.items()}
+    def _nearest(query, dist_fn):
+        dists = {w: float(dist_fn(query, t)) for w, t in templates.items()}
         best = min(dists, key=dists.get)
         return best, dists
 
-    online_pred, online_dists = _nearest(query_online)
-    offline_pred, offline_dists = _nearest(query_offline)
-    return {
-        "duration_s": duration_s,
-        "true_label": query_word,
-        "online_prediction": online_pred,
-        "online_correct": online_pred == query_word,
-        "online_dists": online_dists,
-        "offline_prediction": offline_pred,
-        "offline_correct": offline_pred == query_word,
-        "offline_dists": offline_dists,
+    dist_fns = {
+        "combined": cosine_dist,
+        "tof_only": lambda a, b: modality_cosine_dist(a, b, FEATURE_SLICES, "tof"),
+        "mel_only": lambda a, b: modality_cosine_dist(a, b, FEATURE_SLICES, "mel"),
     }
+
+    result = {"duration_s": duration_s, "true_label": query_word}
+    for name, fn in dist_fns.items():
+        online_pred, online_dists = _nearest(query_online, fn)
+        offline_pred, offline_dists = _nearest(query_offline, fn)
+        result[name] = {
+            "online_prediction": online_pred, "online_correct": online_pred == query_word,
+            "online_dists": online_dists,
+            "offline_prediction": offline_pred, "offline_correct": offline_pred == query_word,
+            "offline_dists": offline_dists,
+        }
+    return result
 
 
 def main():
@@ -250,20 +267,25 @@ def main():
     for r in scan_rate_and_duration_scenarios():
         print(f"- {r['name']}")
         print(f"    原生幀數：ToF {r['n_tof_native']}　Mel {r['n_mel_native']}")
+        print(f"    合併向量 cosine(offline,online)：{r['cosine_dist_combined']:.4f}　"
+              f"ToF-only：{r['cosine_dist_tof_only']:.4f}　"
+              f"Mel-only：{r['cosine_dist_mel_only']:.4f}")
         print(f"    RMS 差：{r['rms_diff']:.3f}（相對 online 幅度 {r['rel_rms_diff_pct']:.1f}%）　"
-              f"max|diff|：{r['max_abs_diff']:.3f}　"
-              f"cosine(offline, online)：{r['cosine_dist_offline_vs_online']:.4f}")
+              f"max|diff|：{r['max_abs_diff']:.3f}")
 
     print()
-    print("=== 分類翻轉測試（樣板一律線上建，查詢分別用線上/離線路徑）===")
+    print("=== 分類翻轉測試（樣板一律線上建，查詢分別用線上/離線路徑，分軌測）===")
     for duration_s in (0.5, 1.3, 3.0, 6.0):
         r = classification_flip_test(duration_s)
-        flag = "" if r["offline_correct"] else "  🔴 翻轉！"
-        print(f"- duration={duration_s}s：真實詞={r['true_label']}　"
-              f"online→{r['online_prediction']}（{'對' if r['online_correct'] else '錯'}）　"
-              f"offline→{r['offline_prediction']}（{'對' if r['offline_correct'] else '錯'}）{flag}")
-        print(f"    online 距離：{r['online_dists']}")
-        print(f"    offline 距離：{r['offline_dists']}")
+        print(f"- duration={duration_s}s，真實詞={r['true_label']}")
+        for track in ("combined", "tof_only", "mel_only"):
+            t = r[track]
+            flag = "" if t["offline_correct"] else "  🔴 翻轉！"
+            print(f"    [{track}] online→{t['online_prediction']}"
+                  f"（{'對' if t['online_correct'] else '錯'}）　"
+                  f"offline→{t['offline_prediction']}（{'對' if t['offline_correct'] else '錯'}）{flag}")
+            print(f"        online 距離：{t['online_dists']}")
+            print(f"        offline 距離：{t['offline_dists']}")
 
 
 if __name__ == "__main__":
