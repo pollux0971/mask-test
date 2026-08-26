@@ -419,10 +419,8 @@ static void mic_task(void *arg)
 
         if (t_end - last_stack_log_us >= 10 * 1000000) {
             UBaseType_t words_free = uxTaskGetStackHighWaterMark(NULL);
-            uart_out_lock();
             ESP_LOGI(TAG, "a15_perf: mic_task stack headroom = %u bytes",
                      (unsigned)(words_free * sizeof(StackType_t)));
-            uart_out_unlock();
             last_stack_log_us = t_end;
         }
     }
