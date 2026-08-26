@@ -285,6 +285,17 @@ registerMode("record", (() => {
   let baselineCaptureTimer = null; // fires requestBaselineCapture() once the local countdown ends
   let baselineOutcome = null; // last BaselineOutcome.to_dict(), or null
   let baselineCapturedAtMs = null; // performance.now() when baseline last succeeded, for staleness
+  // ed's stream-timeout detection (host/quality/metrics.py's QualityAggregator,
+  // 1Hz {"type":"quality",...}) -- complements, does not replace, the
+  // dataStore-based check above: this file's own check is instant (every
+  // 250ms) and always available even before the first quality event
+  // arrives; ed's is slower (1Hz) but reasons about *why* (a stale stream
+  // vs a malformed line vs a real seq gap are three different problems,
+  // see metrics.py's own docstring) and comes with a pre-written message
+  // this file must print as-is, not re-word.
+  let latestQualityEvent = null;
+  let latestSensorsSeen = null; // from {type:"status"} -- "" | "A" | "B" | "AB"
+  let latestSensorsEnabled = null;
 
   // --- C12: trial screen state ---
   let trialState = "IDLE"; // mirrors the last {"type":"trial",...} event's `state`
@@ -1004,6 +1015,44 @@ registerMode("record", (() => {
         `RMS ${(latest.rms ?? 0).toFixed(1)}　peak ${latest.peak ?? "—"}　${micHz.toFixed(0)} Hz`;
       els.liveMicBar.style.width = `${Math.min(100, ((latest.rms || 0) / LIVE_MIC_BAR_MAX) * 100)}%`;
     }
+
+    // ed's backend checks, additive on top of the dataStore check above --
+    // not a replacement, since these only exist once a {type:"status"}/
+    // {type:"quality"} event has actually arrived (nothing yet on a fresh
+    // connection, where the dataStore check above is the only signal there
+    // is).
+    if (latestSensorsEnabled != null && latestSensorsSeen != null
+        && latestSensorsEnabled !== latestSensorsSeen) {
+      els.liveSensorsMismatch.style.display = "block";
+      els.liveSensorsMismatch.textContent =
+        `⚠ 設定：${latestSensorsEnabled || "（無）"}　實際：${latestSensorsSeen || "（無）"}`;
+    } else {
+      els.liveSensorsMismatch.style.display = "none";
+    }
+
+    const malformed = latestQualityEvent ? latestQualityEvent.malformed : null;
+    if (malformed) {
+      // malformed（收到了但那行壞掉）是跟「完全沒收到」不同的問題（ed 的
+      // docstring 分了三類：malformed / seq gap / stale），值得分開顯示。
+      const rate = latestQualityEvent.malformed_rate;
+      els.liveMalformed.style.display = "block";
+      els.liveMalformed.textContent =
+        `損壞行數：${malformed}${typeof rate === "number" ? `（${(rate * 100).toFixed(1)}%）` : ""}`;
+    } else {
+      els.liveMalformed.style.display = "none";
+    }
+
+    const alarms = (latestQualityEvent && latestQualityEvent.alarms) || [];
+    if (alarms.length) {
+      els.liveAlarmsBox.style.display = "block";
+      // message 直接印出來，不要改寫（ed 的原話）——只把它自己用的
+      // **粗體** markdown 轉成真的粗體，這是排版，不是改寫字句。
+      els.liveAlarmsList.innerHTML = alarms
+        .map((a) => `<li>${(a.message || "").replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")}</li>`)
+        .join("");
+    } else {
+      els.liveAlarmsBox.style.display = "none";
+    }
   }
 
   // --- disconnect-during-CAPTURE watch (ca's audit) -----------------------
@@ -1596,6 +1645,12 @@ registerMode("record", (() => {
                 <div><span class="quality-dot quality-ok" data-live-tofb-dot>●</span> ToF B：<span data-live-tofb-text>—</span></div>
                 <div><span class="quality-dot quality-ok" data-live-mic-dot>●</span> 麥克風：<span data-live-mic-text>—</span></div>
                 <div class="label-bar-track"><div class="label-bar-fill" data-live-mic-bar style="width:0%"></div></div>
+                <div data-live-sensors-mismatch style="display:none; color:var(--accent);"></div>
+                <div data-live-malformed style="display:none; color:var(--text-dim);"></div>
+              </div>
+              <div class="warnings-box" data-live-alarms-box style="display:none; margin-bottom:14px;">
+                <div class="warnings-title">⚠ 感測器警示（後端偵測）</div>
+                <ul data-live-alarms-list></ul>
               </div>
 
               <div class="section-label">進度（C13）</div>
@@ -1703,6 +1758,10 @@ registerMode("record", (() => {
         liveMicDot: root.querySelector("[data-live-mic-dot]"),
         liveMicText: root.querySelector("[data-live-mic-text]"),
         liveMicBar: root.querySelector("[data-live-mic-bar]"),
+        liveSensorsMismatch: root.querySelector("[data-live-sensors-mismatch]"),
+        liveMalformed: root.querySelector("[data-live-malformed]"),
+        liveAlarmsBox: root.querySelector("[data-live-alarms-box]"),
+        liveAlarmsList: root.querySelector("[data-live-alarms-list]"),
         buildTemplatesBtn: root.querySelector("[data-build-templates-btn]"),
         templatesStatusBox: root.querySelector("[data-templates-status-box]"),
         templatesStatusTitle: root.querySelector("[data-templates-status-title]"),
@@ -1830,6 +1889,14 @@ registerMode("record", (() => {
         }
       } else if (evt.type === "trial") {
         onTrialEvent(evt);
+      } else if (evt.type === "status") {
+        latestSensorsSeen = evt.sensors_seen != null ? evt.sensors_seen : latestSensorsSeen;
+        latestSensorsEnabled = evt.sensors_enabled != null ? evt.sensors_enabled : latestSensorsEnabled;
+        renderLiveSensorReadout();
+      } else if (evt.type === "quality") {
+        latestQualityEvent = evt;
+        if (evt.sensors_seen != null) latestSensorsSeen = evt.sensors_seen;
+        renderLiveSensorReadout();
       }
     },
   };
