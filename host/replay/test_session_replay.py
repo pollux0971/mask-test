@@ -290,6 +290,31 @@ def test_empty_events_list_rejected():
         ReplayController([])
 
 
+# ---------------------------------------------------------------------------
+# 驗收條件字面驗證：真實 wall-clock（不是假時鐘）下時序還原誤差 < 10ms
+
+
+def test_real_wallclock_timing_accuracy_under_10ms():
+    import time
+
+    events = [ReplayEventStub(i * 50_000, f"e{i}") for i in range(10)]  # 每 50ms 一個
+    ctrl = ReplayController(events)  # 用真正的 time.monotonic
+
+    t0 = time.monotonic()
+    received_at = {}
+    while not ctrl.finished:
+        for e in ctrl.poll():
+            received_at.setdefault(e["tag"], time.monotonic() - t0)
+        time.sleep(0.002)  # 模擬呼叫端的事件迴圈 tick
+
+    for i, event in enumerate(events):
+        expected_s = event.t_us / 1e6
+        actual_s = received_at[f"e{i}"]
+        assert abs(actual_s - expected_s) < 0.010, (
+            f"e{i}: 預期 {expected_s*1000:.1f}ms，實際 {actual_s*1000:.1f}ms"
+        )
+
+
 # 假的最小 ReplayEvent，只提供 ReplayController 需要的兩個屬性
 # （t_us / trial_idx / payload），不用真的建一個 HDF5 檔就能測排程邏輯。
 class ReplayEventStub:

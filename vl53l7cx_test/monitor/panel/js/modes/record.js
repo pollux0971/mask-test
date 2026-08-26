@@ -30,9 +30,10 @@
 //   ZoneQualityReport: {"ok":bool,"unstable_zones":[int],"no_signal_zones":[int],
 //                        "suspect_zero_variance_zones":[int],"valid_zone_ratio":float}
 //
-// Scope per C11.md: settings form + baseline capture screen only. Trial
-// prompting/countdown (C12), progress list (C13), redo/discard UI (C14) are
-// explicitly out of scope -- this mode stops at "baseline done, ready".
+// Scope per C11.md: settings form + baseline capture screen only, ending at
+// a "baseline done, ready" placeholder. C12 (below) replaces that
+// placeholder with the actual trial prompt/countdown/capture screen.
+// Progress list (C13), redo/discard UI (C14) remain out of scope here.
 //
 // C12 adds: the actual trial prompt/countdown/capture screen, driven by
 // `{"type":"trial", "state":"PROMPT|COUNTDOWN|CAPTURE|CONFIRM|SAVE|REST|IDLE",

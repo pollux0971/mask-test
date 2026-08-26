@@ -14,7 +14,16 @@
   margin-bottom: 12px;
 }
 
+/* Form/baseline stay narrow and readable; the trial screen (C12, below)
+   deliberately does not share this cap -- .record-mode itself is left at
+   full width so a max-width here would constrain the trial screen's
+   containing block too, not just these two. */
 #mode-record .record-mode {
+  width: 100%;
+}
+
+#mode-record [data-screen="form"],
+#mode-record [data-screen="baseline"] {
   max-width: 560px;
 }
 
@@ -264,19 +273,20 @@
 #mode-record .trial-screen {
   max-width: none;
   width: 100%;
-  height: 100%;
+  min-height: 85vh;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 24px;
+  position: relative;
 }
 
 #mode-record .trial-topbar {
   position: absolute;
-  top: 16px;
-  left: 220px;
-  right: 24px;
+  top: 0;
+  left: 0;
+  right: 0;
   display: flex;
   justify-content: space-between;
   align-items: center;

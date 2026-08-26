@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -38,9 +39,19 @@ DEFAULT_MIN_SEGMENT_MS = 50.0
 # 高於離開閾值，不設上限會一路退穿整段靜止（實測退了將近一秒）。
 DEFAULT_MAX_ONSET_BACKOFF_MS = 96.0
 
-# sigma 的下限守衛，同 §3.2 對 ToF z-score 的做法。感測器壞掉或整段完全
-# 沒有變異時 sigma 會是 0，除下去會變成 inf/NaN，讓整個判斷靜默壞掉。
-SIGMA_FLOOR = 1e-3
+# sigma 的下限守衛：**量化尺度，不是 `1e-3`**（§3.2.1）。
+#
+# 兩個 VAD 的輸入都是整數：ToF 的距離是 i16 mm、`$M` 的 rms/peak 是 i16
+# 的 16-bit PCM 振幅（§1.1）。一個量化到 1 個單位的量測，其雜訊 σ 不可能
+# 有意義地小於量化本身——均勻量化誤差的 σ 是 `Δ/√12 ≈ 0.289`。
+#
+# `1e-3` 只擋得住**除以零**，擋不住**「小到沒有意義」**：一個安靜房間裡
+# 幾乎每幀都回同一個小整數的通道，`max(0.026, 0.001) = 0.026`，守衛等於
+# 沒作用，閾值塌掉，幾乎任何東西都會觸發。
+#
+# 單位是**該通道的傳輸單位**，所以這個常數對距離（mm）與音訊振幅都成立
+# ——兩者都量化到 1 個傳輸單位。
+SIGMA_FLOOR = 1.0 / math.sqrt(12.0)
 
 
 @dataclass(frozen=True)
@@ -213,6 +224,18 @@ def detect_segments(
     `values`/`times` 必須已經是 numpy 陣列且依 `times` 排好序——排序與
     型別轉換由呼叫端負責，這裡只管演算法。
     """
+    # §3.2.3 檢查清單第三項：**inf／NaN 要報錯，不是繼續算。**
+    # 非有限值進到狀態機不會拋例外——所有比較都是 False，於是它會安靜地
+    # 什麼都偵測不到。呼叫端（`audio_vad` / `tof_vad`）都會先過濾，所以走
+    # 到這裡代表有人繞過了那層，寧可大聲壞掉。
+    if not np.all(np.isfinite(values)):
+        raise ValueError(
+            "values 含非有限值（NaN/inf）；請在呼叫前濾掉整幀無效的樣本"
+            "——狀態機對 NaN 的比較永遠是 False，會安靜地偵測不到任何東西"
+        )
+    if not np.isfinite(mu) or not np.isfinite(sigma):
+        raise ValueError(f"mu/sigma 必須是有限值，收到 mu={mu} sigma={sigma}")
+
     enter_thr, exit_thr = thresholds(mu, sigma, enter_sigma, exit_sigma)
     guarded_sigma = max(float(sigma), SIGMA_FLOOR)
     z = (values - float(mu)) / guarded_sigma

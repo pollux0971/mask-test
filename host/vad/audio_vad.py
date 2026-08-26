@@ -55,7 +55,7 @@ from host.vad.hysteresis import (
     DEFAULT_MAX_ONSET_BACKOFF_MS,
     DEFAULT_MIN_SEGMENT_MS,
     DEFAULT_SMOOTH_FRAMES,
-    SIGMA_FLOOR,
+    SIGMA_FLOOR as _SIGMA_FLOOR,
     Segment,
     detect_segments,
     thresholds,
@@ -97,9 +97,13 @@ HANGOVER_MS = DEFAULT_HANGOVER_MS
 # 等於「至少要有兩幀」——單一幀的尖刺不構成一個詞。
 MIN_SEGMENT_MS = DEFAULT_MIN_SEGMENT_MS
 
-# sigma 的下限守衛，同 §3.2 對 ToF z-score 的做法。麥克風壞掉或整段完全
-# 沒有變異時 sigma 會是 0，除下去會變成 inf/NaN，讓整個判斷靜默壞掉。
-SIGMA_FLOOR = 1e-3
+# sigma 的下限守衛，由共用核心提供（§3.2.1 的 `1/√12`，**不是 `1e-3`**）。
+#
+# 這裡特別容易被漏掉，因為「量化」直覺上是 ToF 的問題——但 **`$M` 的
+# `rms`/`peak` 同樣是 `i16` 整數**（§1.1，`rms` 從草案的浮點改成定點就是
+# 為了這個）。安靜房間裡骨傳導麥克風的 RMS 幾乎每幀都是同一個小整數，
+# σ 趨近 0，`1e-3` 的守衛等於沒作用，閾值塌掉。
+SIGMA_FLOOR = _SIGMA_FLOOR
 
 # 判斷閾值之前先做幾幀的置中移動平均。**這不是美化，是讓 story 指定的
 # 閾值真的能用。** 純底噪高於離開閾值的機率是：

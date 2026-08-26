@@ -6,6 +6,7 @@ import pytest
 
 from analysis.experiments.exp_a_snr import (
     N_ZONES,
+    SIGMA_FLOOR,
     VERDICT_ADJUST,
     VERDICT_DIAGNOSE,
     VERDICT_PASS,
@@ -40,8 +41,8 @@ def test_zone_snr_zero_baseline_std_no_nan_or_inf():
     snr = zone_snr(baseline, round_trials, spread_trials)
 
     assert np.all(np.isfinite(snr))
-    # sigma floor 到 1e-3，delta=5 -> snr = 5000
-    np.testing.assert_allclose(snr, 5000.0)
+    # sigma floor 到 SIGMA_FLOOR（量化雜訊的理論下限 1/√12，不是任意小數）
+    np.testing.assert_allclose(snr, 5.0 / SIGMA_FLOOR)
 
 
 def test_zone_snr_rejects_wrong_shape():

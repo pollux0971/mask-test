@@ -112,6 +112,18 @@ STRENGTH_THRESHOLDS = (
 # 「ToF 均勻地弱」的判定：所有 viseme 的兩個 ToF 模態都落在 weak。
 UNIFORM_WEAK_LEVEL = "weak"
 
+# 高於這個值的 `max|z|` 在物理上講不通，多半代表**上游的 σ 下限出了問題**
+# 而不是嘴巴動得特別大（§3.2.1／3.2.2）。
+#
+# 一個貼著剛性表面的 zone，量化後 `baseline_sigma` 可以低到 0.026 mm；
+# 用 `1e-3` 當下限等於沒有下限，除下去該 zone 的 z 會衝到幾十甚至上萬，
+# 而 `max` 只取最大的那一個——**一個壞掉的 zone 就足以決定整格的顏色**，
+# 而且整張圖看起來只是「這個 viseme 特別敏感」。
+#
+# 30 的由來：本模組的 `strong` 門檻是 excess ≥ 9（約 raw 12.4）。30 已經是
+# 它的兩倍多，真實唇動不該達到——`B16` 在合成資料上量到的最大值約 23。
+IMPLAUSIBLE_MAX_ABS_Z = 30.0
+
 
 def strength_for(value):
     """把一個敏感度數值對應到四級強度字串。"""
@@ -356,6 +368,24 @@ def uniform_weak_tof(table):
     return checked > 0
 
 
+def implausible_cells(table):
+    """回傳所有 `mean max|z|` 大到物理上講不通的格子。
+
+    這是對**上游**的檢查，不是對這批樣本的檢查：見 `IMPLAUSIBLE_MAX_ABS_Z`。
+    本模組吃的是 `D03` 組好的特徵，那些 z-score 是 `D01` 用
+    `baseline_sigma` 除出來的——如果那裡的 σ 下限是 `1e-3` 而不是 §3.2.1
+    的 `1/√12`，一個剛性表面的 zone 就會把整格撐爆，**而且這張圖看起來
+    只會像「這個 viseme 特別敏感」。**
+    """
+    flagged = []
+    for viseme, row in sorted(table.items()):
+        for modality, cell in row.items():
+            if cell["mean"] is not None and cell["mean"] > IMPLAUSIBLE_MAX_ABS_Z:
+                flagged.append({"viseme": viseme, "modality": modality,
+                                "mean": cell["mean"], "n": cell["n"]})
+    return flagged
+
+
 def viseme_sensitivity_report(samples, *, vocab_path=DEFAULT_VOCAB_PATH,
                               is_synthetic=True):
     """完整報告。`samples` 是 `[(word_id, FeatureSeq.data), ...]`。
@@ -375,6 +405,7 @@ def viseme_sensitivity_report(samples, *, vocab_path=DEFAULT_VOCAB_PATH,
         "fricative_check": fricative_check(table),
         "uniform_weak_tof": uniform_weak_tof(table),
         "unknown_words": unknown_words,
+        "implausible_cells": implausible_cells(table),
         "n_samples": len(samples),
         "zone_layout_note": "zone layout: row-major (ASSUMED, unverified — see A track/E01)",
     }
@@ -403,7 +434,7 @@ def plot_viseme_sensitivity(report, dpi=DEFAULT_DPI):
                                     0.85 * len(order) + 2.2), dpi=dpi)
     masked = np.ma.masked_invalid(grid)
     cmap = plt.get_cmap("viridis").copy()
-    cmap.set_bad(color="0.9")
+    cmap = cmap.with_extremes(bad="0.9")
     image = ax.imshow(masked, cmap=cmap, aspect="auto")
 
     ax.set_xticks(range(len(modalities)))
@@ -449,6 +480,16 @@ def format_report(report):
                   " 均勻的弱通常代表訊號根本沒進來（戴法、距離、對焦），"
                   "**不是**「這些音素本來就難」——請先回頭質疑實驗 A（`D10`/`exp_a_snr`）"
                   "與配戴幾何，再討論音素。", ""]
+
+    if report["implausible_cells"]:
+        worst = max(report["implausible_cells"], key=lambda c: c["mean"])
+        lines += [f"> 🔴 **有 {len(report['implausible_cells'])} 格的 mean max|z| 大到"
+                  f"物理上講不通**（最大 {worst['mean']:.1f}，"
+                  f"Viseme {worst['viseme']} / {MODALITY_LABELS[worst['modality']]}）。"
+                  "真實唇動不該達到這個量級——**先查上游的 σ 下限**"
+                  "（§3.2.1：一個貼著剛性表面的 zone 量化後 `baseline_sigma` 可以低到"
+                  " 0.026 mm，用 `1e-3` 當下限等於沒有下限，那個 zone 會單獨撐爆整格），"
+                  "再討論這個 viseme 是不是真的比較敏感。", ""]
 
     if report["unknown_words"]:
         lines += [f"> ⚠️ 有 {len(report['unknown_words'])} 個詞不在 `config/vocab.json` 裡，"

@@ -452,3 +452,47 @@ def test_empty_sample_set_does_not_crash():
     assert "n=0" in text
     fig = plot_viseme_sensitivity(report, dpi=100)
     assert len(fig.axes[0].texts) == 6 * 3
+
+
+# ------------------------------------- 上游 σ 下限出問題時的自我防護（§3.2.2）
+
+
+def test_implausible_max_abs_z_is_flagged_as_an_upstream_problem():
+    """一個貼著剛性表面的 zone，若上游用 `1e-3` 當 σ 下限，z 會衝到幾十
+    ——而 `max` 只取最大的那一個，**一個壞掉的 zone 就決定整格的顏色**，
+    整張圖看起來只像「這個 viseme 特別敏感」。"""
+    from analysis.experiments.d14_viseme_sensitivity import (
+        IMPLAUSIBLE_MAX_ABS_Z,
+        implausible_cells,
+    )
+    rng = np.random.RandomState(30)
+    samples = []
+    for _ in range(4):
+        data = sample(rng)
+        data[5, 7] = 400.0                    # 一個 σ≈0 的 zone 爆掉
+        samples.append(("ba", data))
+    report = viseme_sensitivity_report(samples)
+
+    flagged = report["implausible_cells"]
+    assert flagged, "沒有標記出來的話，這張圖會被當成真實的敏感度差異"
+    assert flagged[0]["viseme"] == "A" and flagged[0]["modality"] == "tof_l"
+    assert flagged[0]["mean"] > IMPLAUSIBLE_MAX_ABS_Z
+
+    text = format_report(report)
+    assert "物理上講不通" in text
+    assert "先查上游的 σ 下限" in text
+
+
+def test_normal_magnitudes_are_not_flagged():
+    """正常的強訊號不能被誤報——誤報會讓人忽略真的警告。"""
+    rng = np.random.RandomState(31)
+    report = viseme_sensitivity_report(build_samples(rng))
+    assert report["implausible_cells"] == []
+    assert "物理上講不通" not in format_report(report)
+
+
+def test_implausible_cells_on_an_empty_table():
+    from analysis.experiments.d14_viseme_sensitivity import implausible_cells
+    word_to_viseme, labels = load_viseme_map()
+    table, _ = sensitivity_table([], word_to_viseme, labels)
+    assert implausible_cells(table) == []

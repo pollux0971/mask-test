@@ -148,13 +148,43 @@ class ReplayController:
         self._pos = 0
         self._anchor_wallclock: Optional[float] = None
         self._anchor_t_us: Optional[int] = None
-        self._rebase()
+        self._jump_to_position(self._clock())
 
-    def _rebase(self) -> None:
-        """重新設定排程錨點：**現在**這一刻對應到目前 `_pos` 那個事件的
-        `t_us`。任何會改變時間基準的操作（暫停/續播/變速/跳轉）都必須
-        呼叫這個，否則舊錨點會讓累積的事件在恢復播放瞬間全部到期。"""
-        self._anchor_wallclock = self._clock()
+    # -- 三種不同語意的錨點重設，不能共用一個 `_rebase()` ----------------
+    #
+    # 一開始只寫了一個籠統的 `_rebase()`，結果 pause()/resume()/set_speed()
+    # 全部呼叫它就會在恢復播放的瞬間把下一個事件立刻判定為到期——因為
+    # 「錨點 t_us = 下一個事件的 t_us」這件事本身就讓那個事件的排程公式
+    # 算出「目標時刻 = 錨點時刻」，不管中間經過多久都是「現在」。
+    # 三個操作其實要的是三種不同的東西：
+
+    def _freeze_virtual_position(self, now: float) -> None:
+        """把「照舊錨點/速度算到現在，虛擬播放進度走到哪個 t_us 了」
+        算出來、凍結成新錨點——速度可以接著換，但虛擬時間軸的位置不會
+        因為這個動作本身跳動。`pause()`／`set_speed()` 用這個：重點是
+        **沿用**之前已經播放掉的進度，不是歸零也不是跳到下一個事件。
+        """
+        if self._anchor_wallclock is not None and not self.finished:
+            elapsed_wall = now - self._anchor_wallclock
+            virtual_t_us = self._anchor_t_us + elapsed_wall * self._speed * 1e6
+        else:
+            virtual_t_us = self._events[self._pos].t_us if not self.finished else None
+        self._anchor_wallclock = now
+        self._anchor_t_us = virtual_t_us
+
+    def _reanchor_without_advancing(self, now: float) -> None:
+        """只更新 wallclock 錨點，虛擬時間軸位置維持不變。`resume()` 用
+        這個：暫停期間經過的真實時間不該被算成播放進度，不然「暫停 5 秒」
+        會變成「快轉 5 秒份的內容」。"""
+        self._anchor_wallclock = now
+        # `_anchor_t_us` 保持 `pause()` 當下 `_freeze_virtual_position()`
+        # 凍結的值，不重算。
+
+    def _jump_to_position(self, now: float) -> None:
+        """直接把錨點設成目前 `_pos` 那個事件的 `t_us`——不是「沿用進度」，
+        是硬跳到一個新位置重新起算。用在建構、`seek_to_trial()`、
+        `step()`（單步之後排程要接著從新位置算，不能留著舊錨點）。"""
+        self._anchor_wallclock = now
         self._anchor_t_us = self._events[self._pos].t_us if not self.finished else None
 
     @property
@@ -182,22 +212,23 @@ class ReplayController:
     def set_speed(self, speed: float) -> None:
         if speed not in VALID_SPEEDS:
             raise ValueError(f"speed 必須是 {VALID_SPEEDS} 之一，收到 {speed}")
+        self._freeze_virtual_position(self._clock())  # 用「換速前」的速度算到現在
         self._speed = speed
-        self._rebase()
 
     def pause(self) -> None:
+        self._freeze_virtual_position(self._clock())
         self._paused = True
 
     def resume(self) -> None:
+        self._reanchor_without_advancing(self._clock())
         self._paused = False
-        self._rebase()
 
     def seek_to_trial(self, trial_idx: int) -> None:
         idx = next((i for i, e in enumerate(self._events) if e.trial_idx == trial_idx), None)
         if idx is None:
             raise TrialNotFoundError(f"這個 session 裡沒有 trial_idx={trial_idx}")
         self._pos = idx
-        self._rebase()
+        self._jump_to_position(self._clock())
 
     def step(self) -> Optional[dict]:
         """不管排程時刻到了沒，立刻吐出下一個事件（單步偵錯用）。"""
@@ -205,7 +236,7 @@ class ReplayController:
             return None
         event = self._events[self._pos]
         self._pos += 1
-        self._rebase()
+        self._jump_to_position(self._clock())
         return {**event.payload, "replay": True}
 
     def poll(self, now: Optional[float] = None) -> List[dict]:

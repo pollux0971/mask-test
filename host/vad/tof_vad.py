@@ -71,6 +71,7 @@ from typing import Iterable, Optional, Sequence
 import numpy as np
 
 from host.vad.hysteresis import (
+    SIGMA_FLOOR,
     DEFAULT_HANGOVER_MS,
     DEFAULT_MAX_ONSET_BACKOFF_MS,
     DEFAULT_MIN_SEGMENT_MS,
@@ -100,7 +101,8 @@ BASELINE_SUSPECT_SIGMA_RATIO = 2.0
 # MAD → sigma 的換算常數（常態分布下）。
 MAD_TO_SIGMA = 1.4826
 
-# 距離的 sigma 下限。**這裡刻意不用 §3.2 的 1e-3。**
+# 距離的 sigma 下限。**照 §3.2.1**（那一節就是從下面這段實測寫出來的；
+# 保留推導是因為「為什麼」比「照契約」更難重建）。
 #
 # `$T` 的距離是 **i16、單位 mm**（§1.1），也就是量化到整數。一個量化到
 # 1 mm 的量測，其雜訊的 sigma 不可能有意義地小於量化本身：均勻量化誤差的
@@ -111,10 +113,10 @@ MAD_TO_SIGMA = 1.4826
 # 實測：`mock_device.py` 的 baseline 是 17.0 mm ± 0.15 mm，四捨五入後幾乎
 # 每一幀都是整數 17，sigma 趨近 0，z 爆到 9.4e5。用 1e-3 當下限完全擋不住。
 #
-# §3.2 的 `1e-3` 是給 `D01` 的特徵 z-score 用的（那裡的輸入已經過其他處理），
-# 這裡是 VAD 能量，用途不同、輸入是原始整數 mm，所以用量化下限才對。
-# 要沿用契約字面值的話明確傳 `sigma_floor=1e-3`。
-QUANTIZATION_SIGMA_MM = 1.0 / math.sqrt(12.0)
+# §3.2.1 現在把這個下限訂成全體適用：**單位是「該通道的傳輸單位」**，
+# 所以同一個常數對距離（mm）、signal（`signal_per_spad/100`）與音訊振幅
+# （i16 PCM）都成立——三者都量化到 1 個傳輸單位。
+QUANTIZATION_SIGMA_MM = SIGMA_FLOOR
 
 # ToF 是 30 Hz。這是本模組能分辨的時間下限，見 `quantization_us`。
 TOF_NOMINAL_FPS = 30.0
@@ -270,7 +272,7 @@ def zone_energy(
     至少還有一個有效 zone——整幀全無效時 `energy` 是 `NaN`，呼叫端要把
     那些幀**連同時間戳一起丟掉**，不要補值。
 
-    σ 的下限守衛見 `QUANTIZATION_SIGMA_MM`——**不是** §3.2 的 `1e-3`。
+    σ 的下限守衛見 `QUANTIZATION_SIGMA_MM`（§3.2.1 的 `1/√12`）。
     """
     tof = np.asarray(tof, dtype=np.float64)
     if tof.ndim != 2:
@@ -409,8 +411,8 @@ def detect_lip_activity(
 
     # 估出來的 sigma 低於理論下界，代表**估計器失效**，不是「資料超級乾淨」。
     # 最常見的成因是量化：`$T` 的距離是整數 mm，當某段資料超過一半的幀是
-    # 同一個整數時，MAD 會**剛好是 0**，閾值跟著塌成 mu + 3×1e-3——幾乎任何
-    # 東西都會觸發。這裡夾到理論下界，並在 reason 講出來。
+    # 同一個整數時，MAD 會**剛好是 0**，閾值跟著塌成 mu + 3×SIGMA_FLOOR
+    # ——幾乎任何東西都會觸發。這裡夾到理論下界，並在 reason 講出來。
     degenerate = not (sigma > analytic_sigma)
     if degenerate:
         sigma = analytic_sigma

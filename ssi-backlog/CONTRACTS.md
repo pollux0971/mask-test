@@ -19,6 +19,7 @@
 | 日期 | 章節 | 變更 | 影響的 story | 已通知 |
 |---|---|---|---|---|
 | 2026-08-26 | 1. 序列埠協定 v2 | `A15`：`$H` 新增 `bw_bytes_since_last:u32`（第 7 個資料欄），韌體端在 `uart_out.c` 累計、`tof_print_heartbeat()` 每次回報自上次 `$H` 以來送出的位元組數。**⚠️ 破壞性變更且尚未修好**：`host/capture/protocol.py` 的 `_parse_heartbeat()` 目前硬性要求 `len(parts) == 7`（對應舊格式），本變更讓每行 `$H` 變成 8 段，在該函式更新（放寬成 `>= 7` 或改成 key=value）之前，**每一行 `$H` 都無法解析**，不只是新欄位讀不到。`B03`/`dropwatch.py` 的掉幀判定不受影響（純靠 `seq` 缺口，不吃 `$H`），但 heap／溫度／新頻寬欄位在此之前對主機端全部不可見 | `A15`, `B01`, `B03`, `C04` | ⬜ 待通知（見完成回報） |
+| 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件新增 `next_label`（只在 `IDLE`/`REST`/`SAVE` 出現）。原因：Hold-to-Record 在使用者按下之前，前端完全不知道下一個要念哪個詞，只能盲按（`C12` 實作時發現）。詞指標改在 `_do_save()` 之前前進，`SAVE`/`REST` 才能 peek 到「下一個」。`abort` 讓它前進、`redo` 不會。另 `TrialStateMachine` 新增 `first_trial_idx` 參數，避免與 baseline 的 `trial_000` 撞號 | `B11`, `B12`, `B19`, `C12`, `C13` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 定義 `session` 事件在 `state:"baseline"` 時的 `progress` 形狀（`elapsed_s`/`remaining_s`/`duration_s`/`live_sigma_A|B`，完成時帶 `outcome`），並新增 `POST /session/baseline/retry`。原本 `progress` 只是佔位符沒有形狀，`C11` 實作時提案。前端須用 `elapsed_s` 重新對時；`live_sigma_*` 為 null 時必須明示「倒數是本地估計」不可假裝正常 | `B10`, `B19`, `C11`, `C12` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件補上 `CONFIRM` 狀態（`B12` Hold-to-Record 專用：按住時間超出 0.3–5 s 範圍時，資料算好但**不落盤**，等使用者決定保留或跳過）。與 `B11` 「放棄的 trial 完全不落盤」一致 | `B12`, `B19`, `C12`, `C14` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件補上 `IDLE` 狀態與 `seed` 欄位；明訂 `abort`（跳過此詞）與 `redo`（保留同詞重試）語意不同，兩者都不寫入 HDF5 與 manifest；明訂 `quality` 值域凍結為 `{ok, low, rejected}`（棄用＝`rejected`，不新增第四個值）與 `B11` 的暫定門檻 0.7／0.3，並標註該門檻無實測依據、待 `E01`/`E03` 校準 | `B11`, `B12`, `B19`, `C12`, `C14`, `D12` | 是 |
@@ -786,7 +787,7 @@ HTTP wiring（`B19`）要對應的形狀，例外型別已經對好該轉成哪�
 {"type":"mic",     "seq":.., "t_us":.., "rms":.., "peak":..}
 {"type":"mel",     "seq":.., "t_us":.., "bands":[..]}
 {"type":"quality", "t":.., "metrics":{"drop_rate":{"value":..,"level":"green","hint":".."}, ...}}
-{"type":"trial",   "state":"PROMPT|COUNTDOWN|CAPTURE|CONFIRM|SAVE|REST|IDLE", "label":"..", "idx":.., "seed":..}
+{"type":"trial",   "state":"PROMPT|COUNTDOWN|CAPTURE|CONFIRM|SAVE|REST|IDLE", "label":"..", "idx":.., "seed":.., "next_label":".."}
 {"type":"session", "state":"started|baseline|ended", "progress":{..}}
 {"type":"status",  "protocol_version":2, "degraded":false, "recording_allowed":true,
                    "warning":null, "dim":16, "fw":"..", "sr":.., "mel":.., "mel_win":..,
@@ -838,6 +839,18 @@ bridge 每秒比一次 mtime，**改完存檔即時生效，不需重啟**。
 > **`IDLE` 是合法狀態，必須廣播。** 它出現在 `REST` 結束、以及 `abort`／`redo` 之後，
 > 意思是「可以開始下一個 trial 了」。前端沒有它就只能靠逾時猜，而猜錯的代價是
 > 使用者對著一個不會反應的畫面等——`E05` 要錄 4 小時，這種摩擦會累積成真實成本。
+>
+> **`next_label`（下一個要念的詞）只出現在 `IDLE` / `REST` / `SAVE`。**
+> `PROMPT`／`COUNTDOWN`／`CAPTURE`／`CONFIRM` **沒有**——
+> 那幾個狀態下「當下」的詞才是重點，不是下一個。
+>
+> 詞序是**循環**的（`E05` 的重複次數遠超過 8 個詞），所以正常情況永遠有值；
+> 只有 `_order` 本身是空的（建構時已擋）才回 `None`。
+>
+> ⚠️ **`abort` 會讓 `next_label` 前進、`redo` 不會**——這是兩者語意差異的直接後果。
+> 詞指標在 `_do_save()` **之前**就前進，所以 `SAVE`／`REST` 事件 peek 到的是
+> 「下一個」而不是剛存好的這個；`label`（顯示用）維持到真的進 `IDLE` 才清，
+> 所以 `REST` 畫面還能顯示「剛才錄的是哪個」。
 >
 > **`session` 事件在 `state:"baseline"` 時的 `progress` 形狀**（`C11` 提案，已採納）：
 > ```json

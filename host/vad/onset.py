@@ -49,6 +49,8 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
+from host.vad.hysteresis import SIGMA_FLOOR
+
 # §1.1.2 / §1.3：ToF 30 Hz、`$M` 31.25 Hz（mic_hop=512 @16kHz）。
 TOF_FRAME_US = 1_000_000 / 30.0
 MIC_FRAME_US = 1_000_000 / 31.25
@@ -203,9 +205,14 @@ def _sigma_multipliers(result):
     if mu is None:
         mu = getattr(result, "noise_floor_mu", None)
         sigma = getattr(result, "noise_floor_sigma", None)
-    if None in (enter, exit_, mu, sigma) or not sigma:
+    if None in (enter, exit_, mu, sigma):
         return None
-    return (enter - mu) / sigma, (exit_ - mu) / sigma
+    # 守衛不是可選的（§3.2.2／3.2.3）。σ≈0 時裸除法會回 `inf`，
+    # 而 `comparable` 的判斷是拿兩組倍數相減比對——`inf - inf` 是 `NaN`，
+    # 比較永遠是 False，於是**每一筆都會被判成「可比」或「不可比」**，
+    # 端看哪邊先爆。這個函式存在的唯一目的就是把關，它自己不能先壞掉。
+    guarded = max(float(sigma), SIGMA_FLOOR)
+    return (enter - mu) / guarded, (exit_ - mu) / guarded
 
 
 def _close(a, b, tol=1e-6):

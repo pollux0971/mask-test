@@ -55,6 +55,27 @@ on) and $STATUS's mel= field always reflects the current state. The 40
 bands are a synthetic formant SHAPE, not speech -- see MelModel. Turning it
 on costs ~15.6 KB/s (#1.4), which bw_bytes_since_last will show: 4x4@30Hz
 goes from roughly 25% to 60% of the 460800-baud budget.
+
+T05 -- replaying a real captured log (real hardware / E01 is skipped for
+this project, so no such log exists yet; the mechanism below is built and
+tested against a log this same mock produces, per the T05 completion
+report):
+
+    idf.py monitor | tee logs/raw_$(date +%Y%m%d_%H%M).log
+    python3 mock_device.py --replay-log logs/raw_20260901_1430.log --replay-speed 0.25 --replay-loop
+
+--replay-log switches the device into pure playback: every other
+generation flag (--scenario, --fps, --fault, ...) is ignored, and the pty
+just replays the captured $-prefixed protocol lines at their original
+pacing, taken from each line's own t_us -- not a fixed interval, since a
+fixed interval would erase the jitter C09's quality gauge exists to show.
+Non-protocol lines (ESP_LOG boot banners, "ets Jul 29 2019 ...", etc.,
+that idf.py monitor interleaves into the capture) are recognised and
+silently dropped rather than written to the wire or mistaken for a timed
+line. --replay-speed scales the pacing (0.25 = quarter speed, for
+frame-by-frame viewing; 4.0 = four times real time); --replay-loop restarts
+from the first line once the file is exhausted, re-anchoring the clock so
+the loop's own timing doesn't drift.
 """
 
 import argparse
@@ -106,6 +127,14 @@ def parse_args():
     p.add_argument("--disconnect-after", type=float, default=15.0, help="seconds before the disconnect fault fires")
     p.add_argument("--fw-sha", default=None, help="fake git short sha for $STATUS (default: random 7 hex chars)")
     p.add_argument("--seed", type=int, default=None, help="RNG seed for reproducible runs")
+    p.add_argument("--replay-log", default=None, metavar="FILE",
+                    help="T05: replay a captured serial log instead of generating synthetic data. "
+                         "Paced from each line's own t_us, not a fixed interval. All --scenario/"
+                         "--fps/--fault/etc. generation flags are ignored in this mode.")
+    p.add_argument("--replay-speed", type=float, default=1.0,
+                    help="replay pacing multiplier (default 1.0): 0.25 = quarter speed, 4.0 = 4x. Only used with --replay-log.")
+    p.add_argument("--replay-loop", action="store_true",
+                    help="restart from the first line when the replay log is exhausted. Only used with --replay-log.")
     return p.parse_args()
 
 

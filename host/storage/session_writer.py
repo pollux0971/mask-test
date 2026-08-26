@@ -68,9 +68,19 @@ SESSION_END_META_KEYS = (
 CLOCK_CROSS_CHECK_TOLERANCE_PPM = SLOPE_TOLERANCE_PPM
 
 REQUIRED_TRIAL_ATTRS = (
-    "wear_id", "mode", "valid_zone_ratio", "drop_count",
-    "vad_start_us", "vad_end_us", "lip_onset_us", "voice_onset_us", "quality",
+    "wear_id", "mode", "valid_zone_ratio", "drop_count", "quality",
 )
+
+# 這四個 VAD 時間戳（B17 的調度決議）**不保證同時存在**：`silent` 模式下
+# `voice_onset_us` 必然缺席，但 `lip_onset_us` 仍應該有；偵測不到的一律
+# 整個 attr 不寫入，不是填 0/-1/capture 視窗邊界——那些數字對「這個 zone
+# 沒有偵測到」來說全部都是看起來合理但其實是編出來的答案，跟 §2.1 對
+# `tof_A`/`tof_B` 無效值的態度是同一個原則。讀取端要用
+# `"lip_onset_us" in trial.attrs` 判斷存在與否，直接讀不存在的 key 會拋
+# `KeyError`——這是刻意的：大聲失敗，而不是安靜地給錯誤答案。
+OPTIONAL_VAD_TIMING_ATTRS = ("vad_start_us", "vad_end_us", "lip_onset_us", "voice_onset_us")
+
+VALID_SPEAKING_MODES = ("normal", "whisper", "silent")
 
 VALID_QUALITY_VALUES = ("ok", "low", "rejected")
 
@@ -179,7 +189,9 @@ class SessionWriter:
         tof_ambient_A=None, tof_ambient_B=None, tof_ambient_t_us=None,
         audio=None, audio_t0_us=None,
         wear_id, mode, valid_zone_ratio: float, drop_count: int,
-        vad_start_us: int, vad_end_us: int, lip_onset_us: int, voice_onset_us: int,
+        vad_start_us: Optional[int] = None, vad_end_us: Optional[int] = None,
+        lip_onset_us: Optional[int] = None, voice_onset_us: Optional[int] = None,
+        speaking_mode: Optional[str] = None, vad_confidence: Optional[float] = None,
         quality: str,
     ) -> None:
         """寫一個完整的 trial，寫完立刻 flush。`idx` 重複寫會覆蓋掉舊的
@@ -188,9 +200,17 @@ class SessionWriter:
         `mel`/`mel_t_us` 與 `tof_ambient_A`/`tof_ambient_B`/`tof_ambient_t_us`
         都是各自獨立的時間軸（`F`、`Ta`），**不會**、也**不可以**拿去跟
         `tof_t_us`/`mic_t_us` 比長度——那是兩種不同取樣率的獨立串流。
+
+        `vad_start_us`/`vad_end_us`/`lip_onset_us`/`voice_onset_us`／
+        `vad_confidence` 給 `None` 就**整個 attr 不寫入**，不是填
+        0/-1/capture 視窗邊界（B17 的調度決議）——這四個時間戳不保證同時
+        存在，`silent` 模式下 `voice_onset_us` 必然缺席，但 `lip_onset_us`
+        仍應該有；呼叫端不要假設四個一起有、一起沒有。
         """
         if quality not in VALID_QUALITY_VALUES:
             raise ValueError(f"quality 必須是 {VALID_QUALITY_VALUES} 之一，收到 {quality!r}")
+        if speaking_mode is not None and speaking_mode not in VALID_SPEAKING_MODES:
+            raise ValueError(f"speaking_mode 必須是 {VALID_SPEAKING_MODES} 之一，收到 {speaking_mode!r}")
 
         tof_A = _to_float32_nan_safe(tof_A)
         tof_B = _to_float32_nan_safe(tof_B)
