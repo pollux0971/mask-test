@@ -239,11 +239,31 @@ const MARKING_MODES = [
   { key: "posthoc", label: "事後標記" },
   { key: "assigned", label: "系統指定" },
 ];
+// MATRIX_CELL_SIZE is authored at MATRIX_CELL_BASE_ROOT_PX (the default,
+// un-scaled root font-size) -- canvas text (ctx.font, drawMatrix() below)
+// doesn't participate in CSS's rem scaling at all, so C25's projector mode
+// (html[data-projector-mode] { font-size:130% }) enlarges every DOM label
+// around the matrix but leaves the matrix's own cells and text exactly
+// MATRIX_CELL_SIZE px forever unless something explicitly compensates.
+// currentMatrixCellSize() below does that for the on-screen canvas;
+// exportMatrixPNG() deliberately keeps using this fixed base value
+// unscaled -- a 300dpi print export shouldn't depend on whatever font-size
+// the viewer's screen happened to be at when they clicked "匯出 PNG".
 const MATRIX_CELL_SIZE = 40;
+const MATRIX_CELL_BASE_ROOT_PX = 16;
 const MATRIX_LABEL_W_RATIO = 1.8; // room for two-character labels like 不要/靜止／其他
 const MATRIX_LABEL_H_RATIO = 1.3;
 const EXPORT_DPI = 300;
 const CSS_DPI = 96; // browsers' baseline px-per-inch assumption; scale = EXPORT_DPI/CSS_DPI
+
+// The cells themselves grow, not just the text -- ctx.font is already
+// cellSize * 0.24 (see drawMatrix() below), so scaling cellSize alone keeps
+// the existing font-to-cell ratio and the text automatically follows,
+// instead of enlarging text into cells that stayed the old size.
+function currentMatrixCellSize() {
+  const rootPx = parseFloat(getComputedStyle(document.documentElement).fontSize) || MATRIX_CELL_BASE_ROOT_PX;
+  return Math.round(MATRIX_CELL_SIZE * (rootPx / MATRIX_CELL_BASE_ROOT_PX));
+}
 
 function hexToRgb(hex) {
   const h = hex.trim().replace("#", "");
@@ -521,10 +541,11 @@ registerMode("quiz", (() => {
 
   function renderMatrix() {
     if (!matrixCanvasEl) return;
-    const { width, height } = matrixLayoutSize(MATRIX_CELL_SIZE);
+    const cellSize = currentMatrixCellSize();
+    const { width, height } = matrixLayoutSize(cellSize);
     matrixCanvasEl.width = width;
     matrixCanvasEl.height = height;
-    drawMatrix(matrixCanvasEl.getContext("2d"), MATRIX_CELL_SIZE);
+    drawMatrix(matrixCanvasEl.getContext("2d"), cellSize);
   }
 
   // 300 dpi (C20.md's explicit acceptance criterion): browsers have no

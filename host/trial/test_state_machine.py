@@ -769,6 +769,32 @@ def test_vad_fields_are_real_when_baseline_and_speech_present(tmp_path):
         attrs = f["trial_000"].attrs
         for key in ("vad_start_us", "vad_end_us", "lip_onset_us", "voice_onset_us"):
             assert key in attrs, f"{key} 應該是真值，不該整個 attr 缺席"
+        # comparable：18 已經把 session_writer.py 那邊接上了，值有沒有記
+        # 錄下來（True 或 False 都算）才是這裡要驗的——`measure_lip_lead()`
+        # 的 comparable 除了「兩邊都偵測到」還會反推門檻 σ 倍數是否一致，
+        # 合成資料湊出來的兩邊門檻不一定一致，所以不斷言一定是 True。
+        assert isinstance(bool(attrs["comparable"]), bool)
+
+
+def test_comparable_is_false_not_absent_when_lip_or_voice_missing(tmp_path):
+    """`comparable=False`（算過，結論是不可比）跟「整個 attr 不寫入」
+    （沒算過/沒偵測到）是兩回事——這裡沒有 baseline，唇動偵測整個
+    applicable=False，`measure_lip_lead()` 因此判定 comparable=False，
+    這個 attr 應該**寫入**，不是缺席。"""
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
+    _feed_tof(aligner, "A", 900_000, 1_300_000)
+    _feed_tof(aligner, "B", 900_000, 1_300_000)
+    _feed_mic(sm, 900_000, 1_300_000)
+
+    sm.hold_start(device_t_us=1_000_000)
+    sm.hold_stop(device_t_us=2_000_000)
+    writer.__exit__(None, None, None)
+
+    with h5py.File(h5_path, "r") as f:
+        attrs = f["trial_000"].attrs
+        assert "comparable" in attrs
+        assert bool(attrs["comparable"]) is False
 
 
 def test_baseline_energy_floor_is_passed_through_to_detect_lips(tmp_path, monkeypatch):

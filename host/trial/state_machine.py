@@ -641,6 +641,11 @@ class TrialStateMachine:
             wear_id=self._wear_id, mode=self._mode,
             valid_zone_ratio=valid_zone_ratio, drop_count=drop_count,
             speaking_mode=self._speaking_mode, vad_confidence=vad_confidence,
+            # comparable：measure_lip_lead() 的旗標，兩邊門檻的 σ 倍數反推
+            # 不一致就是 False（"不能拿不可比的數字寫結論"）。write_trial()
+            # 自己分 None（沒算過/沒偵測到，整個 attr 不寫）vs. False（算過，
+            # 結論就是不可比）——原樣傳過去，不在這裡多做判斷。
+            comparable=lead.comparable,
             quality=quality, **vad_attrs,
         )
         add_session(self._session_h5_path, self._manifest_path, root=self._manifest_root)
@@ -652,13 +657,9 @@ class TrialStateMachine:
             # 呼叫端（tick()/confirm_keep()）已經在呼叫這裡之前把 _order_pos
             # 前進過了，所以此刻 peek 到的就是「下一個」，不是剛存的這個。
             next_label=self.peek_next_label(),
-            # B21：measure_lip_lead() 的 comparable 旗標（兩邊的門檻 σ 不一致
-            # 就是 False，"不能拿不可比的數字寫結論"）——CONTRACTS.md 目前
-            # 沒有 HDF5 attr 給它落腳（grep 過 session_writer.py 沒有），加
-            # 一個是 host/storage/ 的改動，不在這個 story 列的授權路徑內，
-            # 而且 session_writer.py 剛被 18 改過。先讓它至少在即時的 trial
-            # SSE 事件裡看得到，完成回報裡已標成需要調度員排 session_writer.py
-            # 的一個小改動才能落盤保留。
+            # 同一個 comparable 值也放進即時的 trial SSE 事件（跟上面落盤
+            # 用的是同一個 lead.comparable，不是兩次計算）——現場能立刻看
+            # 到，不用等事後開 HDF5。
             vad_comparable=lead.comparable,
         )
 

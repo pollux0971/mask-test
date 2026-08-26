@@ -47,7 +47,17 @@ def _recorded_session(rig):
         pytest.skip(f"baseline gate rejected the synthetic scene: {body.get('reason')}")
     _request(rig, "POST", "/trial/hold/start", {})
     time.sleep(1.2)
-    assert _request(rig, "POST", "/trial/hold/stop")[1]["state"] == "REST"
+    state = _request(rig, "POST", "/trial/hold/stop")[1]["state"]
+    if state == "CONFIRM":
+        # 機器忙的時候（例如整套測試一起跑），1.2 秒的按壓會被判定成
+        # 「太短」而走到 CONFIRM 而不是直接存檔。那不是失敗——狀態機刻意
+        # 不猜，改問使用者。這裡確認它，trial 一樣會存起來。
+        #
+        # ⚠️ `test_bridge_replay_api.py` 的同名 helper 是硬斷言 `== "REST"`，
+        # 所以它在高負載下會偽陽性失敗。那個檔案不是我的，只回報不改。
+        assert _request(rig, "POST", "/trial/confirm")[0] == 200
+    elif state != "REST":
+        pytest.fail(f"hold/stop 回到未預期的狀態: {state}")
     assert _request(rig, "POST", "/session/end")[0] == 200
     time.sleep(0.5)
 
