@@ -5,26 +5,26 @@
 // math (C22.md's own "不包含: 分析演算法 D10-D14" boundary). Every PASS/FAIL
 // number shown here comes verbatim from the backend's report matrix.
 //
-// Backend wiring status (confirmed live, both currently 404): `POST
-// /verify/run` and `GET /verify/state` don't exist yet -- proposed their
-// shape to esp-mask-test-ad/esp-mask-test-ed while writing this file, not
-// yet implemented. Same auto-upgrade pattern as C10's /pca and C16-C19's
-// /recognize: build the full UI against the documented shape now, degrade
-// to a "尚未串接" status line when the fetch 404s, and it starts working
-// the moment the endpoint lands with zero JS changes here.
+// Backend wiring status (re-confirmed live during FULL_FLOW_REHEARSAL /
+// validate-mode rework, 2026-08-26): `/verify/run`, `/verify/state`,
+// `/verify/reports`, `/verify/reports/<id>/<path>` are all fully wired in
+// bridge_server.py now. Every fetch below still keeps a network-failure
+// fallback (real "can't reach the bridge" case), but the old blanket
+// "尚未串接" text for any non-ok response was wrong once the backend went
+// live -- it hid real rejections (e.g. bad session path, already-running)
+// behind stale "not wired yet" copy. Fixed to show the backend's actual
+// error message instead.
 //
-// C0 (串擾) needs its own note. `session_loader.availability()`
-// (analysis/reporting/session_loader.py) says outright: C0 can never be
-// satisfied through run_all/session files (schema has no per-session
-// sensor on/off record) and points at "exp_d10_crosstalk 的專用流程" --
-// but exp_d10_crosstalk.py (checked directly) is a pure function library
-// (zone_distance_delta/crosstalk_verdict), not a runnable pipeline; there
-// is no CLI or HTTP surface that turns a live capture into a verdict.
-// So this file's C0 card does the part that's genuinely real today --
-// automatic, correctly-ordered device state stepping via B18's existing
-// /sensor endpoint, with real progress -- and is honest that the analysis
-// step itself has no backend wiring yet, rather than reimplementing D10's
-// math in JS to fake a number. See the completion report.
+// C0 (串擾) is a full member of the five main experiments run by
+// analysis/run_all.py's run_crosstalk() -- and one of the three must-pass
+// keys (verification_report.py's MUST_PASS). It scores off whichever
+// session file(s) you hand to /verify/run, same as A/B/C/E, PROVIDED that
+// session's per-frame sensors_enabled actually varies over time. This
+// file's C0 card does the part a human can't reliably do by hand --
+// correctly-ordered, correctly-timed sensor toggling via B18's /sensor
+// endpoint -- but it does not itself start or own a recording; the user
+// still needs a record-mode session running alongside it to produce a file
+// worth handing to /verify/run.
 
 import { registerMode } from "../shell.js";
 
@@ -62,6 +62,7 @@ function parseSessionPaths(raw) {
 }
 
 registerMode("validate", (() => {
+  let blockingEl = null;
   let cardsEl = null;
   let sessionsInputEl = null, fastCheckboxEl = null, realCheckboxEl = null;
   let runBtn = null, runStatusEl = null, runErrorEl = null;
@@ -81,7 +82,14 @@ registerMode("validate", (() => {
   let c0AbortRequested = false;
 
   function statusCellHtml(key) {
-    const outcome = lastRun && lastRun.matrix ? lastRun.matrix.find((o) => o.key === key) : null;
+    // CONTRACTS 沒明講但實測確認：`lastRun.matrix` 的每一列只有
+    // {key,name,metric,measured,criterion,status,mark,must_pass} -- 沒有
+    // `reason`/`diagnosis`。這兩個欄位只在平行的 `lastRun.outcomes`
+    // （`ExperimentOutcome.to_dict()`）裡。原本這裡讀 `matrix`，
+    // 導致下面這條「skipped/error 一定要有說明」的規矩從寫出來那天起
+    // 就沒有真的生效過 -- reason 永遠是 undefined。
+    const outcome = lastRun && Array.isArray(lastRun.outcomes)
+      ? lastRun.outcomes.find((o) => o.key === key) : null;
     if (!outcome) {
       return `<span class="validate-status validate-status-none">尚無結果</span>`;
     }
@@ -91,7 +99,24 @@ registerMode("validate", (() => {
     return `<span class="validate-status ${cls}">${label}${measured}</span>` +
       // skipped/error 一定要有說明，不能是沒有解釋的灰格子 (esp-mask-test-ad
       // 的明確要求，見完成回報)
-      (outcome.reason ? `<div class="validate-reason">${outcome.reason}</div>` : "");
+      (outcome.reason ? `<div class="validate-reason">${outcome.reason}</div>` : "") +
+      diagnosisHtml(outcome);
+  }
+
+  // `diagnosis` 一直存在於後端回應裡，但先前完全沒有被顯示過。內容依
+  // status 分兩種完全不同的東西（都讀 run_all.py 原始碼確認過）：FAIL
+  // 時是給人看的建議句子（例如「先懷疑維度詛咒，不要先懷疑資料」），
+  // ERROR 時是 `_errored()` 塞進去的完整 Python traceback。兩者混用同一種
+  // 「💡 提示」外觀會誤導人（traceback 不是建議，是程式炸了的證據）—— 前者
+  // 直接顯示，後者摺起來、換一個不暗示「這是貼心提醒」的標籤，避免口試
+  // 現場沒摺好的 stack trace 佔滿投影幕。
+  function diagnosisHtml(outcome) {
+    if (!outcome.diagnosis) return "";
+    if (outcome.status === "error") {
+      return `<details class="validate-diagnosis validate-diagnosis-error">` +
+        `<summary>⚠ 詳細錯誤（工程除錯用）</summary>${outcome.diagnosis}</details>`;
+    }
+    return `<div class="validate-diagnosis">💡 ${outcome.diagnosis}</div>`;
   }
 
   function renderCards() {
@@ -153,6 +178,44 @@ registerMode("validate", (() => {
     }
   }
 
+  function blockingKeyLabel(key) {
+    const exp = EXPERIMENTS.find((e) => e.key === key);
+    return exp ? `${key}（${exp.name}）` : key;
+  }
+
+  // 🔴 esp-mask-test-ad 明確要求提到最上面，不是藏在某張卡片裡：C0 是
+  // must-pass，C0 沒過代表下游每個數字都可能被汙染 -- 這是「這份報告能不能
+  // 信」的開關，跟其他補充資訊不是同一個重要度。must-pass 的清單直接從
+  // 這輪結果自己的 outcomes[].is_must_pass 算，不寫死 key 列表，避免跟
+  // verification_report.py 的 MUST_PASS 之後改了卻沒人發現兜不起來。
+  function renderBlocking() {
+    if (!blockingEl) return;
+    if (!lastRun) {
+      blockingEl.style.display = "none";
+      return;
+    }
+    const blocking = lastRun.blocking || [];
+    const mustPassKeys = Array.isArray(lastRun.outcomes)
+      ? lastRun.outcomes.filter((o) => o.is_must_pass).map((o) => o.key)
+      : [];
+    blockingEl.style.display = "block";
+    if (blocking.length) {
+      blockingEl.className = "validate-blocking validate-blocking-blocked";
+      blockingEl.innerHTML =
+        `🔴 這份報告的結論暫不可信：` +
+        blocking.map(blockingKeyLabel).join("、") +
+        ` 是必須通過（must-pass）的項目但沒有通過 -- 下游其他實驗的數字` +
+        `可能已被汙染，不能只看綠燈就採信。`;
+    } else if (mustPassKeys.length) {
+      blockingEl.className = "validate-blocking validate-blocking-clear";
+      blockingEl.textContent =
+        `✅ must-pass 項目（${mustPassKeys.map(blockingKeyLabel).join("、")}）都通過，` +
+        `其餘實驗的數字沒有被結構性汙染的已知理由。`;
+    } else {
+      blockingEl.style.display = "none";
+    }
+  }
+
   async function refreshState() {
     try {
       const res = await fetch("/verify/state");
@@ -163,6 +226,7 @@ registerMode("validate", (() => {
       if (state.last_run) lastRun = state.last_run;
       runErrorEl.style.display = "none";
       renderCards();
+      renderBlocking();
       renderRunStatus();
       if (!running && pollTimer) {
         clearInterval(pollTimer);
@@ -172,10 +236,12 @@ registerMode("validate", (() => {
       // refresh it so it shows up without the user reloading the page.
       if (wasRunning && !running) refreshReports();
     } catch (err) {
-      // /verify/state not wired yet (D09/C16-C19's exact same shape of gap)
+      // /verify/state is documented to always return 200 ("沒有在跑" 不是
+      // 錯誤) -- so landing here now means a real network failure, not
+      // "endpoint doesn't exist yet".
       if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
       running = false;
-      runStatusEl.textContent = "尚未串接（/verify/state 還沒上線）";
+      runStatusEl.textContent = "連不上後端（" + err.message + "）";
       console.warn("[validate] /verify/state unavailable:", err.message);
     }
   }
@@ -193,8 +259,9 @@ registerMode("validate", (() => {
       return;
     }
     runErrorEl.style.display = "none";
+    let res;
     try {
-      const res = await fetch("/verify/run", {
+      res = await fetch("/verify/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -203,20 +270,30 @@ registerMode("validate", (() => {
           real: realCheckboxEl.checked,
         }),
       });
-      if (res.status === 409) {
-        runErrorEl.textContent = "已經有一輪驗證在執行中，請等它結束";
-        runErrorEl.style.display = "block";
-        return;
-      }
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      running = true;
-      runStartedMs = performance.now();
-      renderRunStatus();
-      startPolling();
     } catch (err) {
-      runStatusEl.textContent = "尚未串接（/verify/run 還沒上線）";
-      console.warn("[validate] /verify/run unavailable:", err.message);
+      // Real network failure -- can't reach the bridge at all.
+      runStatusEl.textContent = "連不上後端（" + err.message + "）";
+      console.warn("[validate] /verify/run network error:", err.message);
+      return;
     }
+    if (res.status === 409) {
+      const body = await res.json().catch(() => ({}));
+      runErrorEl.textContent = body.error || "已經有一輪驗證在執行中，請等它結束";
+      runErrorEl.style.display = "block";
+      return;
+    }
+    if (!res.ok) {
+      // /verify/run is live -- a non-ok status here is a real rejection
+      // (e.g. "sessions 必須是非空的陣列"), not "not wired yet".
+      const body = await res.json().catch(() => ({}));
+      runErrorEl.textContent = body.error || `送出失敗：HTTP ${res.status}`;
+      runErrorEl.style.display = "block";
+      return;
+    }
+    running = true;
+    runStartedMs = performance.now();
+    renderRunStatus();
+    startPolling();
   }
 
   // ------------------------------------------------------------------- C0
@@ -277,20 +354,19 @@ registerMode("validate", (() => {
       if (c0AbortRequested) {
         renderC0Progress("已中止");
       } else {
-        renderC0Progress("步驟 4/4　分析中…");
-        // No backend wiring for this step yet -- exp_d10_crosstalk.py
-        // (analysis/experiments/) is only a pure function library
-        // (zone_distance_delta/crosstalk_verdict), there's no CLI or HTTP
-        // endpoint that turns this wizard's three captures into a verdict.
-        // Not reimplementing that math here (out of C22's scope per
-        // C22.md's "不包含: 分析演算法"), so this is honest about the gap
-        // instead of faking a PASS/FAIL. See completion report.
+        // C0 其實已經是 /verify/run 五個主實驗之一（analysis/run_all.py
+        // 的 run_crosstalk()），而且是三個 must-pass 之一 -- 不是「尚未
+        // 串接」，是這個精靈本身不負責錄音。這個精靈只做「依序、正確地
+        // 切換兩顆感測器開關」這個真人很難自己計時計準的動作；要讓
+        // /verify/run 評得出 C0，切換期間要有一個 record 模式的 session
+        // 正在錄音（讓 sensors_enabled 在同一個 session 檔案裡隨時間變化）。
         renderC0Progress("裝置狀態已依序切換完成（三種感測器組態，各 30 秒）。");
         c0ResultEl.className = "validate-c0-result validate-c0-result-pending";
         c0ResultEl.textContent =
-          "分析步驟尚未串接：exp_d10_crosstalk.py 目前只有純函式，" +
-          "還沒有對應的 HTTP 端點能把這三段擷取變成 Δ_dist 判定。" +
-          "已回報給調度員，等後端補上端點後這裡會自動可用。";
+          "這個精靈本身不會產生 session 檔案，只負責切換感測器開關。" +
+          "若剛才切換期間有另開 record 模式錄音，把錄好的 session 路徑貼到" +
+          "上面「Session 檔案」欄位、按「執行 A / B / C / E」，C0（串擾）" +
+          "會跟其他四項一起被評出 PASS / FAIL（它是 must-pass 項目）。";
       }
     } finally {
       // Always leave both sensors on afterwards -- a solo-sensor state left
@@ -331,10 +407,15 @@ registerMode("validate", (() => {
   // PNG for the D20 dual-format output.
 
   function fmtReportLabel(report) {
-    // C25: shared .caveat-badge look, same as the run-status one above.
-    const synth = report.is_synthetic ? `　<span class="caveat-badge">⚠ 合成</span>` : "";
-    return `${report.created_at || report.id}${synth}　(${
-      report.elapsed_s != null ? report.elapsed_s.toFixed(1) : "?"}s)`;
+    // 實測確認 GET /verify/reports 回的是
+    // {run_id, modified_at, has_summary, files}（bridge_server.py
+    // list_verify_runs()），不是原本猜的 {id, created_at, is_synthetic,
+    // elapsed_s, figures, sessions}。那個猜測形狀在這輪之前從沒被後端
+    // 滿足過，所以下面每一處都直接對應成真正存在的欄位，不再假裝有
+    // is_synthetic/elapsed_s/sessions/figures 這幾個這個端點沒給的東西
+    // （已回報調度員：這是「圖表看得到」需求現在做不到的根本原因）。
+    return `${report.modified_at || report.run_id}　(${
+      report.has_summary ? "有摘要" : "⚠ 無 summary.md"})`;
   }
 
   function renderReportsList() {
@@ -343,12 +424,11 @@ registerMode("validate", (() => {
       return;
     }
     reportsListEl.innerHTML = allReports.map((r) => `
-      <label class="validate-report-row${selectedIds.includes(r.id) ? " selected" : ""}">
-        <input type="checkbox" data-report-checkbox value="${r.id}"
-          ${selectedIds.includes(r.id) ? "checked" : ""}>
-        <span class="mono validate-report-id">${r.id}</span>
+      <label class="validate-report-row${selectedIds.includes(r.run_id) ? " selected" : ""}">
+        <input type="checkbox" data-report-checkbox value="${r.run_id}"
+          ${selectedIds.includes(r.run_id) ? "checked" : ""}>
+        <span class="mono validate-report-id">${r.run_id}</span>
         <span class="validate-report-meta">${fmtReportLabel(r)}</span>
-        <span class="validate-report-sessions">${(r.sessions || []).join("、")}</span>
       </label>
     `).join("");
     Array.from(reportsListEl.querySelectorAll("[data-report-checkbox]")).forEach((el) => {
@@ -371,24 +451,13 @@ registerMode("validate", (() => {
     renderCompare();
   }
 
-  function figureListHtml(report) {
-    const figures = report.figures || [];
-    const pngs = figures.filter((f) => f.endsWith(".png"));
-    if (!pngs.length) return `<div class="validate-report-no-figures">（這次執行沒有產生圖表）</div>`;
-    return `<div class="validate-report-figures">` + pngs.map((png) => {
-      const pdf = figures.find((f) => f.endsWith(".pdf") && f.slice(0, -4) === png.slice(0, -4));
-      const pngUrl = `/verify/reports/${report.id}/${png}`;
-      return `
-        <figure class="validate-figure">
-          <img src="${pngUrl}" alt="${png}" loading="lazy">
-          <figcaption>
-            ${png}
-            ${pdf ? `<a href="/verify/reports/${report.id}/${pdf}" download>下載 PDF（向量圖，供排版用）</a>` : ""}
-          </figcaption>
-        </figure>
-      `;
-    }).join("") + `</div>`;
-  }
+  // figureListHtml() 拿掉了：GET /verify/reports 目前只列出報告根目錄的
+  // 檔案（見 bridge_server.py list_verify_runs() 的 entry.iterdir()，
+  // 只掃一層），從來沒有列過 figures/ 子目錄底下的檔名，而 write_outputs()
+  // 確認圖一律寫進 figures/ 子目錄 -- 前端沒有任何管道知道圖檔叫什麼名字。
+  // 猜檔名（例如照實驗 slug 拼）是原本這裡的註解自己講過要避免的做法：
+  // D15 之後改圖檔命名，這裡會靜靜地全部連不到。已回報調度員：這是
+  // 「圖表看得到」需求現在做不到的根本原因，需要後端補一個 figures 清單。
 
   function renderCompare() {
     if (!selectedIds.length) {
@@ -396,13 +465,16 @@ registerMode("validate", (() => {
       return;
     }
     compareAreaEl.innerHTML = selectedIds.map((id) => {
-      const report = allReports.find((r) => r.id === id);
+      const report = allReports.find((r) => r.run_id === id);
       if (!report) return "";
+      const htmlUrl = report.has_summary ? `/verify/reports/${report.run_id}/summary.html` : null;
       return `
         <div class="validate-compare-panel">
-          <div class="validate-compare-head mono">${id}　${fmtReportLabel(report)}</div>
-          <iframe class="validate-compare-iframe" src="${report.html_url}" title="report ${id}"></iframe>
-          ${figureListHtml(report)}
+          <div class="validate-compare-head mono">${report.run_id}　${fmtReportLabel(report)}</div>
+          ${htmlUrl
+            ? `<iframe class="validate-compare-iframe" src="${htmlUrl}" title="report ${report.run_id}"></iframe>`
+            : `<div class="pending-note">這一輪沒有 summary.html（可能執行到一半失敗）。</div>`}
+          <div class="pending-note">圖表清單目前後端沒有提供（/verify/reports 只列出報告根目錄的檔案，不含 figures/ 子目錄），已回報調度員追加端點。</div>
         </div>
       `;
     }).join("");
@@ -414,14 +486,16 @@ registerMode("validate", (() => {
       if (!res.ok) throw new Error("HTTP " + res.status);
       const reports = await res.json();
       // 依日期新到舊排序 (C23.md 驗收條件) -- 後端理論上已經排好，這裡防
-      // 禦性地自己再排一次，不假設對方的順序永遠不會變。
-      allReports = [...reports].sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
-      selectedIds = selectedIds.filter((id) => allReports.some((r) => r.id === id));
+      // 禦性地自己再排一次，不假設對方的順序永遠不會變。欄位是
+      // modified_at，不是原本猜的 created_at。
+      allReports = [...reports].sort((a, b) => (b.modified_at || "").localeCompare(a.modified_at || ""));
+      selectedIds = selectedIds.filter((id) => allReports.some((r) => r.run_id === id));
       reportsErrorEl.style.display = "none";
       renderReportsList();
       renderCompare();
     } catch (err) {
-      reportsErrorEl.textContent = "尚未串接（/verify/reports 還沒上線）";
+      // /verify/reports is live -- landing here is a real network failure.
+      reportsErrorEl.textContent = "連不上後端（" + err.message + "）";
       reportsErrorEl.style.display = "block";
       console.warn("[validate] /verify/reports unavailable:", err.message);
     }
@@ -431,6 +505,8 @@ registerMode("validate", (() => {
     init(root) {
       root.innerHTML = `
         <div class="section-label">驗證模式 · 五項物理驗證實驗</div>
+
+        <div class="validate-blocking" data-blocking style="display:none"></div>
 
         <div class="validate-run-controls">
           <label class="validate-control-label">Session 檔案（一行一個，或逗號分隔）
@@ -454,6 +530,7 @@ registerMode("validate", (() => {
         <div class="validate-compare-area" data-compare-area></div>
       `;
 
+      blockingEl = root.querySelector("[data-blocking]");
       cardsEl = root.querySelector("[data-cards]");
       sessionsInputEl = root.querySelector("[data-sessions-input]");
       fastCheckboxEl = root.querySelector("[data-fast-checkbox]");
@@ -469,6 +546,7 @@ registerMode("validate", (() => {
       reportsErrorEl = root.querySelector("[data-reports-error]");
 
       renderCards();
+      renderBlocking();
       refreshState();
       renderReportsList();
       renderCompare();

@@ -5,6 +5,31 @@
   min-height: 0;
 }
 
+/* esp-mask-test-ad 明確要求：must-pass 沒過會汙染下游每個數字，這件事
+   必須在畫面最上面，不是藏在某張卡片裡 -- 所以它在 section-label 正下方，
+   在 run controls 之前。blocked 用 --status-bad（真的是壞消息，不是
+   pending/unknown），clear 用 --status-good 但份量刻意比 blocked 輕，
+   避免看起來像「這就是訊號分得開的證明」（它只是說 must-pass 沒有擋，
+   不代表其他實驗真的通過）。 */
+.validate-blocking {
+  flex-shrink: 0;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  padding: 10px 14px;
+  border-radius: 10px;
+}
+.validate-blocking-blocked {
+  color: var(--status-bad);
+  background: var(--status-bad-soft);
+  border: 1px solid var(--status-bad);
+  font-weight: 600;
+}
+.validate-blocking-clear {
+  color: var(--status-good);
+  background: var(--status-good-soft);
+  border: 1px solid transparent;
+}
+
 .validate-run-controls {
   display: flex;
   flex-direction: column;
@@ -163,6 +188,33 @@
   margin-top: 4px;
   line-height: 1.4;
 }
+.validate-diagnosis {
+  font-size: 0.6875rem;
+  color: var(--status-warn);
+  margin-top: 4px;
+  line-height: 1.4;
+}
+/* ERROR 的 diagnosis 是完整 Python traceback（_errored()，run_all.py），
+   不是給人看的建議 -- 摺起來，不用 --status-warn 那種「這是提醒」的顏色，
+   避免投影時佔滿螢幕、看起來像介面本身壞了。 */
+.validate-diagnosis-error {
+  font-size: 0.625rem;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+.validate-diagnosis-error summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.validate-diagnosis-error[open] {
+  white-space: pre-wrap;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  background: var(--surface-2);
+  border-radius: 6px;
+  padding: 6px 8px;
+  max-height: 200px;
+  overflow-y: auto;
+}
 
 .validate-c0-wizard {
   display: flex;
@@ -224,7 +276,7 @@
 }
 .validate-report-row {
   display: grid;
-  grid-template-columns: auto auto auto 1fr;
+  grid-template-columns: auto auto 1fr;
   align-items: center;
   gap: 10px;
   font-size: 0.75rem;
@@ -243,13 +295,6 @@
 }
 .validate-report-meta {
   color: var(--text-dim);
-}
-.validate-report-sessions {
-  color: var(--text-dim);
-  font-size: 0.6875rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .validate-compare-area {
@@ -292,34 +337,4 @@
      report meant to be printed/read standalone), not a panel surface. */
   background: #fff;
   flex-shrink: 0;
-}
-
-.validate-report-no-figures {
-  font-size: 0.6875rem;
-  color: var(--text-dim);
-}
-.validate-report-figures {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.validate-figure {
-  margin: 0;
-}
-.validate-figure img {
-  max-width: 100%;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  display: block;
-}
-.validate-figure figcaption {
-  font-size: 0.6875rem;
-  color: var(--text-dim);
-  margin-top: 4px;
-  display: flex;
-  gap: 10px;
-  align-items: center;
-}
-.validate-figure figcaption a {
-  color: var(--accent);
 }
