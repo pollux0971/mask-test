@@ -1664,6 +1664,7 @@ registerMode("record", (() => {
       // has gone stale (see BASELINE_STALE_MS) -- reuses enterBaselineScreen()
       // rather than a second "recapture" code path.
       els.baselineRestaleBtn.addEventListener("click", enterBaselineScreen);
+      els.buildTemplatesBtn.addEventListener("click", buildTemplatesFromThisSession);
 
       els.beepToggle.addEventListener("change", () => {
         beepEnabled = els.beepToggle.checked;
@@ -1734,6 +1735,7 @@ registerMode("record", (() => {
       closePreview(); // don't leave the overlay stuck open over another mode
       pendingRequeueLabel = null; // C14: don't let a stale requeue intent survive a mode switch
       stopCaptureStallWatch(); // don't leave this interval running while another mode is visible
+      clearTimeout(templatesPollTimer); // don't keep polling for a build result nobody's looking at
     },
 
     onData(evt) {

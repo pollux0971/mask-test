@@ -310,6 +310,7 @@ class SessionWriter:
         speaking_mode: Optional[str] = None, vad_confidence: Optional[float] = None,
         comparable: Optional[bool] = None,
         baseline_age_s: Optional[float] = None,
+        sensors_seen: Optional[str] = None,
         quality: str,
     ) -> None:
         """寫一個完整的 trial，寫完立刻 flush。`idx` 重複寫會覆蓋掉舊的
@@ -346,11 +347,24 @@ class SessionWriter:
         `monitor.js` 現有的 10 分鐘門檻以後可能會調，門檻變了不該讓已經
         錄好的資料跟著變義；下游要判斷過不過期，自己拿這個數字跟當下的
         門檻比較。跟其他選填欄位同一個原則：`None` 就整個 attr 不寫入。
+
+        `sensors_seen`（trial 層級）：**這一筆 trial 期間**，實際有資料流
+        過來的感測器標籤——跟 `/meta` 的同名欄位**同值域、不同涵蓋範圍**：
+        `/meta` 那個是「到 baseline 為止看到什麼」，這個是「這一筆 trial
+        期間看到什麼」，兩者可以不一致，那個不一致就是「session 中途
+        掉線」的證據（真板子的接頭會在錄製途中隨機斷開，且無法重置重打，
+        `/meta` 單獨一份記不住這件事）。`""` 一樣是合法值，代表「這筆
+        trial 期間監測到，確實沒有任何感測器資料」，跟這個 attr 完全
+        不存在（舊檔，沒有這個功能）意義相反——同一個裁決，不要因為是
+        falsy 就省略。跟 `/meta` 的版本一樣：`sensors_seen="A"` 只代表
+        「線上看到標著 A 的資料」，不是「A 這顆實體感測器是好的」。
         """
         if quality not in VALID_QUALITY_VALUES:
             raise ValueError(f"quality 必須是 {VALID_QUALITY_VALUES} 之一，收到 {quality!r}")
         if speaking_mode is not None and speaking_mode not in VALID_SPEAKING_MODES:
             raise ValueError(f"speaking_mode 必須是 {VALID_SPEAKING_MODES} 之一，收到 {speaking_mode!r}")
+        if sensors_seen is not None and sensors_seen not in VALID_SENSORS_SEEN:
+            raise ValueError(f"sensors_seen 必須是 {VALID_SENSORS_SEEN} 之一，收到 {sensors_seen!r}")
 
         tof_A = _to_float32_nan_safe(tof_A)
         tof_B = _to_float32_nan_safe(tof_B)
@@ -425,6 +439,11 @@ class SessionWriter:
             grp.attrs["comparable"] = bool(comparable)
         if baseline_age_s is not None:
             grp.attrs["baseline_age_s"] = np.float32(baseline_age_s)
+        # 用 `is not None`，不是 truthiness 檢查——"" 是合法值（沒看到任何
+        # 感測器資料的結論），跟這個 attr 完全不寫入（沒有這個功能）意義
+        # 相反，不能因為 "" 是 falsy 就漏寫。
+        if sensors_seen is not None:
+            grp.attrs["sensors_seen"] = sensors_seen
 
         self._trial_indices_written.add(idx)
         self._file.flush()

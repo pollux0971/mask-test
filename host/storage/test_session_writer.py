@@ -981,3 +981,59 @@ def test_invalid_sensors_seen_rejected(tmp_path):
     with pytest.raises(ValueError, match="sensors_seen"):
         with SessionWriter(tmp_path / "session.h5", _sample_meta(sensors_seen="C")):
             pass
+
+
+# -- sensors_seen at trial level (同名同值域，範圍是「這一筆」不是整個 session) --
+
+
+def test_trial_sensors_seen_omitted_when_none(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+    with h5py.File(path, "r") as f:
+        assert "sensors_seen" not in f["trial_000"].attrs
+
+
+@pytest.mark.parametrize("value", ["AB", "A", "B"])
+def test_trial_sensors_seen_accepts_normal_values(tmp_path, value):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs["sensors_seen"] = value
+        w.write_trial(0, **kwargs)
+    with h5py.File(path, "r") as f:
+        assert f["trial_000"].attrs["sensors_seen"] == value
+
+
+def test_trial_sensors_seen_empty_string_is_written_not_dropped(tmp_path):
+    """跟 /meta 版本一樣："" 是「這筆 trial 期間監測到，確實沒有任何感測器
+    資料」的結論，必須真的寫進去，不能因為是 falsy 被當成沒給。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs["sensors_seen"] = ""
+        w.write_trial(0, **kwargs)
+    with h5py.File(path, "r") as f:
+        assert "sensors_seen" in f["trial_000"].attrs
+        assert f["trial_000"].attrs["sensors_seen"] == ""
+
+
+def test_trial_sensors_seen_can_differ_from_meta_sensors_seen(tmp_path):
+    """/meta 記的是「到 baseline 為止」，trial attr 記的是「這一筆期間」
+    ——兩者不一致正是 session 中途掉線的證據，必須能同時存在且不同值。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta(sensors_seen="AB")) as w:
+        kwargs = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs["sensors_seen"] = "A"  # B 在這一筆 trial 期間掉線了
+        w.write_trial(0, **kwargs)
+    with h5py.File(path, "r") as f:
+        assert f["meta"].attrs["sensors_seen"] == "AB"
+        assert f["trial_000"].attrs["sensors_seen"] == "A"
+
+
+def test_invalid_trial_sensors_seen_rejected(tmp_path):
+    with SessionWriter(tmp_path / "session.h5", _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs["sensors_seen"] = "C"
+        with pytest.raises(ValueError, match="sensors_seen"):
+            w.write_trial(0, **kwargs)
