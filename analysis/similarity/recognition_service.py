@@ -52,11 +52,17 @@ import time
 from analysis.similarity.cosine_baseline import cosine_dist
 from analysis.similarity.dtw_baseline import dtw_dist
 from analysis.similarity.enrollment import calibrate_tri_reject_thresholds
+from analysis.similarity.euclidean_baseline import euclidean_dist
 from analysis.similarity.fusion import compute_tri_result
 from analysis.similarity.reject_calibration_roc import STRATEGY_EER, calibrate_tri_threshold_roc
 from analysis.similarity.scoring import DEFAULT_TAU
 
-DIST_FN_BY_NAME = {"cosine": cosine_dist, "dtw": dtw_dist}
+# "euclidean"：使用者指定（2026-08-26，經 `ad` 轉述），預設值先不動——
+# 見 `analysis/similarity/euclidean_baseline.py` 模組說明，兩模態原始
+# 距離尺度不同時，拒識融合（用 raw distance）可能被其中一個模態主導，
+# 這件事要拿真實資料量過（`reports/DISTANCE_COMPARISON.md`）才能定案，
+# 在那之前跟 cosine 一樣，只是「可選」，不是新預設。
+DIST_FN_BY_NAME = {"cosine": cosine_dist, "dtw": dtw_dist, "euclidean": euclidean_dist}
 DEFAULT_DIST_METHOD = "cosine"
 DEFAULT_REJECT_PERCENTILE = 95.0  # 只有 reject_calibration_method="loo_single" 時使用
 
