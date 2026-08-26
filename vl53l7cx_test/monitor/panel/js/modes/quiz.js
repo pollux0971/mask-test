@@ -1067,6 +1067,111 @@ registerMode("quiz", (() => {
     renderResult(triResult);
   }
 
+  // --- D08 (partial): build templates from the current recording ---
+  //
+  // POST /templates/build defaults to the current session on the backend
+  // side (reports/RECOGNIZE_PIPELINE.md), so this UI doesn't pick one --
+  // just trigger it and show whatever comes back. Same fetch-throws vs
+  // !res.ok split as onRecognizeClick() above, plus a bounded poll loop
+  // for the 202-then-poll pattern C22's /verify/run already established.
+  const BUILD_TEMPLATES_POLL_MS = 1000;
+  const BUILD_TEMPLATES_POLL_MAX_ATTEMPTS = 300; // 5 min safety cap -- the normal case self-clears on completion well before this
+
+  function renderBuildTemplatesWarnings(warnings) {
+    if (!warnings || !warnings.length) {
+      buildTemplatesWarningsEl.style.display = "none";
+      buildTemplatesWarningsEl.innerHTML = "";
+      return;
+    }
+    // Shown verbatim -- written to be read by the person who just
+    // recorded (e.g. "n=1 沒有東西可以留一筆出來測，準確率是 nan"), not
+    // developer-facing text that belongs buried in console.warn.
+    buildTemplatesWarningsEl.innerHTML = warnings.map((w) => `<li>⚠ ${w}</li>`).join("");
+    buildTemplatesWarningsEl.style.display = "block";
+  }
+
+  function stopBuildTemplatesPoll() {
+    if (buildTemplatesPollId != null) {
+      clearInterval(buildTemplatesPollId);
+      buildTemplatesPollId = null;
+    }
+  }
+
+  async function pollBuildTemplatesState(attempt) {
+    let res;
+    try {
+      res = await fetch("/templates/build/state");
+    } catch (err) {
+      stopBuildTemplatesPoll();
+      buildTemplatesStatusEl.textContent = "連不上後端（" + err.message + "）";
+      console.warn("[quiz] /templates/build/state network error:", err.message);
+      return;
+    }
+    if (!res.ok) {
+      stopBuildTemplatesPoll();
+      const body = await res.json().catch(() => ({}));
+      buildTemplatesStatusEl.textContent = body.error || `查詢建樣板狀態失敗：HTTP ${res.status}`;
+      return;
+    }
+    const state = await res.json().catch(() => null);
+    if (!state) return;
+
+    if (state.running) {
+      buildTemplatesStatusEl.textContent = `建樣板中…（${(state.elapsed_s ?? 0).toFixed(1)} 秒）`;
+      if (attempt >= BUILD_TEMPLATES_POLL_MAX_ATTEMPTS) {
+        stopBuildTemplatesPoll();
+        buildTemplatesStatusEl.textContent = "建樣板時間過長，停止等待（背景可能仍在跑，稍後重新整理再看一次）";
+      }
+      return;
+    }
+
+    stopBuildTemplatesPoll();
+    if (state.last_error) {
+      buildTemplatesStatusEl.textContent = state.last_error;
+      renderBuildTemplatesWarnings(null);
+      return;
+    }
+    const result = state.last_result;
+    if (!result) {
+      buildTemplatesStatusEl.textContent = "沒有結果（未曾建過）";
+      return;
+    }
+    const counts = Object.entries(result.counts || {}).map(([label, n]) => `${label}=${n}`).join("，");
+    buildTemplatesStatusEl.textContent = `建好了：${counts}`;
+    renderBuildTemplatesWarnings(result.warnings);
+  }
+
+  async function onBuildTemplatesClick() {
+    buildTemplatesStatusEl.textContent = "建樣板中…";
+    renderBuildTemplatesWarnings(null);
+    stopBuildTemplatesPoll();
+
+    let res;
+    try {
+      res = await fetch("/templates/build", { method: "POST" });
+    } catch (err) {
+      buildTemplatesStatusEl.textContent = "連不上後端（" + err.message + "）";
+      console.warn("[quiz] /templates/build network error:", err.message);
+      return;
+    }
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      // Includes the 409 "這個 session 還在錄製中……請先按「結束 session」
+      // 再建樣板" case (confirmed against a real file lock, see
+      // reports/RECOGNIZE_PIPELINE.md) -- shown verbatim, not "發生錯誤".
+      buildTemplatesStatusEl.textContent = body.error || `啟動建樣板失敗：HTTP ${res.status}`;
+      console.warn("[quiz] /templates/build error:", res.status, body.error);
+      return;
+    }
+
+    let attempt = 0;
+    buildTemplatesPollId = setInterval(() => {
+      attempt++;
+      pollBuildTemplatesState(attempt);
+    }, BUILD_TEMPLATES_POLL_MS);
+    pollBuildTemplatesState(attempt); // don't wait a full interval for the first check
+  }
+
   function renderCards() {
     const words = vocab.words || [];
     const reject = vocab.reject || FALLBACK_VOCAB.reject;
@@ -1299,6 +1404,12 @@ registerMode("quiz", (() => {
       resultStatusEl = root.querySelector("[data-result-status]");
       resultsAreaEl = root.querySelector("[data-results]");
       disagreeBannerEl = root.querySelector("[data-disagree-banner]");
+
+      // --- D08 (partial): build templates from the current recording ---
+      buildTemplatesBtn = root.querySelector("[data-build-templates-btn]");
+      buildTemplatesStatusEl = root.querySelector("[data-build-templates-status]");
+      buildTemplatesWarningsEl = root.querySelector("[data-build-templates-warnings]");
+      buildTemplatesBtn.addEventListener("click", onBuildTemplatesClick);
 
       // --- C19: staged progress + thumbnail wiring ---
       progressEl = root.querySelector("[data-quiz-progress]");

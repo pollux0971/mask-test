@@ -162,6 +162,46 @@ def check_mic_noise(session: SessionData, v: Verdict) -> None:
     )
 
 
+def check_mic_signal_level(session: SessionData, v: Verdict) -> None:
+    """真板子第一手資料：RMS 實測 4–6，比 `quality_thresholds.json` 的
+    `noise_floor` 綠燈門檻（300）安靜 50–75 倍——但**真正正常的數值現在
+    還不知道**（`22` 正在從韌體端反推「貼著皮膚說話大概會是多少」），
+    所以這裡**只印分佈，不判定**，跟第 3 項 `check_mic_noise()` 同一個
+    原則。
+
+    🔴 **唯一的例外**：整個 session 每一幀 RMS 都恆為 0。查過
+    `host/quality/metrics.py`（唯讀，沒有改）確認**現行的即時品質儀表板
+    對 `noise_floor` 只有「太吵」的方向**（`direction: "lower_better"`，
+    `value <= green` 就判線）——RMS=0 會被判成全綠，**跟麥克風完全沒接上
+    訊號長得一模一樣，卻是儀表板能顯示的最好結果**。追過完整下游鏈路
+    （`host/vad/audio_vad.py`、`analysis/features/audio_features.py` 的
+    CMN、`analysis/similarity/cosine_baseline.py` 的 `cosine_dist`）：
+    RMS 恆零**不會讓任何一步報錯**——VAD 回傳「沒有任何幀越過進入閾值」
+    （`applicable=True`，不是例外）、CMN 把全零的雷同幀正規化成剛好全零、
+    `cosine_dist` 靠 `DIST_EPS`（`1e-12`）避開除以零，回傳剛好 `1.0`，
+    不是 `NaN`。全程沒有任何錯誤訊息。**這正是「麥克風完全沒接上」目前
+    唯一能被抓到的地方——不是被儀表板抓到，是被這個「恆為 0」的結構性
+    檢查抓到。**
+    """
+    all_rms = np.concatenate([
+        t.mic_rms for t in session.trials
+        if t.mic_rms is not None and t.mic_rms.size
+    ]) if session.trials else np.array([])
+    if all_rms.size == 0:
+        v.info("沒有 mic_rms 資料可以檢查訊號強度")
+        return
+
+    n_zero = int(np.sum(all_rms == 0))
+    v.info(
+        f"麥克風 RMS 分布：min={all_rms.min():.1f} median={float(np.median(all_rms)):.1f} "
+        f"max={all_rms.max():.1f}（{n_zero}/{all_rms.size} 幀恆為 0）——"
+        "僅供參考，目前還不知道真實正常值該是多少（22 正在從韌體端反推"
+        "「貼著皮膚說話大概會是多少」），不判定正常/異常"
+    )
+    if n_zero == all_rms.size:
+        v.stop("麥克風 RMS 整個 session 恆為 0——這不是「數字偏低」，是麥克風可能根本沒接上訊號")
+
+
 def check_clipping(session: SessionData, v: Verdict) -> None:
     """mock 的 `MicModel.sample()` 只產生平滑的 rms/peak，peak 從沒有
     連續好幾幀貼著滿刻度——真人講太大聲會是這個形狀，之前沒有任何邏輯
