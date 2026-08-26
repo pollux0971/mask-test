@@ -26,10 +26,75 @@
 // and surfaces a tof/either trigger-source choice instead of pretending
 // Auto-VAD still applies.
 
+// C16 additions: three-track (ToF-only / Mel-only / Fused) score bars.
+//
+// TriResult (CONTRACTS.md 4.3) comes from POST /recognize (D09) -- which
+// doesn't exist yet (confirmed live: 404), and neither does the trial/VAD
+// trigger pipeline that would normally call it. There's a manual "觸發
+// 辨識" button so the chart is exercisable now and auto-works once D09
+// lands, same auto-upgrade pattern as C10's /pca check.
+//
+// D07.md gives the exact formula, and it's the SAME formula for all three
+// columns at different w: fuse(w) = softmax(-(w*d_tof + (1-w)*d_mel)/tau).
+// w=1 -> pure ToF, w=0 -> pure Mel. So "ToF only" and "Mel only" aren't
+// separate formulas, they're fuse(1) and fuse(0) -- and per D07's own
+// acceptance criteria, d_tof/d_mel from ONE fetched TriResult must never
+// be re-fetched just because w changes; this file only recomputes softmax
+// locally. C17's slider is expected to reuse fuseScores() at whatever w
+// it picks for the "Fused" column, not invent a second formula.
+//
+// distance -> score conversion is this softmax; CONTRACTS/D07.md don't
+// specify a display formula beyond "the frontend computes fuse(w)" itself,
+// so this is D07.md's own fuse() applied verbatim, not a guess.
+
 import { registerMode } from "../shell.js";
 
 const VOCAB_URL = "data/vocab.json";
 const FALLBACK_VOCAB = { words: [], reject: { id: "_reject", text: "靜止／其他" } };
+const DEFAULT_FUSED_W = 0.5; // Demo script step 1; C17 makes this a live slider
+
+function softmax(values) {
+  const max = Math.max(...values);
+  const exps = values.map((v) => Math.exp(v - max));
+  const sum = exps.reduce((a, b) => a + b, 0);
+  return exps.map((v) => v / sum);
+}
+
+function fuseScores(triResult, w) {
+  const { d_tof, d_mel, tau } = triResult;
+  const combined = d_tof.map((d, i) => w * d + (1 - w) * d_mel[i]);
+  return softmax(combined.map((d) => -d / tau));
+}
+
+function sortedEntries(classes, scores) {
+  return classes
+    .map((cls, i) => ({ cls, score: scores[i] }))
+    .sort((a, b) => b.score - a.score);
+}
+
+// FLIP: capture each bar's position (keyed by class, since sort order
+// changes), let updateFn mutate the DOM, then animate from the old
+// position to the new one instead of snapping -- C16.md's explicit
+// "分數變動時動畫重排（0.3s ease-out）" requirement.
+function flipAnimate(container, updateFn) {
+  const before = new Map(
+    Array.from(container.querySelectorAll(".quiz-bar")).map((el) => [el.dataset.classId, el.getBoundingClientRect()])
+  );
+  updateFn();
+  Array.from(container.querySelectorAll(".quiz-bar")).forEach((el) => {
+    const first = before.get(el.dataset.classId);
+    if (!first) return;
+    const last = el.getBoundingClientRect();
+    const dy = first.top - last.top;
+    if (!dy) return;
+    el.style.transition = "none";
+    el.style.transform = `translateY(${dy}px)`;
+    requestAnimationFrame(() => {
+      el.style.transition = "transform 0.3s ease-out";
+      el.style.transform = "";
+    });
+  });
+}
 
 const SPEAKING_MODES = [
   { key: "normal", label: "正常" },
@@ -52,6 +117,72 @@ registerMode("quiz", (() => {
   let speakingMode = "normal";
   let triggerSource = "tof";
   let vocab = FALLBACK_VOCAB;
+
+  // --- C16: three-track result bars ---
+  let recognizeBtn = null, resultStatusEl = null, resultsAreaEl = null, disagreeBannerEl = null;
+  const barsEl = { tof: null, mel: null, fused: null };
+  const rejectBadgeEl = { tof: null, mel: null };
+  let lastTriResult = null;
+
+  function renderColumn(el, classes, scores, rejected) {
+    const entries = sortedEntries(classes, scores);
+    el.innerHTML = entries.map((e, i) => `
+      <div class="quiz-bar${i === 0 && !rejected ? " top1" : ""}" data-class-id="${e.cls}">
+        <span class="quiz-bar-label">${e.cls}</span>
+        <div class="quiz-bar-track"><div class="quiz-bar-fill" style="width:${(e.score * 100).toFixed(1)}%"></div></div>
+        <span class="quiz-bar-pct mono">${(e.score * 100).toFixed(0)}%</span>
+      </div>
+    `).join("");
+    return entries[0];
+  }
+
+  function renderResult(triResult) {
+    lastTriResult = triResult;
+    const classes = triResult.classes;
+    const tofScores = fuseScores(triResult, 1);
+    const melScores = fuseScores(triResult, 0);
+    const fusedScores = fuseScores(triResult, DEFAULT_FUSED_W);
+
+    let tofTop, melTop, fusedTop;
+    flipAnimate(barsEl.tof, () => { tofTop = renderColumn(barsEl.tof, classes, tofScores, triResult.reject_tof); });
+    flipAnimate(barsEl.mel, () => { melTop = renderColumn(barsEl.mel, classes, melScores, triResult.reject_mel); });
+    flipAnimate(barsEl.fused, () => { fusedTop = renderColumn(barsEl.fused, classes, fusedScores, false); });
+
+    rejectBadgeEl.tof.style.display = triResult.reject_tof ? "inline-block" : "none";
+    rejectBadgeEl.mel.style.display = triResult.reject_mel ? "inline-block" : "none";
+
+    // Disagreement compares only the tracks that actually have an opinion
+    // -- a rejected track saying "nothing" isn't disagreement, it's just
+    // silence (D22 note: reject is a normal outcome, not treated as an
+    // error state to fold into this comparison).
+    const tops = [];
+    if (!triResult.reject_tof) tops.push(tofTop.cls);
+    if (!triResult.reject_mel) tops.push(melTop.cls);
+    tops.push(fusedTop.cls); // no reject_fused in CONTRACTS 4.3; fused always has an opinion here
+    const disagree = new Set(tops).size > 1;
+    resultsAreaEl.classList.toggle("results-disagree", disagree);
+    disagreeBannerEl.style.display = disagree ? "block" : "none";
+
+    resultStatusEl.textContent = "已顯示辨識結果";
+  }
+
+  async function onRecognizeClick() {
+    resultStatusEl.textContent = "辨識中…";
+    try {
+      const res = await fetch("/recognize", { method: "POST" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const triResult = await res.json();
+      if (!triResult || !Array.isArray(triResult.classes) || !Array.isArray(triResult.d_tof) || !Array.isArray(triResult.d_mel)) {
+        throw new Error("malformed TriResult");
+      }
+      renderResult(triResult);
+    } catch (err) {
+      // D09's /recognize doesn't exist yet (confirmed live, 404) -- this
+      // is the expected state right now, not a real error to alarm over.
+      resultStatusEl.textContent = "尚未串接（/recognize 還沒上線）";
+      console.warn("[quiz] /recognize unavailable:", err.message);
+    }
+  }
 
   function renderCards() {
     const words = vocab.words || [];
@@ -134,6 +265,32 @@ registerMode("quiz", (() => {
           ${TRIGGER_SOURCES.map((t) => `<button class="quiz-mode-btn" data-trigger-btn data-trigger="${t.key}">${t.label}</button>`).join("")}
         </div>
         <div class="quiz-cards" data-cards></div>
+
+        <div class="quiz-result-controls">
+          <button class="quiz-mode-btn" data-recognize-btn>觸發辨識</button>
+          <span class="quiz-result-status mono" data-result-status>尚無辨識結果</span>
+        </div>
+        <div class="quiz-disagree-banner" data-disagree-banner style="display:none">
+          ⚠ 三軌判斷不一致
+        </div>
+        <div class="quiz-results" data-results>
+          <div class="quiz-result-col">
+            <div class="quiz-result-col-head">ToF only
+              <span class="quiz-reject-badge" data-reject-badge="tof" style="display:none">拒識</span>
+            </div>
+            <div class="quiz-bars" data-bars="tof"></div>
+          </div>
+          <div class="quiz-result-col">
+            <div class="quiz-result-col-head">Mel only
+              <span class="quiz-reject-badge" data-reject-badge="mel" style="display:none">拒識</span>
+            </div>
+            <div class="quiz-bars" data-bars="mel"></div>
+          </div>
+          <div class="quiz-result-col fused">
+            <div class="quiz-result-col-head">Fused ★</div>
+            <div class="quiz-bars" data-bars="fused"></div>
+          </div>
+        </div>
       `;
 
       cardsEl = root.querySelector("[data-cards]");
@@ -149,6 +306,17 @@ registerMode("quiz", (() => {
       setSpeakingMode("normal");
       setTriggerSource("tof");
       loadVocab();
+
+      recognizeBtn = root.querySelector("[data-recognize-btn]");
+      resultStatusEl = root.querySelector("[data-result-status]");
+      resultsAreaEl = root.querySelector("[data-results]");
+      disagreeBannerEl = root.querySelector("[data-disagree-banner]");
+      barsEl.tof = root.querySelector('[data-bars="tof"]');
+      barsEl.mel = root.querySelector('[data-bars="mel"]');
+      barsEl.fused = root.querySelector('[data-bars="fused"]');
+      rejectBadgeEl.tof = root.querySelector('[data-reject-badge="tof"]');
+      rejectBadgeEl.mel = root.querySelector('[data-reject-badge="mel"]');
+      recognizeBtn.addEventListener("click", onRecognizeClick);
     },
 
     onData(evt) {

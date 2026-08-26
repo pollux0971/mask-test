@@ -139,6 +139,112 @@ def parse_args():
 
 
 # ---------------------------------------------------------------------------
+# T05: replaying a captured serial log. Pure functions, independent of
+# MockDevice, so they can be exercised directly in tests without a pty.
+
+# Comma-index of t_us within each timed line type, by its leading tag.
+# $STATUS/$REC and the WAV markers carry no per-line timestamp at all --
+# they are look-ups that miss (see extract_t_us) rather than a fifth entry
+# here, because "no timestamp" and "index 0" are not the same thing.
+_TIMED_LINE_T_US_INDEX = {
+    "$T": 3,   # $T,<A|B>,<seq>,<t_us>,<dim>,...
+    "$A": 3,   # $A,<A|B>,<seq>,<t_us>,<dim>,...  (#1.1.3 ambient frame)
+    "$M": 2,   # $M,<seq>,<t_us>,...
+    "$F": 2,   # $F,<seq>,<t_us>,...
+    "$H": 1,   # $H,<t_us>,...
+}
+
+
+def is_protocol_line(line):
+    """True if `line` is part of the serial contract and should be replayed.
+
+    A captured log is `idf.py monitor` output `tee`'d to a file: interleaved
+    with the $-prefixed protocol lines are ESP-IDF's own boot banner and
+    ESP_LOG lines ("ets Jul 29 2019 ...", "I (306) cpu_start: ...", etc.).
+    Those have no t_us and were never meant to cross the wire as data --
+    replaying them would feed a host-side parser lines it was never built to
+    see. The wire format restricts every actual protocol line to start with
+    "$" (CONTRACTS.md #1), with BEGIN_WAV_B64/END_WAV_B64 as the one
+    documented exception, so that single check is sufficient and exact --
+    no heuristic guessing at what "looks like" telemetry.
+    """
+    return line.startswith("$") or line.startswith("BEGIN_WAV_B64") or line == "END_WAV_B64"
+
+
+def extract_t_us(line):
+    """The line's t_us, or None if this line type carries no timestamp.
+
+    $STATUS, $REC and the WAV markers are real protocol lines (so
+    `is_protocol_line` keeps them) but have no per-line t_us of their own --
+    they still get replayed, just without advancing the playback clock.
+    """
+    tag = line.split(",", 1)[0]
+    idx = _TIMED_LINE_T_US_INDEX.get(tag)
+    if idx is None:
+        return None
+    parts = line.split(",")
+    if len(parts) <= idx:
+        return None
+    try:
+        return int(parts[idx])
+    except ValueError:
+        return None
+
+
+def replay_log(path, write_fn, speed=1.0, loop=False,
+                sleep_fn=time.sleep, clock_fn=time.monotonic, running_fn=None):
+    """Replay a captured log's protocol lines through `write_fn`, paced by
+    each line's own t_us.
+
+    Scheduling uses a *target wall-clock time* computed from a single fixed
+    anchor (the wall time this pass started, plus the first timed line's
+    t_us), not by accumulating a sleep duration per line. B06's aligner hit
+    exactly this bug: summing many small sleep() calls lets their individual
+    floating-point error accumulate linearly over a long replay, so the
+    tail of a long log drifts out of step with its own t_us even though each
+    individual sleep was accurate. Anchoring every target to the same fixed
+    reference point means each line's schedule error depends only on that
+    one line's t_us delta, not on how many lines came before it.
+
+    speed: pacing multiplier -- 0.25 plays four times slower (for watching a
+    heatmap frame-by-frame), 4.0 four times faster. 1.0 reproduces the
+    original capture's timing.
+    loop: restart from the first line when the file is exhausted, with a
+    fresh anchor -- otherwise the second pass would replay at 1/2 the
+    correct pace (its t_us deltas measured against the *first* pass's
+    now-stale anchor).
+    running_fn: optional no-arg callable polled before each line; return
+    False to stop the replay early (e.g. on disconnect/shutdown). Defaults
+    to always-True.
+    """
+    if running_fn is None:
+        running_fn = lambda: True
+
+    with open(path, "r", encoding="ascii", errors="replace") as f:
+        raw_lines = [ln.rstrip("\n") for ln in f]
+
+    while True:
+        anchor_wall = clock_fn()
+        anchor_t_us = None
+        for raw_line in raw_lines:
+            if not running_fn():
+                return
+            if not is_protocol_line(raw_line):
+                continue  # ESP_LOG / boot-banner noise: not replayed, does not touch the clock
+            t_us = extract_t_us(raw_line)
+            if t_us is not None:
+                if anchor_t_us is None:
+                    anchor_t_us = t_us
+                target_wall = anchor_wall + (t_us - anchor_t_us) / 1e6 / speed
+                sleep_for = target_wall - clock_fn()
+                if sleep_for > 0:
+                    sleep_fn(sleep_for)
+            write_fn(raw_line)
+        if not loop:
+            return
+
+
+# ---------------------------------------------------------------------------
 # Zone geometry: dim=16 -> 4x4 grid, dim=64 -> 8x8 grid.
 
 def zone_weights(dim):
@@ -553,8 +659,47 @@ class MockDevice:
 
     # -- main loop --------------------------------------------------------
 
+    def run_replay(self):
+        """T05: replay `--replay-log` instead of generating synthetic data.
+
+        Host->device commands are not drained here -- T05's scope is
+        playback pacing, not making a replayed device answer PING/SENS/MEL
+        as if it were live (that would need those commands to affect a
+        pre-recorded stream, which is a different feature). A consumer
+        connecting to this pty gets exactly the bytes the capture recorded,
+        in the capture's own rhythm.
+        """
+        try:
+            replay_log(
+                self.args.replay_log,
+                self._write,
+                speed=self.args.replay_speed,
+                loop=self.args.replay_loop,
+                running_fn=lambda: self._running,
+            )
+            # A non-looping replay reaches end-of-file and returns immediately
+            # after the last os.write(); without this, shutdown() below closes
+            # both pty fds essentially back-to-back with that write, racing
+            # the kernel's delivery of the final bytes to whoever is reading
+            # the slave side. This has no effect on --replay-loop (which never
+            # returns here on its own) or on a real disconnect/Ctrl-C.
+            time.sleep(0.05)
+        except KeyboardInterrupt:
+            pass
+        except FileNotFoundError:
+            print(f"[mock_device] replay log not found: {self.args.replay_log}", file=sys.stderr)
+        finally:
+            self.shutdown()
+
     def run(self):
         print(f"[mock_device] pty ready: {self.port_path}", file=sys.stdout)
+        if self.args.replay_log:
+            print(f"[mock_device] replaying {self.args.replay_log} "
+                  f"speed={self.args.replay_speed} loop={self.args.replay_loop}",
+                  file=sys.stdout)
+            sys.stdout.flush()
+            self.run_replay()
+            return
         print(f"[mock_device] proto={self.args.proto} dim={self.args.dim}x{self.args.dim} "
               f"scenario={self.args.scenario} drop_rate={self.args.drop_rate} "
               f"invalid_zone_rate={self.args.invalid_zone_rate} fault={self.args.fault or 'none'}",

@@ -265,7 +265,10 @@ def capture_baseline_trial(
             mic_rms=mic_rms, mic_peak=mic_peak, mic_t_us=mic_t_us,
             wear_id=wear_id, mode=mode,
             valid_zone_ratio=outcome.valid_zone_ratio, drop_count=0,
-            vad_start_us=-1, vad_end_us=-1, lip_onset_us=-1, voice_onset_us=-1,
+            # baseline 沒有語音、沒有跑 VAD——四個時間戳跟 speaking_mode
+            # 一律不給（SessionWriter 就整個 attr 不寫），不是填 -1 假裝
+            # 「偵測過但沒找到」（B17 的調度決議：偵測不到就整個 attr 不
+            # 寫入，不是填 0/-1/邊界值）。
             quality="ok",
         )
 

@@ -280,11 +280,28 @@ registerMode("record", (() => {
 
   // --- baseline screen ---------------------------------------------------
 
+  const SCREEN_ELS = () => ({ form: els.formScreen, baseline: els.baselineScreen, trial: els.trialScreen });
+  const SCREEN_DISPLAY = { form: "block", baseline: "block", trial: "flex" };
+
   function showScreen(name) {
+    const screens = SCREEN_ELS();
+    // A screen element missing here means `init()` hasn't finished building
+    // `els` yet (e.g. this got called while `root.innerHTML` was still
+    // being parsed/queried) -- ca hit this as an intermittent "Cannot read
+    // properties of undefined" with no indication of *which* element was
+    // missing. Failing loudly and specifically beats a silent skip: a
+    // silent skip here would leave every screen at its default `display`
+    // (i.e. the previous screen keeps showing, or nothing does), which is
+    // strictly more confusing to debug than a clear error naming the gap.
+    for (const [key, el] of Object.entries(screens)) {
+      if (!el) {
+        throw new Error(`[record] showScreen(${name}): els.${key}Screen is not ready yet (DOM not built?)`);
+      }
+    }
     screen = name;
-    els.formScreen.style.display = name === "form" ? "block" : "none";
-    els.baselineScreen.style.display = name === "baseline" ? "block" : "none";
-    els.trialScreen.style.display = name === "trial" ? "flex" : "none";
+    for (const [key, el] of Object.entries(screens)) {
+      el.style.display = key === name ? SCREEN_DISPLAY[key] : "none";
+    }
   }
 
   function enterBaselineScreen() {

@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import socketserver
 from datetime import datetime
 from pathlib import Path
@@ -73,12 +74,16 @@ from host.storage.baseline import capture_baseline_trial            # noqa: E402
 from host.clock.ping_sync import (                                  # noqa: E402
     PingSyncer, SessionClockSync, SESSION_START, SESSION_END,
 )
+from host.storage.session_writer import SessionWriter               # noqa: E402
+from host.trial.state_machine import TrialStateMachine              # noqa: E402
 
 THRESHOLDS_PATH = ROOT_DIR / "config" / "quality_thresholds.json"
 LAST_SESSION_PATH = ROOT_DIR / "config" / "last_session.json"
 #: Fitted PCA models for GET /pca. Nothing writes here yet -- the endpoint
 #: reports "no model" rather than inventing one (see _handle_pca).
 MODELS_DIR = ROOT_DIR / "models"
+VOCAB_PATH = ROOT_DIR / "config" / "vocab.json"
+MANIFEST_PATH = ROOT_DIR / "sessions" / "manifest.csv"
 
 # Imported lazily: mel_pipeline pulls in librosa, which is a heavy optional
 # dependency. The bridge's core job -- serving the panel and relaying $-lines
@@ -634,6 +639,112 @@ def load_pca_model(source):
         return None
 
 
+# --- B11 / B12: trial state machine ---------------------------------------
+
+
+def load_vocab():
+    """Words for the trial order, from config/vocab.json (CONTRACTS #6)."""
+    try:
+        data = json.loads(VOCAB_PATH.read_text(encoding="utf-8"))
+        words = [w["text"] for w in data.get("words", []) if w.get("text")]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"[bridge] could not read {VOCAB_PATH}: {exc}")
+        return []
+    return words
+
+
+def open_trial_machine(info):
+    """Build the trial machine, once the baseline has created the session file.
+
+    Ordering is forced by the schema, not by preference: `/meta` requires the
+    baseline statistics, which only exist after the baseline runs, so the
+    file has to be created by the baseline and reopened here. mode="a" is
+    what makes that safe -- mode="w" truncates, and would take the baseline
+    trial with it.
+    """
+    words = load_vocab()
+    if not words:
+        return None, "config/vocab.json 讀不到任何詞，無法開始 trial"
+    h5_path = session_runtime["h5_path"]
+    if h5_path is None or not Path(h5_path).is_file():
+        return None, "session 檔案還不存在——請先擷取 baseline"
+
+    try:
+        writer = SessionWriter(h5_path, mode="a")
+        writer.__enter__()
+    except Exception as exc:
+        return None, f"無法開啟 session 檔案: {exc}"
+
+    machine = TrialStateMachine(
+        words, session_aligner, writer, h5_path, MANIFEST_PATH,
+        wear_id=info.wear_id, mode=info.mode,
+        # trial_000 belongs to the baseline (B10); starting at 0 here would
+        # collide with it.
+        first_trial_idx=1,
+    )
+    with session_lock:
+        session_runtime["writer"] = writer
+        session_runtime["trial"] = machine
+    return machine, None
+
+
+# TrialStateMachine is not thread-safe, and two threads drive it: the ticker
+# advances timed transitions while HTTP handlers act on button presses. They
+# collide for real -- hold_stop() runs the HDF5 write inside the request, and
+# an unsynchronised tick() during it took the whole handler down.
+trial_lock = threading.Lock()
+
+
+def as_trial_events(result):
+    """Normalise one state-machine return value into a list of events.
+
+    The machine is not uniform about this and reasonably so: `start_trial()`
+    and `abort()` cause exactly one transition, while `hold_stop()` and
+    `tick()` can cause several in one go (CAPTURE -> SAVE -> REST). Callers
+    should not have to remember which is which -- getting it wrong produced
+    a nested list that took down the request thread.
+    """
+    if result is None:
+        return []
+    if isinstance(result, dict):
+        return [result]
+    return [e for e in result if isinstance(e, dict)]
+
+
+def publish_trial_events(events):
+    for event in as_trial_events(events):
+        broadcaster.publish({"type": "trial", **event})
+
+
+def trial_ticker(interval=0.05):
+    """Advances the trial state machine on its own thread.
+
+    The machine has no timer of its own by design, so something has to poll
+    it. 20 Hz is well under the shortest state duration and keeps the SSE
+    transitions tight enough that a countdown looks like a countdown.
+    """
+    while True:
+        time.sleep(interval)
+        machine = session_runtime.get("trial")
+        if machine is None:
+            continue
+        try:
+            # CONTRACTS #1.3: trial boundaries are marked in device time, so
+            # tick() needs the newest device timestamp for the two edges
+            # that record one (COUNTDOWN->CAPTURE and leaving CAPTURE).
+            with trial_lock:
+                events = machine.tick(device_t_us=device_clock["last_t_us"])
+        except ValueError as exc:
+            # No device timestamp yet: the link is down mid-trial. Reported,
+            # not crashed -- the ticker has to survive to run the next one.
+            print(f"[bridge] trial tick could not advance: {exc}")
+            continue
+        except Exception as exc:
+            print(f"[bridge] trial tick failed: {exc}")
+            continue
+        publish_trial_events(events)
+
+
 # --- B09 / B11 seams -------------------------------------------------------
 # The state machines themselves are not built yet. These exist so that when
 # they are, both stories emit the shapes CONTRACTS #4.2 already froze rather
@@ -956,8 +1067,101 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_session_end()
         elif self.path.startswith("/session/baseline"):
             self._handle_session_baseline()
+        elif self.path.startswith("/trial/"):
+            self._handle_trial()
         else:
             self.send_error(404)
+
+    # -- B11 / B12: trials ------------------------------------------------
+
+    def _handle_trial(self):
+        action = self.path[len("/trial/"):].split("?", 1)[0].strip("/")
+        info = session_registry.current
+        if info is None:
+            self._send_json(409, {"error": "沒有進行中的 session"})
+            return
+        if not info.baseline_done:
+            # B10's gate. Trials recorded against no baseline cannot be
+            # normalised later, so they are not "slightly worse data" --
+            # they are unusable, and better refused now than discovered in
+            # analysis after a four-hour session.
+            self._send_json(409, {"error": "還沒擷取 baseline，不能開始 trial",
+                                  "baseline_done": False})
+            return
+
+        with trial_lock:
+            machine = session_runtime.get("trial")
+            if machine is None:
+                machine, err = open_trial_machine(info)
+                if machine is None:
+                    self._send_json(409, {"error": err})
+                    return
+
+        body = self._read_json_body() if action in ("start", "hold/start") else {}
+        if body is None:
+            return
+
+        try:
+            with trial_lock:
+                events = self._dispatch_trial(machine, action, body)
+        except LookupError:
+            # JSON, not send_error()'s HTML page: this is a JSON API and a
+            # client that has to special-case the error body cannot report
+            # what went wrong.
+            self._send_json(404, {"error": f"未知的 trial 動作: {action}"})
+            return
+        except RuntimeError as exc:
+            # The machine refuses transitions that are wrong for its current
+            # state (e.g. abort during REST, where the trial is already
+            # saved). 409 rather than 400: the request is well-formed, the
+            # state is not what the caller assumed.
+            self._send_json(409, {"error": str(exc), "state": machine.state.value})
+            return
+        except ValueError as exc:
+            self._send_json(409, {"error": str(exc), "state": machine.state.value})
+            return
+        except Exception as exc:
+            # Anything else is a bug here, not a client error -- but it must
+            # still come back as a response. Letting it escape kills the
+            # handler thread, and the caller sees the connection drop with
+            # no clue what happened.
+            traceback.print_exc()
+            self._send_json(500, {"error": f"{type(exc).__name__}: {exc}",
+                                  "state": machine.state.value})
+            return
+
+        try:
+            publish_trial_events(events)
+        except Exception:
+            # The action already happened; failing to broadcast it must not
+            # turn a successful request into a dropped connection.
+            traceback.print_exc()
+        self._send_json(200, {"state": machine.state.value,
+                              "events": as_trial_events(events)})
+
+    def _dispatch_trial(self, machine, action, body):
+        """Map one /trial/<action> to the state machine. Returns its events."""
+        device_t_us = device_clock["last_t_us"]
+        if action == "start":
+            return as_trial_events(machine.start_trial(label=body.get("label")))
+        if action == "hold/start":
+            return as_trial_events(
+                machine.hold_start(device_t_us=device_t_us, label=body.get("label")))
+        if action == "hold/stop":
+            return as_trial_events(machine.hold_stop(device_t_us=device_t_us))
+        if action == "confirm":
+            # B12's CONFIRM state: the trial is computed but NOT on disk
+            # until this call. Discard is the other half, and the panel has
+            # to offer both -- leaving it ambiguous would mean a trial that
+            # is neither kept nor dropped.
+            return as_trial_events(machine.confirm_keep())
+        if action == "discard":
+            return as_trial_events(machine.discard_pending())
+        if action == "abort":
+            return as_trial_events(machine.abort())   # skips this word
+        if action == "redo":
+            return as_trial_events(machine.redo())    # keeps the same word
+        raise LookupError(action)
 
     # -- B09: session lifecycle -----------------------------------------
 
@@ -1043,6 +1247,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         session_registry.mark_baseline_recorded()
+        machine, open_err = open_trial_machine(session_registry.current)
+        if machine is None:
+            print(f"[bridge] trial machine not opened: {open_err}")
         publish_session_state("baseline", session=session_registry.current.to_dict(),
                               progress={"baseline_seconds": seconds})
         broadcaster.publish({"type": "baseline", **payload})
@@ -1288,6 +1495,7 @@ def main():
     # Runs whether or not the link is up: a health dashboard that freezes
     # when something breaks is useless exactly when it is needed.
     threading.Thread(target=quality_emitter, daemon=True).start()
+    threading.Thread(target=trial_ticker, daemon=True).start()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.http_port), Handler)
     server.serial_port = args.port

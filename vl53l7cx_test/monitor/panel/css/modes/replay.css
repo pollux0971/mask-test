@@ -1,2 +1,204 @@
-/* replay mode styles — owned by the story that builds this mode
-   (see ssi-backlog/README.md track C). Empty shell from C01. */
+/* replay mode styles (C24). See js/modes/replay.js. */
+
+#mode-replay {
+  gap: 14px;
+  min-height: 0;
+}
+
+#mode-replay .section-label {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.replay-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.replay-select,
+.replay-file-input {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+.replay-select {
+  min-width: 220px;
+}
+
+.replay-file-input {
+  flex: 1;
+  min-width: 200px;
+}
+
+.replay-btn {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.replay-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.replay-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.replay-btn-primary {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.replay-status {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.replay-status.replay-status-error {
+  color: var(--warn);
+}
+
+.replay-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.replay-speed-group {
+  display: flex;
+  gap: 4px;
+}
+
+.replay-speed-btn.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.replay-seek {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.replay-control-label {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.replay-seek-input {
+  width: 64px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+
+.replay-timeline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  overflow-y: auto;
+  padding: 4px 2px;
+}
+
+.replay-timeline-empty {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.replay-trial-marker {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 56px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.replay-trial-marker:hover {
+  border-color: var(--accent);
+}
+
+.replay-trial-marker.current {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.replay-trial-idx {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.replay-trial-marker[data-quality="low"] {
+  border-color: var(--warn);
+}
+
+.replay-trial-marker[data-quality="rejected"] {
+  opacity: 0.5;
+}
+
+/* --- Cross-mode REPLAY watermark ---
+   Appended to #mainContent (a sibling of every .mode-section, see
+   ensureWatermark() in replay.js), not scoped under #mode-replay, so it
+   stays visible after switching to monitor/quiz/etc -- that's the entire
+   point (CONTRACTS.md 4.2 / C24.md "不能只在回放模式裡標"). Needs
+   `position: relative` on the shared #mainContent to anchor against, set
+   here rather than in shell.css since that file isn't owned by this story;
+   a plain `position` rule doesn't touch anything shell.css already sets. */
+.main-content {
+  position: relative;
+}
+
+.replay-watermark {
+  position: absolute;
+  top: 10px;
+  right: 14px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(-4px);
+  transition: opacity 150ms ease, transform 150ms ease;
+  z-index: 50;
+}
+
+.replay-watermark.visible {
+  opacity: 1;
+  transform: translateY(0);
+}

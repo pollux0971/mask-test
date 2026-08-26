@@ -1,2 +1,296 @@
-// replay mode — owned by the story that builds this mode
-// (see ssi-backlog/README.md track C). Empty shell from C01.
+// Replay mode (C24): load a saved HDF5 session and play it back through the
+// SAME SSE pipeline live data uses (B17's ReplayController publishes onto
+// the existing /events stream via broadcaster.publish() -- confirmed by
+// B17's completion report), so switching to any other mode during playback
+// "just works" with zero changes to bus.js/monitor.js/shell.js: those
+// files already branch on evt.type, not on whether evt.replay is set.
+//
+// Backend endpoints this calls do NOT exist yet (confirmed live: every one
+// 404s) -- B17 (host/replay/session_replay.py) is done, but B19's HTTP
+// wiring for it hasn't landed. Proposed shape (from B17's completion
+// report, relayed to ed):
+//   GET  /replay/sessions                      -> {"files": ["<name>", ...]}
+//   POST /replay/start?file=<name>&start_trial=<n>
+//                                               -> {"trials": [{"idx","label","quality"}, ...]} (best-effort)
+//   POST /replay/control?action=pause|resume|step
+//   POST /replay/speed?value=0.25|1|4
+//   POST /replay/seek?trial=<n>
+// Same auto-upgrade pattern as quiz.js's /recognize and C10's /pca check:
+// build the UI against the agreed shape, degrade to a visible "尚未串接"
+// message on 404 instead of failing silently, and it starts working the
+// moment ed wires bridge_server.py -- no changes needed here.
+//
+// Playback control semantics map directly onto ReplayController's three
+// distinct anchor operations (session_replay.py's own hard-won lesson: one
+// generic "rebase" for all four control ops caused resume() to instantly
+// dump the whole backlog). This file doesn't re-derive that logic -- it
+// only ever sends one action per button and lets the backend own state.
+//
+// REPLAY marks itself in two places, per C24.md ("不能只在回放模式裡標"):
+// the sidebar text (already done by C04, listening for evt.replay -- this
+// file doesn't touch shell.js) and a small fixed corner ribbon over the
+// main content area, injected here (not into shell.js/index.html) so it
+// survives switching away from replay mode. pointer-events:none so it
+// never blocks clicks on whatever mode is actually showing underneath.
+
+import { registerMode } from "../shell.js";
+
+const REPLAY_WATERMARK_LINGER_MS = 3000; // matches shell.js's own REPLAY_WINDOW_MS
+const SPEEDS = [0.25, 1, 4];
+
+function fmtSpeed(v) {
+  return (v === 1 ? "1" : v < 1 ? v.toFixed(2).replace(/0+$/, "").replace(/\.$/, "") : String(v)) + "×";
+}
+
+registerMode("replay", (() => {
+  let filesSelectEl, fileInputEl, loadBtn, statusEl;
+  let playPauseBtn, stepBtn, speedEls;
+  let timelineEl, seekInputEl;
+  let watermarkEl;
+
+  let sessionLoaded = false;
+  let paused = false;
+  let speed = 1;
+  let currentTrialIdx = null;
+  // Keyed by idx so out-of-order SAVE-after-CAPTURE updates (quality can
+  // change between the two) both land on the same row instead of the
+  // timeline growing a duplicate entry per state transition.
+  const trialsByIdx = new Map();
+  let lastReplayEventAt = -Infinity;
+
+  function setStatus(text, isError) {
+    statusEl.textContent = text;
+    statusEl.classList.toggle("replay-status-error", !!isError);
+  }
+
+  async function fetchSessionList() {
+    try {
+      const res = await fetch("/replay/sessions");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      const files = Array.isArray(data.files) ? data.files : [];
+      filesSelectEl.innerHTML =
+        `<option value="">— 選擇 session（或下方手動輸入路徑）—</option>` +
+        files.map((f) => `<option value="${f}">${f}</option>`).join("");
+      filesSelectEl.disabled = files.length === 0;
+    } catch (err) {
+      // Expected right now (endpoint doesn't exist server-side yet) -- the
+      // manual path input below stays usable so controls remain testable
+      // ahead of B19 wiring, same as quiz.js's /recognize fallback.
+      filesSelectEl.innerHTML = `<option value="">（session 清單尚未串接，請用下方輸入路徑）</option>`;
+      filesSelectEl.disabled = true;
+      console.warn("[replay] /replay/sessions unavailable:", err.message);
+    }
+  }
+
+  function selectedFile() {
+    return (fileInputEl.value || filesSelectEl.value || "").trim();
+  }
+
+  function renderTimeline() {
+    const entries = Array.from(trialsByIdx.values()).sort((a, b) => a.idx - b.idx);
+    if (!entries.length) {
+      timelineEl.innerHTML = `<span class="replay-timeline-empty">尚無 trial（播放後這裡會即時填入）</span>`;
+      return;
+    }
+    timelineEl.innerHTML = entries.map((t) => `
+      <button class="replay-trial-marker${t.idx === currentTrialIdx ? " current" : ""}"
+              data-quality="${t.quality || ""}" data-trial-idx="${t.idx}" title="quality: ${t.quality || "?"}">
+        <span class="replay-trial-idx mono">${t.idx}</span>
+        <span class="replay-trial-label">${t.label || ""}</span>
+      </button>
+    `).join("");
+    Array.from(timelineEl.querySelectorAll("[data-trial-idx]")).forEach((el) => {
+      el.addEventListener("click", () => seekToTrial(Number(el.dataset.trialIdx)));
+    });
+  }
+
+  function upsertTrial(idx, label, quality) {
+    const prev = trialsByIdx.get(idx) || {};
+    trialsByIdx.set(idx, { idx, label: label ?? prev.label, quality: quality ?? prev.quality });
+  }
+
+  function setPlaybackControlsEnabled(enabled) {
+    playPauseBtn.disabled = !enabled;
+    stepBtn.disabled = !enabled;
+    seekInputEl.disabled = !enabled;
+    speedEls.forEach((el) => (el.disabled = !enabled));
+  }
+
+  async function postControl(path) {
+    try {
+      const res = await fetch(path, { method: "POST" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return true;
+    } catch (err) {
+      setStatus("尚未串接（" + path + " 還沒上線）", true);
+      console.warn("[replay] control endpoint unavailable:", path, err.message);
+      return false;
+    }
+  }
+
+  async function onLoadClick() {
+    const file = selectedFile();
+    if (!file) {
+      setStatus("請先選擇或輸入 session 檔案路徑", true);
+      return;
+    }
+    setStatus("載入中…");
+    trialsByIdx.clear();
+    currentTrialIdx = null;
+    renderTimeline();
+
+    try {
+      const res = await fetch(`/replay/start?file=${encodeURIComponent(file)}`, { method: "POST" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json().catch(() => null);
+      // Best-effort: a backend that already knows every trial up front can
+      // hand back the full list so the timeline doesn't start empty and
+      // fill in only as playback reaches each one.
+      if (data && Array.isArray(data.trials)) {
+        data.trials.forEach((t) => upsertTrial(t.idx, t.label, t.quality));
+      }
+      sessionLoaded = true;
+      paused = false;
+      playPauseBtn.textContent = "⏸ 暫停";
+      setPlaybackControlsEnabled(true);
+      setStatus(`回放中：${file}`);
+      renderTimeline();
+    } catch (err) {
+      sessionLoaded = false;
+      setPlaybackControlsEnabled(false);
+      setStatus("尚未串接（/replay/start 還沒上線）— 已知：B17 後端邏輯完成，等 ed 接上 bridge_server.py", true);
+      console.warn("[replay] /replay/start unavailable:", err.message);
+    }
+  }
+
+  async function onPlayPauseClick() {
+    const action = paused ? "resume" : "pause";
+    const ok = await postControl(`/replay/control?action=${action}`);
+    if (!ok) return;
+    paused = !paused;
+    playPauseBtn.textContent = paused ? "▶ 播放" : "⏸ 暫停";
+  }
+
+  async function onStepClick() {
+    await postControl("/replay/control?action=step");
+  }
+
+  async function onSpeedClick(value) {
+    const ok = await postControl(`/replay/speed?value=${value}`);
+    if (!ok) return;
+    speed = value;
+    speedEls.forEach((el) => el.classList.toggle("active", Number(el.dataset.speed) === value));
+  }
+
+  async function seekToTrial(idx) {
+    if (!Number.isInteger(idx)) return;
+    await postControl(`/replay/seek?trial=${idx}`);
+  }
+
+  function onSeekInputSubmit() {
+    const idx = Number(seekInputEl.value);
+    if (Number.isInteger(idx)) seekToTrial(idx);
+  }
+
+  function updateWatermark() {
+    const active = performance.now() - lastReplayEventAt < REPLAY_WATERMARK_LINGER_MS;
+    watermarkEl.classList.toggle("visible", active);
+  }
+
+  function ensureWatermark() {
+    // Lives outside every .mode-section (appended straight to #mainContent,
+    // a sibling of all five sections) so it's still on screen after
+    // switching to monitor/quiz/etc -- CONTRACTS.md 4.2's whole point
+    // ("否則會拿回放資料當即時資料") only holds if the mark survives the
+    // mode switch a Demo presenter would actually make.
+    if (document.getElementById("replayWatermark")) return document.getElementById("replayWatermark");
+    const mainContent = document.getElementById("mainContent");
+    const el = document.createElement("div");
+    el.id = "replayWatermark";
+    el.className = "replay-watermark";
+    el.innerHTML = `<span>▶ REPLAY</span>`;
+    mainContent.appendChild(el);
+    return el;
+  }
+
+  // Mirrors shell.js's own setInterval(renderStatusBar, 500): without a
+  // tick, the watermark would only ever turn OFF the instant a new evt
+  // happens to arrive, i.e. never, once the replay actually stops (no more
+  // events => no more onData calls => nothing left to notice the linger
+  // window has expired).
+  setInterval(updateWatermark, 500);
+
+  return {
+    init(root) {
+      watermarkEl = ensureWatermark();
+
+      root.innerHTML = `
+        <div class="section-label" data-replay-label>回放模式 · HDF5 Session 重播</div>
+
+        <div class="replay-picker">
+          <select class="replay-select" data-files-select disabled>
+            <option value="">載入中…</option>
+          </select>
+          <input class="replay-file-input" data-file-input type="text"
+                 placeholder="或手動輸入 data/sessions/ 下的檔名">
+          <button class="replay-btn replay-btn-primary" data-load-btn>▶ 載入並播放</button>
+        </div>
+        <div class="replay-status mono" data-status>尚未載入 session</div>
+
+        <div class="replay-controls" data-controls>
+          <button class="replay-btn" data-play-pause disabled>⏸ 暫停</button>
+          <button class="replay-btn" data-step disabled title="單步：不管排程，立刻送出下一個事件">⏭ 單步</button>
+          <div class="replay-speed-group" data-speed-group>
+            ${SPEEDS.map((s) => `<button class="replay-btn replay-speed-btn${s === 1 ? " active" : ""}"
+                     data-speed="${s}" disabled>${fmtSpeed(s)}</button>`).join("")}
+          </div>
+          <div class="replay-seek">
+            <span class="replay-control-label">跳到 trial</span>
+            <input class="replay-seek-input mono" data-seek-input type="number" min="0" step="1" disabled>
+            <button class="replay-btn" data-seek-go disabled>跳轉</button>
+          </div>
+        </div>
+
+        <div class="section-label">Trial 時間軸</div>
+        <div class="replay-timeline" data-timeline></div>
+      `;
+
+      filesSelectEl = root.querySelector("[data-files-select]");
+      fileInputEl = root.querySelector("[data-file-input]");
+      loadBtn = root.querySelector("[data-load-btn]");
+      statusEl = root.querySelector("[data-status]");
+      playPauseBtn = root.querySelector("[data-play-pause]");
+      stepBtn = root.querySelector("[data-step]");
+      speedEls = Array.from(root.querySelectorAll("[data-speed]"));
+      timelineEl = root.querySelector("[data-timeline]");
+      seekInputEl = root.querySelector("[data-seek-input]");
+      const seekGoBtn = root.querySelector("[data-seek-go]");
+
+      loadBtn.addEventListener("click", onLoadClick);
+      playPauseBtn.addEventListener("click", onPlayPauseClick);
+      stepBtn.addEventListener("click", onStepClick);
+      speedEls.forEach((el) => el.addEventListener("click", () => onSpeedClick(Number(el.dataset.speed))));
+      seekGoBtn.addEventListener("click", onSeekInputSubmit);
+      seekInputEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") onSeekInputSubmit();
+      });
+
+      setPlaybackControlsEnabled(false);
+      renderTimeline();
+      fetchSessionList();
+    },
+
+    onData(evt) {
+      if (evt.replay === true) {
+        lastReplayEventAt = performance.now();
+        updateWatermark();
+      }
+      if (evt.type === "trial" && (evt.state === "CAPTURE" || evt.state === "SAVE")) {
+        if (evt.state === "CAPTURE") currentTrialIdx = evt.idx;
+        upsertTrial(evt.idx, evt.label, evt.quality);
+        renderTimeline();
+      }
+    },
+  };
+})());

@@ -152,3 +152,122 @@
   font-size: 18px;
   color: var(--text-dim);
 }
+
+/* --- C16: three-track score bars --- */
+.quiz-result-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+.quiz-result-status {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.quiz-disagree-banner {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-radius: 8px;
+  padding: 6px 12px;
+  width: fit-content;
+}
+
+.quiz-results {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  overflow-y: auto;
+  /* 1080p / 2m-away legibility (C16.md's explicit acceptance criterion) --
+     sized generously rather than shrinking to fit; the grid scrolls if the
+     viewport is short instead of cramming bars smaller. */
+  font-size: 15px;
+}
+
+.quiz-result-col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  min-width: 0;
+}
+.quiz-result-col.fused {
+  border-color: var(--accent);
+}
+
+.quiz-result-col-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-dim);
+}
+.quiz-result-col.fused .quiz-result-col-head { color: var(--accent); }
+
+.quiz-reject-badge {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+.quiz-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.quiz-bar {
+  display: grid;
+  grid-template-columns: 2.2em 1fr 3.2em;
+  align-items: center;
+  gap: 8px;
+}
+
+.quiz-bar-label {
+  font-weight: 600;
+  text-align: right;
+}
+
+.quiz-bar-track {
+  height: 18px;
+  background: var(--surface-2);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.quiz-bar-fill {
+  height: 100%;
+  background: var(--text-dim);
+  border-radius: 4px;
+  transition: width 0.3s ease-out;
+}
+
+.quiz-bar-pct {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+/* top-1 within a (non-rejected) column -- bold label, filled bar in the
+   accent color instead of the neutral default. */
+.quiz-bar.top1 .quiz-bar-label { color: var(--text); }
+.quiz-bar.top1 .quiz-bar-fill { background: var(--accent); }
+.quiz-bar.top1 .quiz-bar-pct { color: var(--accent); font-weight: 700; }
+
+/* C16.md: "三軌 top-1 不一致時要突顯" -- every column's top-1 bar gets an
+   outline tying them together as "look at these three, they disagree",
+   on top of the shared banner above. */
+.results-disagree .quiz-bar.top1 {
+  outline: 2px solid var(--warn);
+  outline-offset: 2px;
+  border-radius: 4px;
+}

@@ -576,8 +576,99 @@ def test_session_end_meta_keys_matches_contracts_field_list():
 
 
 def test_required_trial_attrs_matches_contracts_field_list():
-    expected = {
-        "wear_id", "mode", "valid_zone_ratio", "drop_count",
-        "vad_start_us", "vad_end_us", "lip_onset_us", "voice_onset_us", "quality",
-    }
+    """`vad_start_us`/`vad_end_us`/`lip_onset_us`/`voice_onset_us` 不在這裡
+    ——B17 的調度決議之後它們是「偵測到才寫」，不是每個 trial 都必填。"""
+    expected = {"wear_id", "mode", "valid_zone_ratio", "drop_count", "quality"}
     assert set(REQUIRED_TRIAL_ATTRS) == expected
+
+
+# ---------------------------------------------------------------------------
+# VAD 時間戳缺席時整個 attr 不寫入；speaking_mode／vad_confidence（B17 調度決議）
+
+
+def test_vad_timing_attrs_omitted_when_none(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs["vad_start_us"] = None
+        kwargs["vad_end_us"] = None
+        kwargs["lip_onset_us"] = None
+        kwargs["voice_onset_us"] = None
+        w.write_trial(0, **kwargs)
+
+    with h5py.File(path, "r") as f:
+        attrs = f["trial_000"].attrs
+        for key in ("vad_start_us", "vad_end_us", "lip_onset_us", "voice_onset_us"):
+            assert key not in attrs
+            with pytest.raises(KeyError):
+                attrs[key]  # noqa: B018 -- 故意觸發，驗證「大聲失敗」
+
+
+def test_vad_timing_attrs_independently_optional(tmp_path):
+    """驗收條件的核心：silent 模式下 voice_onset_us 必然缺席，但
+    lip_onset_us 仍應該有——四個欄位不是綁在一起的。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs["voice_onset_us"] = None  # 只有這個缺席
+        w.write_trial(0, **kwargs)
+
+    with h5py.File(path, "r") as f:
+        attrs = f["trial_000"].attrs
+        assert "voice_onset_us" not in attrs
+        assert "vad_start_us" in attrs
+        assert "vad_end_us" in attrs
+        assert "lip_onset_us" in attrs
+
+
+def test_speaking_mode_and_vad_confidence_written_when_given(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs["speaking_mode"] = "whisper"
+        kwargs["vad_confidence"] = 0.82
+        w.write_trial(0, **kwargs)
+
+    with h5py.File(path, "r") as f:
+        attrs = f["trial_000"].attrs
+        assert attrs["speaking_mode"] == "whisper"
+        assert attrs["vad_confidence"] == pytest.approx(0.82, abs=1e-5)
+
+
+def test_speaking_mode_and_vad_confidence_omitted_by_default(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        attrs = f["trial_000"].attrs
+        assert "speaking_mode" not in attrs
+        assert "vad_confidence" not in attrs
+
+
+def test_silent_mode_vad_confidence_is_none_not_a_fabricated_number(tmp_path):
+    """`silent` 模式沒有跑音訊 VAD，`vad_confidence` 應該是 None（不寫），
+    不是隨便給一個看起來合理的數字。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs["speaking_mode"] = "silent"
+        kwargs["vad_confidence"] = None
+        kwargs["voice_onset_us"] = None
+        w.write_trial(0, **kwargs)
+
+    with h5py.File(path, "r") as f:
+        attrs = f["trial_000"].attrs
+        assert attrs["speaking_mode"] == "silent"
+        assert "vad_confidence" not in attrs
+        assert "voice_onset_us" not in attrs
+        assert "lip_onset_us" in attrs  # silent 模式唇動仍然存在
+
+
+def test_invalid_speaking_mode_rejected(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs["speaking_mode"] = "shouting"
+        with pytest.raises(ValueError):
+            w.write_trial(0, **kwargs)

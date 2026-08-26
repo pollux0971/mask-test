@@ -267,11 +267,19 @@ class SessionWriter:
         grp.attrs["mode"] = mode
         grp.attrs["valid_zone_ratio"] = float(valid_zone_ratio)
         grp.attrs["drop_count"] = int(drop_count)
-        grp.attrs["vad_start_us"] = np.int64(vad_start_us)
-        grp.attrs["vad_end_us"] = np.int64(vad_end_us)
-        grp.attrs["lip_onset_us"] = np.int64(lip_onset_us)
-        grp.attrs["voice_onset_us"] = np.int64(voice_onset_us)
         grp.attrs["quality"] = quality
+
+        # 偵測不到就整個 attr 不寫入——見這支方法 docstring 的說明。
+        for key, value in (
+            ("vad_start_us", vad_start_us), ("vad_end_us", vad_end_us),
+            ("lip_onset_us", lip_onset_us), ("voice_onset_us", voice_onset_us),
+        ):
+            if value is not None:
+                grp.attrs[key] = np.int64(value)
+        if speaking_mode is not None:
+            grp.attrs["speaking_mode"] = speaking_mode
+        if vad_confidence is not None:
+            grp.attrs["vad_confidence"] = np.float32(vad_confidence)
 
         self._trial_indices_written.add(idx)
         self._file.flush()
