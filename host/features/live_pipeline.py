@@ -19,10 +19,14 @@
 獨立資料，不是 CONTRACTS.md §3.3 104 維特徵向量的一部分（那裡就只有
 `tof_A`(32) + `tof_B`(32) + `mel`(40)），所以這個管線完全不碰它。
 
-**這裡也不處理 VAD。** `mel_features()` 的 `vad_start`/`vad_end` 兩個參數
-留空（跟 `analysis/run_all.py` 的 `build_feature_seqs()`——目前唯一的
-真實參考管線——做法一致，那邊也是整段不裁切），因為沒有 VAD 起訖點的
-即時 producer（C08/C19 都各自碰過這個缺口，見對應報告）。
+**VAD 裁切現在是選填的（`speech_window`）。** `mel_features()` 自己的
+`vad_start`/`vad_end` 兩個參數仍然留空不用——裁切改在**對齊後的幀**這一層
+做（見 `compute_speech_window()`），因為 ToF-A/ToF-B/Mel 已經是同一組
+共用時間軸，在這裡裁一次就對三個模態同時生效，不用分別換算成三種各自
+的幀索引。**不給 `speech_window` 就是舊行為（整段不裁切）**——這是
+`reports/ALIGNMENT_MISMATCH.md`「按住多久會不會洩漏」章節量到的問題的
+修法：hold-to-record 按鍵按多久，會直接改變講話動作在固定 `T=24` 幀裡的
+相對位置，混進跟詞義無關的差異。
 
 **幀選擇：只用 ToF-A、ToF-B、Mel 三者同時「有資料」的幀，其餘直接丟棄，
 不補值。** `Aligner` 已經用 `*_present` 誠實標記「這個時間點附近沒有可信
@@ -32,7 +36,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -42,6 +46,104 @@ from analysis.features.tof_features import tof_features
 from host.align.aligner import AlignedFrame
 
 MIN_USABLE_FRAMES = 2  # assemble_feature_seq()/resample_fixed_length() 的硬性下限
+
+# `compute_speech_window()` 的 margin/下限預設值——見該函式 docstring 的
+# 完整理由，這裡只列常數本身。
+DEFAULT_PRE_MARGIN_US = 100_000    # 100 ms
+DEFAULT_POST_MARGIN_US = 100_000   # 100 ms
+DEFAULT_MIN_SPEECH_WINDOW_US = 300_000  # 300 ms ≈ 30 Hz 下 9 個原始 ToF 幀
+
+
+@dataclass(frozen=True)
+class SpeechWindowResult:
+    """`compute_speech_window()` 的回傳值——**永遠有 `reason`，不管有沒有
+    裁切**。`window_us` 為 `None` 代表沒有裁切（沒偵測到任何來源、或裁完
+    太短），這兩種情況都必須被看見：一部分樣板裁過、一部分整段使用，
+    它們在特徵空間裡不可比，而這正是這個功能存在之前一直沒有任何東西會
+    講出來的坑（`reports/ALIGNMENT_MISMATCH.md`「按住多久會不會洩漏」）。
+    """
+    window_us: Optional[Tuple[int, int]]
+    trimmed: bool
+    source: str                    # "none" 或參與聯集的來源標籤（例如 "lip_A+voice"）
+    reason: Optional[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "trimmed": self.trimmed,
+            "source": self.source,
+            "reason": self.reason,
+            "window_us": list(self.window_us) if self.window_us else None,
+        }
+
+
+def compute_speech_window(
+    segments: Sequence[Tuple[str, Optional[int], Optional[int]]],
+    *,
+    pre_margin_us: int = DEFAULT_PRE_MARGIN_US,
+    post_margin_us: int = DEFAULT_POST_MARGIN_US,
+    min_span_us: int = DEFAULT_MIN_SPEECH_WINDOW_US,
+) -> SpeechWindowResult:
+    """從一批 VAD 偵測到的區段，算出「真的在講話」的時間窗，供
+    `assemble_query_from_aligned_frames()` 的 `speech_window` 用——讓固定
+    長度重採樣之前先把 hold-to-record 按鍵按住多久造成的「講完話還按著」
+    那段濾掉。背景與量到的落差見 `reports/ALIGNMENT_MISMATCH.md`「按住
+    多久會不會洩漏進特徵向量」章節。
+
+    segments: `(來源標籤, start_us, end_us)` 的清單。每個 VAD 來源（唇動
+    A、唇動 B、語音……）各自一筆；沒偵測到的來源可以整個不放進清單，或放
+    `(label, None, None)`——這裡會自動濾掉，兩種寫法效果一樣。
+
+    ## 取聯集，不是交集
+
+    窗口是**所有來源裡最早的 start，到最晚的 end**。唇動本來就該比發聲
+    早——那正是這個專案要量的東西本身（`host/vad/onset.py`），取交集會
+    直接把唇動領先的那一段切掉，而且切完看起來完全正常，不會有任何錯誤
+    訊息。兩顆 ToF 感測器（A/B）同理：只要有一邊偵測到動作起點，就不該
+    被另一邊「還沒偵測到」蓋掉。
+
+    ## margin 的理由（不是隨便訂的數字）
+
+    - **前緣 `pre_margin_us`（預設 100 ms）**：`host/vad/onset.py` 算過的
+      跨模態量化誤差 RMS 約 46 ms，這裡抓 2 倍當安全空間；同時**遠低於**
+      story 預期的唇動先行量（50–150 ms），不會把要量的東西本身裁掉。
+      `host/vad/hysteresis.py` 的 onset 偵測本身已經有回退到「上升沿
+      起腳」的邏輯（最多 96 ms）——這裡的 100 ms 是在那之上**再留**一點
+      量化安全空間，不是重複的保護。
+    - **後緣 `post_margin_us`（預設 100 ms）**：離開閾值本身已經有
+      200 ms 掛延遲（`hysteresis.py` 的 `DEFAULT_HANGOVER_MS`），這裡再留
+      100 ms 給收尾的量化誤差。
+
+    ## 兩種「不裁切」的情況，都要記錄原因，不能安靜發生
+
+    - **完全沒有任何來源偵測到**：回 `source="none"`。silent 模式下沒有
+      語音是預期中的正常狀況，但連唇動都沒偵測到通常代表這筆錄音本身有
+      問題——不該被裁切邏輯悄悄吃掉，變得跟「這筆錄音很正常、只是沒被
+      選中裁切」看起來一樣。
+    - **裁切窗太短**：`min_span_us`（預設 300 ms，約 30 Hz 下 9 個原始
+      ToF 幀）是重採樣到 `T=24` 還有意義的下限，低於這個值裁切反而比不
+      裁切更失真，這裡選擇退回整段而不是報錯——跟這份報告一路以來
+      「結構壞掉才 STOP，數字異常只回報」的原則一致。
+    """
+    usable = [(label, s, e) for label, s, e in segments if s is not None and e is not None]
+    if not usable:
+        return SpeechWindowResult(
+            window_us=None, trimmed=False, source="none",
+            reason="沒有任何來源偵測到起訖（唇動與語音都沒有），退回使用整段錄音（未裁切）",
+        )
+
+    start = min(s for _, s, _ in usable) - pre_margin_us
+    end = max(e for _, _, e in usable) + post_margin_us
+    source = "+".join(sorted({label for label, _, _ in usable}))
+
+    span = end - start
+    if span < min_span_us:
+        return SpeechWindowResult(
+            window_us=None, trimmed=False, source=source,
+            reason=(f"裁切窗口只剩 {span / 1000:.0f} ms（來源：{source}），"
+                    f"低於下限 {min_span_us / 1000:.0f} ms，退回使用整段錄音（未裁切）"),
+        )
+
+    return SpeechWindowResult(window_us=(int(start), int(end)), trimmed=True, source=source, reason=None)
 
 
 class InsufficientFramesError(ValueError):
@@ -90,11 +192,17 @@ class QueryAssembly:
     `.slices`/`.t_us`/`.t_us_raw` 直接轉發底下的 `FeatureSeq`——**既有呼叫端
     （`bridge_server.py` 的 `_handle_recognize`，直接用 `query.data`）完全
     不用改就能繼續動**，這是刻意的：這條路徑改動時 `bridge_server.py` 不一定
-    歸這一輪的人動。`.coverage` 是新加的欄位，要不要看、看了要怎麼反應由
-    呼叫端自己決定。
+    歸這一輪的人動。`.coverage`／`.trim` 都是新加的欄位，要不要看、看了
+    要怎麼反應由呼叫端自己決定。
+
+    `.trim`：呼叫端有傳 `speech_window`（`compute_speech_window()` 的
+    結果）時原樣轉發，沒傳就是 `None`——`None` 代表「這次呼叫根本沒有
+    嘗試裁切」，跟 `SpeechWindowResult(trimmed=False, ...)`（有嘗試但
+    退回整段）是兩件不同的事，呼叫端要能分得出來。
     """
     feature_seq: FeatureSeq
     coverage: SensorCoverage
+    trim: Optional["SpeechWindowResult"] = None
 
     @property
     def data(self):
@@ -138,6 +246,7 @@ def assemble_query_from_aligned_frames(
     cvn: bool = False,
     active_zones_A: Optional[Sequence[int]] = None,
     active_zones_B: Optional[Sequence[int]] = None,
+    speech_window: Optional[SpeechWindowResult] = None,
 ) -> QueryAssembly:
     """把一段 `Aligner.frames()` 的輸出組成 `QueryAssembly`——`.data`
     （固定 T=`t_fixed`）給 cosine 距離用，`.data_raw` 給 DTW 用，跟
@@ -154,19 +263,30 @@ def assemble_query_from_aligned_frames(
     cvn: 是否對 mel 額外做逐 band 除以標準差（見 D02 `mel_features`）。
     active_zones_A/B: 可選，只用這些 zone 的距離+signal 通道（見 D11
         `active_zone_indices`）；為 None 時用全部 16 個 zone。
+    speech_window: 可選，`compute_speech_window()` 的結果——`.window_us`
+        非 `None` 時只保留這個時間窗內的幀，再做固定長度重採樣（見
+        `compute_speech_window()` 的完整理由）。`None`（預設）或
+        `.window_us is None`（有嘗試但退回整段）都維持這個參數加入前的
+        行為——整段都用，不裁切。**新功能預設關閉，不會讓沒有主動選用
+        它的呼叫端（例如目前的 `build_templates_from_session.py`）被動
+        改變行為。**
 
-    幀數不足（三個模態同時 present 的幀 < `MIN_USABLE_FRAMES`）時丟
-    `InsufficientFramesError`，不猜測、不補值——這是唯一會擋下的情況
-    （整段完全沒交集）；**一顆感測器只是「間歇性」有資料，不會觸發這個
-    例外，向量照樣組得出來，這正是 `SensorCoverage` 存在的理由**：真機上
-    ToF-A 中途斷線的實測顯示，這種情況下距離量測會明顯偏移、`top1` 可能
-    選錯類別，而且完全不會有任何例外或錯誤訊息。
+    幀數不足（三個模態同時 present 的幀 < `MIN_USABLE_FRAMES`，裁切之後
+    也算）時丟 `InsufficientFramesError`，不猜測、不補值；**一顆感測器
+    只是「間歇性」有資料，不會觸發這個例外，向量照樣組得出來，這正是
+    `SensorCoverage` 存在的理由**：真機上 ToF-A 中途斷線的實測顯示，這種
+    情況下距離量測會明顯偏移、`top1` 可能選錯類別，而且完全不會有任何
+    例外或錯誤訊息。
     """
     usable = _extract_usable_frames(frames)
+    if speech_window is not None and speech_window.window_us is not None:
+        window_start_us, window_end_us = speech_window.window_us
+        usable = [f for f in usable if window_start_us <= f.t_us <= window_end_us]
     if len(usable) < MIN_USABLE_FRAMES:
         raise InsufficientFramesError(
             f"三個模態同時有資料的幀只有 {len(usable)} 個，至少需要 {MIN_USABLE_FRAMES} 個"
-            f"（原始輸入 {len(frames)} 幀）"
+            f"（原始輸入 {len(frames)} 幀"
+            + (f"，裁切窗口 {speech_window.window_us}）" if speech_window and speech_window.window_us else "）")
         )
 
     coverage = SensorCoverage(
@@ -196,4 +316,4 @@ def assemble_query_from_aligned_frames(
     # 不在這裡重複驗證。
 
     feature_seq = assemble_feature_seq(tof_a_z, tof_b_z, mel_cmn, t_us, t_fixed=t_fixed)
-    return QueryAssembly(feature_seq=feature_seq, coverage=coverage)
+    return QueryAssembly(feature_seq=feature_seq, coverage=coverage, trim=speech_window)

@@ -22,7 +22,9 @@ import pytest
 from host.align.aligner import Aligner
 from host.features.live_pipeline import (
     InsufficientFramesError,
+    SpeechWindowResult,
     assemble_query_from_aligned_frames,
+    compute_speech_window,
 )
 
 _TOOLS_DIR = Path(__file__).resolve().parents[2] / "ssi-backlog" / "tools"
@@ -107,6 +109,120 @@ def test_missing_modality_frames_are_dropped_not_faked():
     assert any(f.tof_A_present for f in frames)  # sanity: tof itself did land
     with pytest.raises(InsufficientFramesError):
         assemble_query_from_aligned_frames(frames, np.zeros(32), np.ones(32), np.zeros(32), np.ones(32))
+
+
+def test_speech_window_takes_the_union_not_the_intersection():
+    """唇動比出聲早是這個專案要量的東西本身——取交集會把那段領先切掉，
+    這裡確認窗口是「較早的 start、較晚的 end」。"""
+    result = compute_speech_window([
+        ("lip_A", 1_000_000, 1_400_000),
+        ("voice", 1_200_000, 1_600_000),
+    ], pre_margin_us=0, post_margin_us=0, min_span_us=0)
+
+    assert result.trimmed
+    assert result.window_us == (1_000_000, 1_600_000)  # min(start), max(end)
+    assert result.source == "lip_A+voice"
+    assert result.reason is None
+
+
+def test_speech_window_applies_margins():
+    result = compute_speech_window(
+        [("lip_A", 1_000_000, 1_400_000)],
+        pre_margin_us=100_000, post_margin_us=50_000, min_span_us=0,
+    )
+    assert result.window_us == (900_000, 1_450_000)
+
+
+def test_speech_window_no_detection_falls_back_with_a_reason():
+    result = compute_speech_window([("lip_A", None, None), ("voice", None, None)])
+
+    assert not result.trimmed
+    assert result.window_us is None
+    assert result.source == "none"
+    assert result.reason is not None
+
+
+def test_speech_window_too_short_falls_back_with_a_reason_not_silently():
+    result = compute_speech_window(
+        [("lip_A", 1_000_000, 1_000_100)],  # 100 us span, way under any sane minimum
+        pre_margin_us=0, post_margin_us=0, min_span_us=300_000,
+    )
+
+    assert not result.trimmed
+    assert result.window_us is None
+    assert result.reason is not None
+    assert "300" in result.reason  # 說得出「低於哪個下限」，不是只說「太短」
+
+
+def test_speech_window_entries_with_missing_data_are_ignored():
+    """單一來源沒偵測到（`(label, None, None)`）不該讓整批算不出來——
+    只要還有別的來源有值，一樣要算得出聯集。"""
+    result = compute_speech_window([
+        ("lip_A", None, None),
+        ("lip_B", 1_000_000, 1_200_000),
+    ], pre_margin_us=0, post_margin_us=0, min_span_us=0)
+
+    assert result.trimmed
+    assert result.window_us == (1_000_000, 1_200_000)
+    assert result.source == "lip_B"
+
+
+def test_assemble_query_with_speech_window_drops_frames_outside_it():
+    aligner = Aligner()
+    t_end_us = _synthesize_utterance(aligner, "round", seed=1)
+    frames = list(aligner.frames(0, t_end_us, rate_hz=TOF_HZ))
+    mu, sigma = np.zeros(32), np.ones(32)
+
+    full = assemble_query_from_aligned_frames(frames, mu, sigma, mu, sigma)
+    assert full.trim is None  # 沒傳 speech_window，代表根本沒有嘗試裁切
+
+    narrow_window = compute_speech_window(
+        [("lip_A", 500_000, 900_000)], pre_margin_us=0, post_margin_us=0, min_span_us=0,
+    )
+    trimmed = assemble_query_from_aligned_frames(frames, mu, sigma, mu, sigma,
+                                                  speech_window=narrow_window)
+
+    assert trimmed.coverage.usable_frames < full.coverage.usable_frames
+    assert trimmed.trim is narrow_window
+    assert trimmed.trim.trimmed
+    # 裁切之後形狀依然是固定的 T=24——重採樣本身沒有被改動。
+    assert trimmed.data.shape == (24, 104)
+
+
+def test_assemble_query_with_a_fallback_window_behaves_like_no_window():
+    """`compute_speech_window()` 因為裁完太短而退回整段時，
+    `window_us is None`——`assemble_query_from_aligned_frames()` 必須把它
+    當成「不裁切」處理，而不是拿一個 `None` 窗口去比較炸掉。"""
+    aligner = Aligner()
+    t_end_us = _synthesize_utterance(aligner, "round", seed=1)
+    frames = list(aligner.frames(0, t_end_us, rate_hz=TOF_HZ))
+    mu, sigma = np.zeros(32), np.ones(32)
+
+    fallback = compute_speech_window(
+        [("lip_A", 500_000, 500_100)], pre_margin_us=0, post_margin_us=0, min_span_us=300_000,
+    )
+    assert fallback.window_us is None  # 確認真的是「太短退回」的情境
+
+    full = assemble_query_from_aligned_frames(frames, mu, sigma, mu, sigma)
+    with_fallback = assemble_query_from_aligned_frames(frames, mu, sigma, mu, sigma,
+                                                         speech_window=fallback)
+
+    assert with_fallback.coverage.usable_frames == full.coverage.usable_frames
+    assert with_fallback.trim is fallback
+    assert not with_fallback.trim.trimmed
+
+
+def test_assemble_query_speech_window_too_narrow_raises_insufficient_frames():
+    aligner = Aligner()
+    t_end_us = _synthesize_utterance(aligner, "round", seed=1)
+    frames = list(aligner.frames(0, t_end_us, rate_hz=TOF_HZ))
+    mu, sigma = np.zeros(32), np.ones(32)
+
+    # 窗口存在,但只涵蓋 1 個原始 ToF 幀的間距 (~33ms)——裁完應該不足
+    # MIN_USABLE_FRAMES,必須丟例外而不是靜靜地用不足的幀數硬組。
+    tight = SpeechWindowResult(window_us=(0, 1), trimmed=True, source="lip_A", reason=None)
+    with pytest.raises(InsufficientFramesError):
+        assemble_query_from_aligned_frames(frames, mu, sigma, mu, sigma, speech_window=tight)
 
 
 def test_end_to_end_through_recognition_service():

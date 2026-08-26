@@ -458,6 +458,64 @@ def test_d18_permutation_flags_a_single_wear_id_loudly(tmp_path):
     assert any("🔴" in note and "D18" in note for note in notes)
 
 
+# ------------------------------- effect_size 接線（7c 的 effect_size.py，只 import）
+
+
+def _fake_permutation_result(*, score, pvalue, passed, permutation_scores):
+    return {
+        "score": score, "pvalue": pvalue, "passed": passed,
+        "permutation_scores": permutation_scores,
+    }
+
+
+def test_d18_effect_size_flags_significant_p_that_does_not_clear_chance():
+    """7c 點名的那條規則：p 值顯著不等於 CI 下界贏過機率基準。手刻一個兩者
+    不一致的 report（n 很小、null 分布很窄），不需要真的跑 sklearn CV
+    才能驗證這個不一致偵測有沒有接對。"""
+    # n=8, n_classes=2（機率基準 50%），k=6/8=75%——Wilson CI 下界約 41%，
+    # 蓋住 50% 的機率基準，所以「贏過隨機猜」站不住；但把 pvalue 手動設成
+    # < 0.01（模擬置換檢定剛好判定顯著的情境），製造出跟 CI 判斷不一致。
+    report = {
+        "all": _fake_permutation_result(
+            score=0.75, pvalue=0.005, passed=True,
+            permutation_scores=[0.5, 0.5, 0.5, 0.5, 0.5],
+        ),
+        "tof_only": _fake_permutation_result(
+            score=0.75, pvalue=0.005, passed=True,
+            permutation_scores=[0.5, 0.5, 0.5, 0.5, 0.5],
+        ),
+    }
+
+    markdown, extra_notes = run_all.d18_effect_size_section(report, n=8, n_classes=2)
+
+    assert len(extra_notes) == 2  # all + tof_only 都不一致
+    for note in extra_notes:
+        assert "🔴" in note
+        assert "p 值顯著" in note
+        assert "沒有蓋過機率基準" in note
+    assert "準確率（近似）" in markdown
+    assert "置換效果量 z" in markdown
+
+
+def test_d18_effect_size_does_not_flag_when_ci_and_p_agree():
+    """兩者一致（都顯著、CI 也贏過機率基準）時不該產生任何 extra_notes——
+    這條規則只在**不一致**時才要出聲，不是每次都要講。"""
+    report = {
+        "all": _fake_permutation_result(
+            score=0.95, pvalue=0.001, passed=True,
+            permutation_scores=[0.5] * 20,
+        ),
+        "tof_only": _fake_permutation_result(
+            score=0.95, pvalue=0.001, passed=True,
+            permutation_scores=[0.5] * 20,
+        ),
+    }
+
+    _, extra_notes = run_all.d18_effect_size_section(report, n=20, n_classes=2)
+
+    assert extra_notes == []
+
+
 def test_missing_votes_are_reported_not_silently_empty():
     """**「沒有資料」不等於「沒有矛盾」。** 票數不足時要講出來。"""
     from analysis.reporting.verification_report import (

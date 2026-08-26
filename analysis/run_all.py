@@ -300,6 +300,7 @@ def _errored(key, exc):
 
 def run_silhouette(feature_seqs, labels, *, fast, is_synthetic):
     from analysis.experiments import exp_c_silhouette as mod
+    from analysis.reporting import effect_size
 
     n_components = 12 if fast else mod.DEFAULT_PCA_COMPONENTS
     report = mod.silhouette_report({"all": (feature_seqs, labels)},
@@ -310,6 +311,16 @@ def run_silhouette(feature_seqs, labels, *, fast, is_synthetic):
     score = table["all"]["score"]
     tof_score = table["tof_combined"]["score"]
     passed = mod.verdict_for_score(score) != "fail"
+
+    # Silhouette 本身就是效果量（`effect_size.silhouette_interpretation()`
+    # 只負責解釋尺度，不重新定義通過門檻——那個門檻仍然是
+    # `verdict_for_score()`，這裡不重複也不覆蓋）。附上解讀文字，不是只有
+    # 分數：口試委員問「這個數字代表什麼」時，這段話要能直接回答。
+    effect_size_md = effect_size.format_effect_size_section(
+        [("Silhouette（全模態）", effect_size.silhouette_interpretation(score)),
+         ("Silhouette（ToF-only）", effect_size.silhouette_interpretation(tof_score))],
+        title="效果量：這個分開有多明顯",
+    )
 
     name, metric, criterion = EXPERIMENT_META["C"]
     return ExperimentOutcome(
@@ -334,7 +345,7 @@ def run_silhouette(feature_seqs, labels, *, fast, is_synthetic):
             "在少數 zone/band，攤平後被大量無關維度稀釋。可先試 `--fast`（較低的"
             " PCA 維度）看分數會不會回升。"
         ),
-        report_md=mod.format_report(report),
+        report_md=mod.format_report(report) + "\n" + effect_size_md,
     )
 
 
@@ -669,6 +680,13 @@ def run_d18_permutation(feature_seqs, labels, wear_ids, *, n_permutations, is_sy
 
     置換次數沿用 `--ablation-permutations`（跟 `D19` 共用同一個時間預算
     旋鈕，理由相同：完整 1000 次要約 70 秒）。
+
+    **也接上 `analysis/reporting/effect_size.py`**（只 import，沒有改那支
+    檔案）：附上準確率的 Wilson CI（跟機率基準比較用 CI 下界，不是點估計）
+    與置換檢定的標準化效果量 z。回傳
+    `(grouping, (slug, markdown), extra_notes)`——比 `D16`/`D19` 多一個
+    `extra_notes`，因為「p 值顯著但 CI 下界沒蓋過機率基準」這個不一致
+    必須直接出現在 `summary.md`，不能只藏在 side report 裡。
     """
     from analysis.experiments import d18_permutation_test as mod
 
@@ -677,7 +695,50 @@ def run_d18_permutation(feature_seqs, labels, wear_ids, *, n_permutations, is_sy
         is_synthetic=is_synthetic, groups=wear_ids,
     )
     grouping = report["all"]["grouping"]
-    return grouping, ("d18_permutation", mod.format_report(report))
+    effect_size_md, extra_notes = d18_effect_size_section(report, n=len(labels),
+                                                           n_classes=len(set(labels)))
+    markdown = mod.format_report(report) + "\n" + effect_size_md
+    return grouping, ("d18_permutation", markdown), extra_notes
+
+
+def d18_effect_size_section(report, *, n, n_classes):
+    """把 `d18_permutation_test.permutation_report()` 的結果轉成效果量
+    小節（Wilson CI + 標準化效果量 z），拆成獨立函式**只是為了能直接單元
+    測試「p 值顯著但 CI 下界沒蓋過機率基準」這個不一致偵測**——不需要真的
+    跑一次 sklearn CV 才能驗證這條規則有沒有接對。
+
+    回傳 `(markdown, extra_notes)`。
+    """
+    from analysis.reporting import effect_size
+
+    entries = []
+    extra_notes = []
+    for label, key in (("全模態", "all"), ("ToF-only", "tof_only")):
+        r = report[key]
+        # `score` 是這輪 CV 的平均準確率，不是單一二項式試驗的 k/n——
+        # 用 `round(score * n)` 反推一個近似的 k，供 `accuracy_with_ci()`
+        # 算信賴區間用。這是近似（CV 折之間不獨立），跟 `cohens_d()` 那條
+        # 限制說明是同一種精神：夠好用來判斷「CI 下界有沒有蓋過機率基準」，
+        # 不是精確的二項式檢定。
+        k = round(r["score"] * n)
+        acc = effect_size.accuracy_with_ci(k, n, n_classes=n_classes)
+        entries.append((f"{label} 準確率（近似）", acc))
+        entries.append((f"{label} 置換效果量 z", effect_size.permutation_effect_size(
+            r["score"], r["permutation_scores"])))
+
+        # 🔴 這是 7c 點名要接的那條規則：p 值顯著（`passed`）不等於
+        # CI 下界蓋過機率基準（`above_chance`）——兩者用不同的統計量，
+        # 可能得出不同結論。兩者不一致時必須明講，不能只印比較好看的那個。
+        if r["passed"] and acc["above_chance"] is False:
+            extra_notes.append(
+                f"🔴 D18（{label}）：p 值顯著（p={r['pvalue']:.4f} < 0.01），"
+                f"但準確率信賴區間下界（{acc['ci_lower']:.1%}）沒有蓋過機率基準"
+                f"（{acc['chance_level']:.1%}）——**不能同時宣稱「統計上顯著」跟"
+                f"「贏過隨機猜」**，見 d18_permutation.md 的效果量小節。"
+            )
+
+    markdown = effect_size.format_effect_size_section(entries, title="效果量：這個顯著性有多大")
+    return markdown, extra_notes
 
 
 # ------------------------------------------------------------------ 主流程
@@ -788,12 +849,20 @@ def run_experiments(sessions, *, fast=False, is_synthetic=True,
                 notes.append(f"{name}未執行（--ablation-permutations 0）；{skip_consequence}")
                 continue
             try:
-                value, report = runner()
+                if extras_key == "d18_grouping":
+                    # D18 多回傳一個 `extra_notes`——「p 值顯著但 CI 下界
+                    # 沒蓋過機率基準」這個不一致必須直接進 `notes`，
+                    # 不能只藏在 side report 裡，D16/D19 沒有這個需求。
+                    value, report, extra_notes = runner()
+                else:
+                    value, report = runner()
+                    extra_notes = []
             except Exception as exc:                 # noqa: BLE001 — 側邊實驗容錯
                 notes.append(f"{name} 執行失敗（{type(exc).__name__}: {exc}）；{skip_consequence}")
                 continue
             extras[extras_key] = value
             side_reports.append(report)
+            notes.extend(extra_notes)
             if extras_key == "d18_grouping":
                 # 🔴 這個狀態必須在 summary.md 上就看得到，不能只藏在
                 # side report 裡——尤其 `ungrouped_single_group`（要求了
