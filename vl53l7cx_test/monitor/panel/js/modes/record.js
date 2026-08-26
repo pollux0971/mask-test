@@ -212,6 +212,16 @@ const ETA_SAMPLES_MAX = 8; // rolling window for the "actual average" ETA estima
 // threshold, kept in sync by convention rather than by import.
 const CAPTURE_STALL_MS = 3000;
 const CAPTURE_STALL_POLL_MS = 750;
+
+// ca's audit: recording a 4-hour E05 session against a baseline that's
+// since drifted produces trials that *look* fine (no error, no crash) but
+// have a wrong z-score reference the whole way down (baseline_mu/sigma,
+// energy_mu -> lip VAD thresholds -> feature vectors). Matches monitor.js's
+// own BASELINE_STALE_MS exactly (not exported, so not imported -- same
+// "propose reuse via matching constant" situation as CAPTURE_STALL_MS
+// above) -- this project has broken from a second, drifted definition of
+// the same threshold before; reusing the number, not inventing a new one.
+const BASELINE_STALE_MS = 10 * 60 * 1000;
 const QUALITY_DOT_LABEL = { ok: "●", low: "●", rejected: "●" };
 
 // Small self-contained z-score color, deliberately not imported from
