@@ -26,6 +26,7 @@ from typing import List, Optional
 import numpy as np
 
 from host.storage.session_writer import SessionWriter, TOF_VALID_DIM
+from host.vad.tof_vad import estimate_energy_floor, zone_energy
 
 BASELINE_DURATION_S = 30.0
 
@@ -82,6 +83,13 @@ class BaselineOutcome:
     noise_floor_sigma: Optional[float] = None
     valid_zone_ratio: Optional[float] = None
     noise_floor_warning: Optional[str] = None  # 見 NOISE_FLOOR_CONTAMINATION_RATIO；不影響 ok
+    # B21：ToF 唇動偵測（host/vad/tof_vad.py 的 detect_lip_activity()）的
+    # 能量門檻，從 baseline 期間（保證沒有動作）算的，不是從含動作的 trial
+    # 自己估——後者 B16 量過會偏嚴約 23%，唇動起點被系統性判太晚，直接
+    # 影響 D14「唇動先行量」的結論。只算 sensor A（B21 目前只用 sensor A
+    # 做偵測，沒有雙感測器融合策略）。
+    energy_mu: Optional[float] = None
+    energy_sigma: Optional[float] = None
 
     def to_dict(self) -> dict:
         def _list_or_none(x):
@@ -96,6 +104,7 @@ class BaselineOutcome:
             "noise_floor_mu": self.noise_floor_mu, "noise_floor_sigma": self.noise_floor_sigma,
             "valid_zone_ratio": self.valid_zone_ratio,
             "noise_floor_warning": self.noise_floor_warning,
+            "energy_mu": self.energy_mu, "energy_sigma": self.energy_sigma,
         }
 
 
@@ -217,6 +226,14 @@ def evaluate_baseline(tof_A: np.ndarray, tof_valid_A: np.ndarray,
 
     overall_valid_ratio = float(np.concatenate([tof_valid_A, tof_valid_B]).mean())
 
+    # B21：能量門檻用 sensor A 自己這段乾淨的靜止資料算——跟
+    # detect_lip_activity() 內部自估用的是同一組函式（zone_energy() +
+    # estimate_energy_floor()），不是抄一份邏輯。baseline 期間沒有動作，
+    # 這裡估出來的分布不會有 detect_lip_activity() 自己在含動作的 trial
+    # 資料上估計時那 23% 的系統性偏嚴。
+    energy_A, _, _ = zone_energy(tof_A, mu_A, sigma_A)
+    energy_mu, energy_sigma = estimate_energy_floor(energy_A)
+
     return BaselineOutcome(
         ok=report_A.ok and report_B.ok,
         reason=_reason_from_reports(report_A, report_B),
@@ -226,6 +243,7 @@ def evaluate_baseline(tof_A: np.ndarray, tof_valid_A: np.ndarray,
         noise_floor_mu=noise_mu, noise_floor_sigma=noise_sigma,
         valid_zone_ratio=overall_valid_ratio,
         noise_floor_warning=noise_floor_warning,
+        energy_mu=energy_mu, energy_sigma=energy_sigma,
     )
 
 
@@ -241,9 +259,17 @@ def capture_baseline_trial(
     由呼叫端準備好傳進來，這支不負責湊）、開一個新的 `SessionWriter`，
     以 `label="_baseline"` 寫成 `trial_000`。
 
-    `session_meta_base` 不能已經帶 `baseline_mu_A` 等四個 baseline 欄位或
-    `noise_floor_*`——這支就是負責算出並填入它們的地方，重複給會被覆蓋，
-    容易誤以為呼叫端要自己算，所以刻意不接受呼叫端傳這些鍵。
+    `session_meta_base` 不能已經帶 `baseline_mu_A` 等四個 baseline 欄位、
+    `noise_floor_*`，或 `energy_mu`/`energy_sigma`（B21）——這支就是負責算出
+    並填入它們的地方，重複給會被覆蓋，容易誤以為呼叫端要自己算，所以刻意
+    不接受呼叫端傳這些鍵。
+
+    ⚠️ `energy_mu`/`energy_sigma`（B21，給 `host.vad.tof_vad.detect_lip_activity()`
+    用）：目前 `session_writer.py` 還沒有這兩個 `/meta` 欄位的寫入邏輯
+    （18 正在加），這裡先把它們放進 `meta` dict——在那個改動落地前，
+    `SessionWriter._write_meta()` 只認 `REQUIRED_META_KEYS`/`OPTIONAL_META_KEYS`
+    裡列的鍵，多出來的鍵會被安靜地忽略（不報錯，只是不落盤），兩邊各自
+    完成後自動接上，不用互相等待。
     """
     outcome = evaluate_baseline(tof_A, tof_valid_A, tof_B, tof_valid_B, mic_rms)
     if not outcome.ok:
@@ -256,6 +282,8 @@ def capture_baseline_trial(
     meta["baseline_sigma_B"] = outcome.baseline_sigma_B
     meta["noise_floor_mu"] = outcome.noise_floor_mu
     meta["noise_floor_sigma"] = outcome.noise_floor_sigma
+    meta["energy_mu"] = outcome.energy_mu
+    meta["energy_sigma"] = outcome.energy_sigma
 
     with SessionWriter(path, meta) as writer:
         writer.write_trial(

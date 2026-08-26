@@ -194,6 +194,45 @@ def test_evaluate_baseline_stable_case_is_ok():
     assert outcome.valid_zone_ratio == pytest.approx(1.0)
 
 
+def test_evaluate_baseline_computes_energy_floor_from_sensor_a():
+    """B21：`energy_mu`/`energy_sigma` 用 sensor A 這段乾淨的靜止資料算，
+    不是從含動作的 trial 自己估——兩者都應該是有限、非負的值，且用的是
+    `host.vad.tof_vad` 裡跟 `detect_lip_activity()` 自估時同一組函式
+    （`zone_energy()` + `estimate_energy_floor()`），不是另外抄一份邏輯。
+    """
+    from host.vad.tof_vad import estimate_energy_floor, zone_energy
+
+    rng = np.random.default_rng(5)
+    tof_A, valid_A = _stable_tof(rng=rng)
+    tof_B, valid_B = _stable_tof(rng=rng)
+    mic_rms = rng.normal(loc=300, scale=10, size=930).astype(np.float32)
+
+    outcome = evaluate_baseline(tof_A, valid_A, tof_B, valid_B, mic_rms)
+
+    assert np.isfinite(outcome.energy_mu)
+    assert np.isfinite(outcome.energy_sigma)
+    assert outcome.energy_mu >= 0
+
+    # 跟直接呼叫同一組函式的結果比對，鎖住「同一份邏輯」這件事，不是只驗
+    # 「有算出一個數字」。
+    expected_energy, _, _ = zone_energy(tof_A, outcome.baseline_mu_A, outcome.baseline_sigma_A)
+    expected_mu, expected_sigma = estimate_energy_floor(expected_energy)
+    assert outcome.energy_mu == pytest.approx(expected_mu)
+    assert outcome.energy_sigma == pytest.approx(expected_sigma)
+
+
+def test_baseline_outcome_to_dict_includes_energy_floor():
+    rng = np.random.default_rng(6)
+    tof_A, valid_A = _stable_tof(rng=rng)
+    tof_B, valid_B = _stable_tof(rng=rng)
+    mic_rms = rng.normal(loc=300, scale=10, size=930).astype(np.float32)
+
+    outcome = evaluate_baseline(tof_A, valid_A, tof_B, valid_B, mic_rms)
+    d = outcome.to_dict()
+    assert d["energy_mu"] == pytest.approx(outcome.energy_mu)
+    assert d["energy_sigma"] == pytest.approx(outcome.energy_sigma)
+
+
 def test_evaluate_baseline_detects_shaking_on_either_sensor():
     rng = np.random.default_rng(2)
     tof_A, valid_A = _stable_tof(rng=rng)
@@ -238,6 +277,14 @@ def test_capture_baseline_trial_writes_meta_and_trial_000(tmp_path):
     )
 
     assert outcome.ok
+    # B21：energy_mu/energy_sigma 是這個 outcome 拿去填 SessionWriter 的
+    # meta dict 用的來源值 -- session_writer.py 目前還沒有這兩個 /meta 欄位
+    # 的寫入邏輯（18 正在加），所以刻意不斷言 HDF5 裡讀得到，只驗證
+    # capture_baseline_trial() 算出來的值本身是對的；那條「複製進 meta
+    # dict」的程式碼是一行單純賦值，看 diff 就能確認。
+    assert np.isfinite(outcome.energy_mu)
+    assert np.isfinite(outcome.energy_sigma)
+
     with h5py.File(path, "r") as f:
         meta = f["meta"]
         np.testing.assert_allclose(meta.attrs["baseline_mu_A"], outcome.baseline_mu_A)
