@@ -342,6 +342,47 @@ pytest 行程在搶 CPU**，事件到達的實際延遲會變大，容易超出�
 ⚠️ **中間那一列的「1 failed」是上面「待觀察」那節的
 `ConnectionRefusedError`，不是 helper 的問題**——它在下一輪就消失了。
 
+### 2026-08-26 下午快照（今天九個 agent 大量改動之後）
+
+> ⚠️ 同一條「移動目標」警語適用：**這是快照，不是常數。**
+
+| 範圍 | 結果 | 耗時 | 機器狀態 |
+|---|---|---|---|
+| `host/` + `analysis/` + `ssi-backlog/tools/` | **1165 passed, 0 failed** | 250s | ⚠️ 有其他 agent 在跑 bridge 測試，load ~2–5 |
+| `vl53l7cx_test/monitor/` | **見下方「拿不到乾淨數字」** | — | 🔴 load 7.8–10.9（8 核） |
+
+**指令**：
+```bash
+.venv/bin/python3 -m pytest host/ analysis/ ssi-backlog/tools/ -q
+```
+
+**這一輪涵蓋的當天改動**：VAD 裁切、分組 CV（`d18`）、效果量與 Wilson CI
+（`effect_size`）、`sensors_seen` 三層、`baseline_age_s`、串流逾時、`D21`、
+`mel_writer` 移除、`mic_t_us`、驗證介面。
+
+⚠️ **這一輪之前**，`test_run_all.py` 有兩條紅的（`8f` 重構 `run_all.py`
+到一半）。**這一輪它們是綠的**——重構完成了。**那兩條紅不是回歸，是進行中
+的狀態**，正是下方判準第 1 條講的情況。
+
+### 🔴 `vl53l7cx_test/monitor/` 這一輪**拿不到乾淨數字**
+
+**沒有跑。** 原因不是懶，是**跑了也不能用**：
+
+* 嘗試期間 load average 在 **7.8 – 10.9**（8 核），至少三個 agent 各自在跑
+  pytest，其中兩次直接在跑 `vl53l7cx_test/monitor/` 底下的檔案
+* 依本文件「根因」那節：**這個目錄一輪起約 90 對子行程**，在這種負載下
+  `device_clock["last_t_us"]` 會停住，**產生的紅燈是偽陽性**
+* 🔴 **而且會反過來污染其他 agent 正在跑的那幾輪**
+
+> **一份講「負載會造成偽陽性」的文件，不能靠製造負載來驗證自己。**
+
+**目前可用的最近數字**是同日稍早在較空的機器上量的
+**`123 passed, 0 failed, 0 errors`（627s）**——⚠️ **它早於當天下午的多項
+改動**（`test_bridge_device_api.py` 等新檔案是那之後才加的），
+**所以總數一定已經變了，通過率則未知**。
+
+**要拿乾淨數字，請在確認 `pgrep -af "python -m pytest"` 是空的時候再跑。**
+
 ### ⚠️ 重跑之前先確認機器狀態
 
 `vl53l7cx_test/monitor/` 一輪要 **10 分鐘、起約 90 對子行程**。
