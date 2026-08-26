@@ -194,3 +194,103 @@ I (98765) bone_mic: a15_perf: mic_task stack headroom = 3200 bytes
 - **`$T`/`$M`/`$F` 長行有機率被一行 log 從中間切斷**，不是理論風險、是目前程式碼結構
   必然存在的 race，機率取決於 mic_task/uart_cmd_task 的 log 呼叫頻率
   （`a15_perf` 每 10 秒至少一次，是最穩定會發生的來源）。
+  ⚠️ **更正**：見 §6——這個機率比本文件先前估的高得多，不是「10 分鐘大概撞不到一次」。
+
+---
+
+## 6. 🔴 更正前面的機率估計 + 最小韌體修法（已驗證過，**沒有套用**）
+
+### 6.1 先更正 §2／`reports/E01_bringup_checklist.md` §1.2 的機率估計
+
+先前（包含我自己寫進 `E01_bringup_checklist.md` §1.2 的那句）把碰撞機率估成
+「千分之幾量級，10 分鐘大概撞不到一次」——**這個估計錯了，錯在想像 UART 是
+「印完就丟進緩衝區、CPU 幾乎瞬間跑完」**。去讀了 `uart_cmd.c:279` 實際呼叫的
+`uart_driver_install(UART_NUM_0, 512, 0, 0, NULL, 0)`，第三個參數
+**`tx_buffer_size = 0`**。查了 ESP-IDF 驅動原始碼
+（`~/esp/esp-idf/components/esp_driver_uart/src/uart.c:1654-1676`，
+`uart_tx_all()`）：**`tx_buffer_size == 0` 代表完全沒有 TX ring buffer，
+`uart_write_bytes()`/`printf()` 是真的照 wire 速度**逐段等 `tx_fifo_sem`**阻塞
+到送完為止**，不是丟進緩衝區就返回。
+
+重新估：
+- 460800 baud，8N1，等效 46080 bytes/s。
+- 4×4（`dim=16`）一行 `$T` 約 140-150 bytes ≈ **3.2ms** 傳輸時間；
+  8×8（`dim=64`）一行約 550-650 bytes（超過那個已經是 0 的緩衝區，
+  更沒有任何緩衝空間可言）≈ **12-14ms**。
+- `uart_out_lock()` 整段（`print_tof_line()`/`print_ambient_line()`）
+  就是持鎖持續這整段實際傳輸時間，不是持鎖幾十微秒。
+- 4×4 @30Hz：A+B 兩顆各鎖一次 ≈ 6.4ms 鎖持有時間 / 33ms 幀週期
+  ≈ **占用率約 19%**。
+- 8×8 @10Hz：A+B 兩顆 ≈ 24-28ms / 100ms 幀週期 ≈ **占用率約 25-28%**。
+- `a15_perf` 每 10 秒觸發一次，時機跟 `$T` 的鎖週期沒有同步關係，
+  可以當成落在鎖持有窗口內的機率 ≈ 占用率本身。
+
+**修正後的估計：每次 `a15_perf` 觸發，大約 1/5 到 1/4 的機率撞上，不是千分之幾。**
+10 分鐘內 `a15_perf` 觸發約 60 次，預期撞上（因而弄丟一行 `$T`）約
+**12-17 次**——不是「大概率一次都不會撞上」。
+
+這個更正也代表 §6.2 這個修法**比原先想的更值得做**。
+
+### 6.2 修法：把 `a15_perf`（`mic_task` 那一行）包進 `uart_out_lock()`
+
+**可行性檢查**：
+
+| 疑慮 | 結論 |
+|---|---|
+| `uart_out_lock()` 是什麼鎖？`mic_task` context 拿得到嗎？ | 純 FreeRTOS mutex（`xSemaphoreCreateMutex`，`uart_out.c:11`），支援 priority inheritance，一般 task context 呼叫沒有限制。 |
+| 死結風險？ | 沒有。掃過全部 `uart_out_lock()`/`unlock()` 呼叫點（`bone_mic.c`、`vl53l7cx_test.c`），鎖保護的範圍永遠只是一串 `printf()`，沒有巢狀鎖、沒有在鎖內呼叫任何會回頭等 `mic_task` 自己的東西（I2S、queue）。 |
+| 會不會讓 `mic_task` 卡太久、掉音訊幀？ | **不會，有約 5-7 倍餘裕。** 最壞情況卡在 `tof_task` 剛好持鎖印一行 8×8 的 `$T`：≈13ms。`i2s_channel_read()` 讀的是 DMA 緩衝（`I2S_CHANNEL_DEFAULT_CONFIG`：`dma_desc_num=6`、`dma_frame_num=240`，總容量 1440 samples @16kHz ≈ **90ms**），`mic_task` 每次只吃 256 samples（16ms）份，也就是說在下一次 `i2s_channel_read()` 被叫之前，硬體最多能吸收約 90ms 的落後，而不是 mic_task 一卡住就馬上掉樣本。13ms 遠低於 90ms。 |
+
+**結論：可行，代價可接受，值得做。**
+
+**精確改法**（`main/bone_mic.c` 第 420-425 行，現在的原始碼）：
+
+```c
+        if (t_end - last_stack_log_us >= 10 * 1000000) {
+            UBaseType_t words_free = uxTaskGetStackHighWaterMark(NULL);
+            ESP_LOGI(TAG, "a15_perf: mic_task stack headroom = %u bytes",
+                     (unsigned)(words_free * sizeof(StackType_t)));
+            last_stack_log_us = t_end;
+        }
+```
+
+改成（只加兩行 `uart_out_lock()`/`uart_out_unlock()`，包住原本那一行 `ESP_LOGI`）：
+
+```c
+        if (t_end - last_stack_log_us >= 10 * 1000000) {
+            UBaseType_t words_free = uxTaskGetStackHighWaterMark(NULL);
+            uart_out_lock();
+            ESP_LOGI(TAG, "a15_perf: mic_task stack headroom = %u bytes",
+                     (unsigned)(words_free * sizeof(StackType_t)));
+            uart_out_unlock();
+            last_stack_log_us = t_end;
+        }
+```
+
+`bone_mic.c` 已經 `#include "uart_out.h"`（第 19 行），不用加 include。
+
+**已實際套用測試**：`idf.py build` 過，**0 warning**。測完已改回去，
+`git diff` 確認乾淨。
+
+**這個修法沒動到 log 的文字內容**——`reports/A15_perf.md` §3 說
+`tools/fw_regression.py` 靠人工從 `idf.py monitor` 抄 `a15_perf:` 這行
+（含 `bone_mic.c`/`vl53l7cx_test.c` 兩邊各一行）填表，這個修法只是「印之前
+先排隊」，印出來的文字、tag、格式一個字都沒變，`A15` 的量測方法不受影響。
+
+**沒解決的部分（範圍內就是如此，不是這次沒做完）**：
+- `vl53l7cx_test.c` 自己那行 `a15_perf`（同 task 印 `$T`，本來就不會撞自己，不用改）。
+- 開機期間（ROM + IDF 元件初始化）的雜訊——`app_main()` 都還沒開始跑，
+  `uart_out_lock` 這時候根本不存在，管不到，跟本文件 §1 是同一個結論。
+- `uart_cmd.c`/`bone_mic.c` 其餘的錯誤/指令觸發 log（i2s 失敗、
+  `SENS`/`AMB`/`MEL`/`REC` 回應、`unrecognised command`）——這些是事件觸發，
+  不是穩態週期性噪音，這次沒有一併包進鎖裡。如果之後要做「徹底沒有殘留風險」，
+  這些也要包，但那是更大範圍的改動，不是這次「最小修法」的範圍。
+
+### 6.3 一句話建議
+
+**值得搭 FFT 那次燒錄一起做。** 兩行改動、`uart_out_lock()`/`uart_out_unlock()`
+已經是現有機制、風險（音訊延遲 13ms vs 90ms 容量）遠低於現在確認會發生的
+問題（穩態下每 10 分鐘約 12-17 次 `$T` 遺失，且會被主機端誤判成傳輸層故障，
+見 `E01_bringup_checklist.md` §1.2）。唯一的理由不做是「使用者這次只想燒
+FFT probe，不想在同一次燒錄夾帶任何其他改動」——如果是這樣，這是可以晚一次
+燒錄再做的東西，不影響 FFT probe 那次量測本身。
