@@ -953,12 +953,18 @@ def build_session_meta_base(info, tof_t_us):
     # asked for"). The two disagreeing is itself the diagnosis -- on the
     # first real board this reads "A" against an enabled set of "AB".
     #
+    # Counted since the link came up, not since /session/start. The baseline
+    # is computed from the buffered seconds *before* the session was started,
+    # so frames that went into it can predate the session -- gating on the
+    # session's own start made this read "" on a board where both sensors
+    # were plainly streaming.
+    #
     # ⚠ /meta is written once, at baseline capture, because the schema needs
     # the baseline statistics. So this records what had been seen up to that
     # point, not the whole session. Enough for "one sensor never came up",
     # which is visible from boot; a sensor that drops out mid-session shows
     # up in the SSE events instead.
-    meta["sensors_seen"] = sensors_seen_string(session_frame_baseline)
+    meta["sensors_seen"] = sensors_seen_string()
 
     enabled = sensors_enabled_string()
     if enabled:
@@ -1515,6 +1521,9 @@ def serial_reader(port, baud, allow_v1=False):
             # re-reading the new firmware's $STATUS from scratch.
             protocol_state["parser"] = ProtocolParser(allow_v1=allow_v1)
             protocol_state["last_status_signature"] = None
+            # A reconnect is a new link: what the previous one delivered says
+            # nothing about this one.
+            session_frame_baseline.update(snapshot_frame_counts())
             print(f"[bridge] serial open: {port} @ {baud}")
             broadcaster.publish({"type": "link", "state": "up"})
             # Ask the device to identify itself right away. The board boots

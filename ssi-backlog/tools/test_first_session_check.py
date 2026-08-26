@@ -213,7 +213,7 @@ def test_mic_rms_constantly_zero_is_a_stop(tmp_path):
     path = tmp_path / "dead_mic.h5"
     meta = _base_meta()
     _write_session(path, meta, [
-        (0, "_baseline", {}),
+        (0, "_baseline", _trial_arrays(mic_rms_value=0.0)),
         (1, "八", _trial_arrays(mic_rms_value=0.0)),
         (2, "五", _trial_arrays(mic_rms_value=0.0)),
     ])

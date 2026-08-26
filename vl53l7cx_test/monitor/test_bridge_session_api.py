@@ -517,4 +517,9 @@ def test_sensors_seen_is_recorded_in_the_session_meta(rig):
     seen = meta.get("sensors_seen")
     if seen is None:
         pytest.skip("sensors_seen is not in the schema yet (esp-mask-test-18)")
-    assert seen in ("AB", b"AB")
+    if isinstance(seen, bytes):
+        seen = seen.decode()
+    assert seen == "AB", (
+        f"both sensors streamed but /meta recorded {seen!r} -- the count "
+        f"must include the buffered frames the baseline was computed from"
+    )

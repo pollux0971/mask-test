@@ -822,6 +822,129 @@ registerMode("record", (() => {
     };
   }
 
+  // --- build templates from this session's recordings ---------------------
+  //
+  // The user's own request: recording templates needs a panel button, not a
+  // terminal command someone wearing the device can't reach. Backend is
+  // 7c's POST /templates/build + GET /templates/build/state (202+poll, no
+  // completion SSE event -- confirmed by reading run_templates_build(), the
+  // finally block updates templates_build_state but never calls
+  // broadcaster.publish() again after the initial kickoff, so this has to
+  // poll rather than wait for an event).
+  //
+  // 7c found (real BlockingIOError, not a guess) that building against a
+  // session whose SessionWriter is still open 409s -- "結束 session 再建
+  // 樣板". One button that does both, not two the person has to sequence
+  // themselves, since they're wearing the device: end the session, then
+  // build against it (no body -- /templates/build defaults to
+  // session_runtime["h5_path"], which /session/end leaves set even after
+  // clearing the writer).
+
+  let templatesPollTimer = null;
+
+  function showTemplatesError(text) {
+    els.templatesStatusBox.style.display = "none";
+    els.templatesError.textContent = text;
+    els.templatesError.style.display = "block";
+  }
+
+  function showTemplatesStatus(title) {
+    els.templatesError.style.display = "none";
+    els.templatesStatusBox.style.display = "block";
+    els.templatesStatusTitle.textContent = title;
+    els.templatesSummary.textContent = "";
+    els.templatesWarningsList.innerHTML = "";
+  }
+
+  function renderTemplatesResult(result) {
+    els.templatesError.style.display = "none";
+    els.templatesStatusBox.style.display = "block";
+    els.templatesStatusTitle.textContent = "✅ 樣板已建立，可以切到「測驗」模式試試看";
+    const counts = Object.entries(result.counts || {}).map(([label, n]) => `${label}=${n}`).join("、");
+    const skipped = (result.skipped || []).length
+      ? `　跳過 ${result.skipped.length} 筆（${result.skipped.map((s) => `${s.trial}: ${s.reason}`).join("；")}）`
+      : "";
+    els.templatesSummary.textContent = `${result.out_path}　各類別：${counts}${skipped}`;
+    // warnings 原樣顯示，不要吞掉或改寫成別的話——7c 的腳本寫這些是給操作
+    // 者看的（例如 n=1 時「準確率是 nan 不是 0%」這種特定訊息）。
+    els.templatesWarningsList.innerHTML = (result.warnings || [])
+      .map((w) => `<li>⚠ ${w}</li>`).join("");
+  }
+
+  async function pollTemplatesBuildState() {
+    clearTimeout(templatesPollTimer);
+    try {
+      const res = await fetch("/templates/build/state");
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showTemplatesError(body.error || `查詢建樣板狀態失敗：HTTP ${res.status}`);
+        return;
+      }
+      if (body.running) {
+        showTemplatesStatus(`建樣板中…（已經 ${body.elapsed_s ?? "?"} 秒）`);
+        templatesPollTimer = setTimeout(pollTemplatesBuildState, 1000);
+        return;
+      }
+      if (body.last_error) {
+        showTemplatesError(body.last_error);
+        return;
+      }
+      if (body.last_result) {
+        renderTemplatesResult(body.last_result);
+        return;
+      }
+      showTemplatesError("建樣板結束了，但既沒有結果也沒有錯誤訊息（這不應該發生，回報給調度員）");
+    } catch (err) {
+      console.error("[record] poll /templates/build/state failed:", err);
+      if (err instanceof TypeError) {
+        showTemplatesError("無法連上 /templates/build/state：" + err.message);
+      } else {
+        showTemplatesError("輪詢建樣板狀態時發生程式錯誤（不是連線問題）：" + err.message);
+      }
+    }
+  }
+
+  async function buildTemplatesFromThisSession() {
+    els.buildTemplatesBtn.disabled = true;
+    showTemplatesStatus("結束 session 中…");
+    try {
+      const endRes = await fetch("/session/end", { method: "POST" });
+      // 409 here just means "already ended" (e.g. a second click, or the
+      // person already ended it some other way) -- not a reason to stop,
+      // /templates/build below will use whatever session is already on
+      // disk. Any other non-2xx is a real problem worth stopping for.
+      if (!endRes.ok && endRes.status !== 409) {
+        const body = await endRes.json().catch(() => ({}));
+        showTemplatesError(body.error || `結束 session 失敗：HTTP ${endRes.status}`);
+        return;
+      }
+
+      showTemplatesStatus("啟動建樣板中…");
+      const buildRes = await fetch("/templates/build", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      });
+      const buildBody = await buildRes.json().catch(() => ({}));
+      if (buildRes.status !== 202) {
+        showTemplatesError(buildBody.error || `啟動建樣板失敗：HTTP ${buildRes.status}`);
+        return;
+      }
+      pollTemplatesBuildState();
+    } catch (err) {
+      console.error("[record] buildTemplatesFromThisSession failed:", err);
+      // Same distinction as submitForm()'s catch (C11/ca's audit): a fetch()
+      // network failure is a TypeError, anything else is a real bug in this
+      // function and saying so (plus logging it) matters more than folding
+      // every failure into one "後端沒接上"-shaped message.
+      if (err instanceof TypeError) {
+        showTemplatesError("無法連上後端：" + err.message);
+      } else {
+        showTemplatesError("建樣板流程出錯（程式錯誤，不是連線問題，已印出完整訊息到 console）：" + err.message);
+      }
+    } finally {
+      els.buildTemplatesBtn.disabled = false;
+    }
+  }
+
   // --- disconnect-during-CAPTURE watch (ca's audit) -----------------------
   //
   // "斷線這件事前端已經知道了，只是 record 模式沒有用這個資訊" -- shell.js
@@ -1421,6 +1544,17 @@ registerMode("record", (() => {
 
               <div class="section-label dash-subsection">最近 10 筆（點擊可預覽）</div>
               <div class="recent-list" data-recent-list></div>
+
+              <div class="section-label dash-subsection">建立樣板</div>
+              <button type="button" class="retry-btn" data-build-templates-btn style="width:100%;">
+                🏗 結束 Session 並用這批建樣板
+              </button>
+              <div class="warnings-box" data-templates-status-box style="display:none; margin-top:8px;">
+                <div class="warnings-title" data-templates-status-title></div>
+                <div class="mono" data-templates-summary style="font-size:12px; margin:6px 0;"></div>
+                <ul data-templates-warnings-list></ul>
+              </div>
+              <div class="form-error" data-templates-error style="display:none; margin-top:8px;"></div>
             </aside>
           </section>
 
@@ -1493,6 +1627,12 @@ registerMode("record", (() => {
         progressEta: root.querySelector("[data-progress-eta]"),
         labelBars: root.querySelector("[data-label-bars]"),
         recentList: root.querySelector("[data-recent-list]"),
+        buildTemplatesBtn: root.querySelector("[data-build-templates-btn]"),
+        templatesStatusBox: root.querySelector("[data-templates-status-box]"),
+        templatesStatusTitle: root.querySelector("[data-templates-status-title]"),
+        templatesSummary: root.querySelector("[data-templates-summary]"),
+        templatesWarningsList: root.querySelector("[data-templates-warnings-list]"),
+        templatesError: root.querySelector("[data-templates-error]"),
         previewOverlay: root.querySelector("[data-preview-overlay]"),
         previewTitle: root.querySelector("[data-preview-title]"),
         previewClose: root.querySelector("[data-preview-close]"),
