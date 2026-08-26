@@ -70,6 +70,11 @@
   → `DEGRADED_SESSION.md` — 08-26 11:45 · 🧪 🔴（核心發現：換一組詞彙集，核心卡在單感測器資料上能直接 PASS 零警示）
 - 真實資料開始進來後，哪裡最可能悄悄壞掉而不是大聲報錯
   → `FIRST_REAL_DATA.md` — 08-26 11:14 · ⚙️（純程式碼路徑推演，還沒真的跑過真實資料）
+- ambient（`$A`）資料從序列埠解析出來之後，真的走得到 `C0` 串擾測試嗎
+  → `AMBIENT_PATH.md` — 08-26 12:39 · ⚙️ **已知缺口，刻意不補**（非待辦）：
+  `bridge_server.py`/`Aligner` 從沒收集過 ambient，全 repo 沒有一個真的
+  寫入點；但 `C0` 的 PASS/FAIL 不依賴它，只是少了 `D10` 講的最靈敏指標
+  加分項——`C0` 本身不受影響，理由跟修復時機見檔案開頭裁決
 - 錄好幾小時會不會出問題、會不會很煩
   → `RECORD_ENDURANCE.md` — 08-26 10:34 · ⚠️ **stale-needs-recheck**：中途被一個真的 `record.js` bug（`BASELINE_WAIT_GRACE_MS` undefined）卡住，沒能跑完整個耐久測試，部分答案只是程式碼審查
 - 錄到一半當機，`.h5` 檔案還讀得出來嗎
