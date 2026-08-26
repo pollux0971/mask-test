@@ -51,6 +51,13 @@ class Trial:
     # `D10` 明訂 ambient 是 crosstalk 最靈敏的指標。
     ambient_a: Optional[np.ndarray] = None
     ambient_b: Optional[np.ndarray] = None
+    # 之前寫進 HDF5 卻沒有對應欄位可以讀出來的三個 dataset（供需對帳表，
+    # SCHEMA_SUPPLY_DEMAND.md 的「結構性讀不到」）。`mel_t_us` 最要緊：
+    # §2 規定它跟 `mel` 成對，`mel` 讀得到卻沒有時間軸，任何要對齊 mel
+    # 幀與其他串流時間戳的分析都做不到。
+    mic_peak: Optional[np.ndarray] = None        # (M,) int16
+    mel_t_us: Optional[np.ndarray] = None        # (F,) int64，與 mel 成對
+    ambient_t_us: Optional[np.ndarray] = None    # (Ta,) int64，與 ambient_a/b 成對
     attrs: dict = field(default_factory=dict)
 
     @property
@@ -178,12 +185,17 @@ def load_session(path):
                 tof_valid_b=np.asarray(group["tof_valid_B"], dtype=bool),
                 tof_t_us=np.asarray(group["tof_t_us"], dtype=np.int64),
                 mic_rms=np.asarray(group["mic_rms"], dtype=np.float64),
+                mic_peak=np.asarray(group["mic_peak"], dtype=np.int64),
                 mel=(np.asarray(group["mel"], dtype=np.float64)
                      if "mel" in group else None),
+                mel_t_us=(np.asarray(group["mel_t_us"], dtype=np.int64)
+                          if "mel_t_us" in group else None),
                 ambient_a=(np.asarray(group["tof_ambient_A"], dtype=np.float64)
                            if "tof_ambient_A" in group else None),
                 ambient_b=(np.asarray(group["tof_ambient_B"], dtype=np.float64)
                            if "tof_ambient_B" in group else None),
+                ambient_t_us=(np.asarray(group["tof_ambient_t_us"], dtype=np.int64)
+                              if "tof_ambient_t_us" in group else None),
                 attrs=attrs,
             ))
 

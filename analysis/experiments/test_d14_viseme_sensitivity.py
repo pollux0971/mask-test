@@ -14,9 +14,12 @@ from analysis.experiments.d14_viseme_sensitivity import (
     MODALITY_ORDER,
     STRENGTH_ORDER,
     chance_max,
+    compare_lip_lead_versions,
     compare_to_expected,
+    format_lip_lead_report,
     format_report,
     fricative_check,
+    lip_lead_samples,
     load_viseme_map,
     plot_viseme_sensitivity,
     sensitivity,
@@ -26,6 +29,7 @@ from analysis.experiments.d14_viseme_sensitivity import (
     uniform_weak_tof,
     viseme_sensitivity_report,
 )
+from analysis.reporting.session_loader import Trial
 
 T_FIXED = 24
 N_DIMS = 104
@@ -486,3 +490,86 @@ def test_implausible_cells_on_an_empty_table():
     word_to_viseme, labels = load_viseme_map()
     table, _ = sensitivity_table([], word_to_viseme, labels)
     assert implausible_cells(table) == []
+
+
+# ---------------------------------------------------------------------------
+# 唇動先行量讀取端（`lip_lead_samples`/`compare_lip_lead_versions`）
+# ---------------------------------------------------------------------------
+
+def _make_trial(**attrs):
+    """最小可用的 `Trial`——這裡只測 `.attrs` 篩選邏輯，其餘欄位給空陣列
+    即可，不需要真的形狀正確的 ToF/mic 資料。"""
+    empty2d = np.zeros((0, 0))
+    empty1d = np.zeros((0,))
+    return Trial(
+        key="trial_000", label="wu", wear_id=1, mode="quiz",
+        speaking_mode=attrs.pop("speaking_mode", "normal"),
+        quality="ok",
+        tof_a=empty2d, tof_b=empty2d,
+        tof_valid_a=empty2d.astype(bool), tof_valid_b=empty2d.astype(bool),
+        tof_t_us=empty1d.astype(np.int64), mic_rms=empty1d,
+        mel=None, attrs=attrs,
+    )
+
+
+def test_lip_lead_samples_excludes_non_comparable_trials():
+    """`comparable` 不是明確 `True`（`None` 或 `False`）都要排除。"""
+    trials = [
+        _make_trial(comparable=True, voice_onset_us=200_000, lip_onset_us=100_000),
+        _make_trial(comparable=False, voice_onset_us=200_000, lip_onset_us=100_000),
+        _make_trial(voice_onset_us=200_000, lip_onset_us=100_000),  # comparable 缺席
+    ]
+    samples = lip_lead_samples(trials)
+    assert samples["fused"] == [100_000.0]  # 只有第一筆被納入
+
+
+def test_lip_lead_samples_excludes_trials_without_voice_onset():
+    """`voice_onset_us` 缺席（silent 模式必然如此）要整筆跳過，不能補 0。"""
+    trials = [_make_trial(comparable=True, lip_onset_us=100_000, speaking_mode="silent")]
+    samples = lip_lead_samples(trials)
+    assert samples == {"fused": [], "single_a": [], "single_b": []}
+
+
+def test_lip_lead_samples_handles_missing_sensor_b_independently():
+    """`lip_onset_us_B` 缺席是 `union_min` 設計本身允許的正常狀況——
+    `single_b` 跳過，不影響 `fused`/`single_a`。"""
+    trials = [_make_trial(
+        comparable=True, voice_onset_us=250_000,
+        lip_onset_us=100_000, lip_onset_us_A=100_000,
+        # lip_onset_us_B 故意不給
+    )]
+    samples = lip_lead_samples(trials)
+    assert samples["fused"] == [150_000.0]
+    assert samples["single_a"] == [150_000.0]
+    assert samples["single_b"] == []
+
+
+def test_compare_lip_lead_versions_reports_stats_and_marks_synthetic():
+    """煙霧測試：合成資料餵進去，三個版本的統計量都算得出來，且格式沒有
+    宣稱這是真實結論。"""
+    rng = np.random.default_rng(0)
+    trials = []
+    for _ in range(20):
+        lip = 100_000
+        voice = lip + int(rng.normal(100_000, 10_000))  # 平均先行量約 100ms
+        trials.append(_make_trial(
+            comparable=True, voice_onset_us=voice,
+            lip_onset_us=lip, lip_onset_us_A=lip, lip_onset_us_B=lip,
+        ))
+    result = compare_lip_lead_versions(trials)
+    for version in ("fused", "single_a", "single_b"):
+        assert result[version]["n"] == 20
+        assert result[version]["median_ms"] is not None
+
+    report = format_lip_lead_report(result, is_synthetic=True)
+    assert "合成資料" in report
+    assert "不是真實結論" in report
+
+
+def test_compare_lip_lead_versions_with_no_data_reports_zero_not_crash():
+    result = compare_lip_lead_versions([])
+    for version in ("fused", "single_a", "single_b"):
+        assert result[version]["n"] == 0
+        assert result[version]["median_ms"] is None
+    # 不該炸掉，且報告要能印出「0 筆」而不是拋例外
+    format_lip_lead_report(result)

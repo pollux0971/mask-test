@@ -115,11 +115,25 @@ VALID_QUALITY_VALUES = ("ok", "low", "rejected")
 # 不到，所以要跟 baseline_mu_*/noise_floor_* 一樣進 /meta。跟它們同一組
 # 待遇：選填、成對（給一個就兩個都要給，沒有「只知道平均不知道離散度」
 # 這種狀態），不驗值域（能量的合理範圍由上游 B16 自己決定，這裡不重複假設）。
+#
+# `source`（B19 wiring 時發現的落差，見 CONTRACTS.md 變更紀錄）：
+# §4.2 早就規定 `status` SSE 事件要帶它，`bridge_server.py` 組 baseline 的
+# meta dict 時也真的把 `link_source["value"]` 放進去了——但這裡以前沒有
+# 欄位可以接住，值進了 `_write_meta()` 就被丟掉。SSE 說得出來、檔案說不
+# 出來，而分析時只剩檔案：`E05` 的四小時資料如果不小心錄到 mock 上，這是
+# 唯一能事後發現的地方。跟 `energy_mu` 那次一樣的落差形狀（呼叫端在傳、
+# 寫入端沒接住），差別是這次還沒有人開始讀，抓到得早。
 OPTIONAL_META_KEYS = (
     "sensors_enabled", "sensors_enabled_confirmed", "energy_mu", "energy_sigma",
+    "source",
 )
 
 VALID_SENSORS_ENABLED = ("AB", "A", "B")
+
+# 跟 bridge_server.py 的 VALID_SOURCES 同一份值域（§4.2/§2 兩處契約已經
+# 凍結這四個值），不是各自維護一份容易漂移的清單，只是 SessionWriter 不
+# import bridge_server.py（方向反了），所以這裡重複列一次常數本身。
+VALID_SOURCES = ("live", "mock", "replay-log", "replay-session")
 
 
 class SessionWriter:
@@ -230,6 +244,12 @@ class SessionWriter:
         if has_energy_mu:
             meta_group.attrs["energy_mu"] = float(self._meta["energy_mu"])
             meta_group.attrs["energy_sigma"] = float(self._meta["energy_sigma"])
+
+        if "source" in self._meta:
+            value = self._meta["source"]
+            if value not in VALID_SOURCES:
+                raise ValueError(f"source 必須是 {VALID_SOURCES} 之一，收到 {value!r}")
+            meta_group.attrs["source"] = value
 
         # B05（兩點法漂移）與 B04（回歸法 slope）是兩個獨立方法量同一件事
         # ——對得上，兩邊才都可信；差太多代表其中一邊（或兩邊都）有問題，

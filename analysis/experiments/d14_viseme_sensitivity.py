@@ -565,6 +565,133 @@ def _expected_section(report):
     return lines
 
 
+# ---------------------------------------------------------------------------
+# 唇動先行量的讀取端（`reports/VAD_FUSION_OPTIONS.md` 問題 4 的事後檢驗）
+#
+# 不在 `D14.md` 原始範圍內（那份 story 只講 viseme 敏感度熱力圖）——放在
+# 這個檔案是 esp-mask-test-ad 的路由決定：`CONTRACTS.md` 的變更記錄把
+# `measure_lip_lead()`（`host/vad/onset.py`，B16）算出來的唇動領先量稱為
+# 「`D14` 唯一要量的東西」，`comparable`/`lip_onset_us_A`/`_B` 這幾個
+# schema 欄位也是為了讓這裡能做「`union_min` 融合策略選得對不對」的事後
+# 檢驗而存在（見 `reports/SCHEMA_SUPPLY_DEMAND.md`「一個欄位的三道關卡」）。
+#
+# **一律走 `session_loader.load_session()`，不要直接開 h5py 讀 attrs**——
+# h5py 原生讀 bool attr 會是 `numpy.bool_`，`numpy.bool_(True) is True`
+# 是 `False`，`comparable` 的篩選條件會靜默失效（`CONTRACTS.md` §2 的
+# 變更紀錄親自踩過這個坑）。`session_loader._as_scalar()` 已經把它正規化
+# 成 Python `bool`，這裡拿到的 `Trial.attrs` 是安全的。
+# ---------------------------------------------------------------------------
+
+LIP_LEAD_VERSIONS = ("fused", "single_a", "single_b")
+_LIP_ONSET_ATTR = {
+    "fused": "lip_onset_us",
+    "single_a": "lip_onset_us_A",
+    "single_b": "lip_onset_us_B",
+}
+
+
+def lip_lead_samples(trials):
+    """從一批 `Trial`（例如 `SessionData.trials`，跨多個 session 可以自己
+    先串起來再傳進來）收集「有意義的唇動先行量」樣本，依融合前後三個
+    版本分開回傳。
+
+    篩選規則（每一條都是 `CONTRACTS.md` §2 明訂的語意，不是這裡自己
+    發明的）：
+
+    - **`comparable` 必須明確是 `True`**（`is True`，不是 truthy）——
+      `None`（`measure_lip_lead()` 沒算過，例如根本沒偵測到唇動或語音）
+      跟 `False`（算過了，但兩邊的結果不能拿去相減）都要排除。這正是
+      `comparable` 這個欄位存在的理由：不可比的兩個時間戳硬相減，算出來
+      的數字看起來完全正常，不會有任何錯誤訊息。
+    - **`voice_onset_us` 缺席就整筆跳過**（三個版本都跳過）——`silent`
+      模式下這個欄位必然缺席，此時「唇動比發聲早多久」這個問題本身沒有
+      意義，不是「早了 0 ms」。
+    - **`single_b` 允許自己缺席，不影響 `fused`/`single_a`**：
+      `lip_onset_us_B` 缺席是 `union_min` 融合策略設計本身假設的正常
+      狀況（那顆感測器那次沒偵測到），不代表資料損毀，三個版本各自獨立
+      判斷自己的必要欄位是否存在。
+
+    回傳 `{version: [lead_us, ...]}`（`lead_us = voice_onset_us -
+    lip_onset_us`，符號跟 `host/vad/onset.py` 的 `LipLead.lead_us` 一致：
+    正值代表唇動比發聲早）。
+
+    ⚠️ **簡化說明**：`comparable` 是 `measure_lip_lead()` 針對**融合後**
+    （`fused`）版本判定的可比性；這裡把同一個閘門也套用在 `single_a`/
+    `single_b` 上，是這個讀取端的簡化，不是分別判斷每顆感測器自己的
+    可比性——schema 裡沒有逐感測器的 `comparable_A`/`comparable_B`。
+    """
+    out = {version: [] for version in LIP_LEAD_VERSIONS}
+    for trial in trials:
+        attrs = trial.attrs
+        if attrs.get("comparable") is not True:
+            continue
+        voice_onset = attrs.get("voice_onset_us")
+        if voice_onset is None:
+            continue
+        for version in LIP_LEAD_VERSIONS:
+            lip_onset = attrs.get(_LIP_ONSET_ATTR[version])
+            if lip_onset is None:
+                continue
+            out[version].append(float(voice_onset) - float(lip_onset))
+    return out
+
+
+def compare_lip_lead_versions(trials):
+    """三個版本（融合後 `lip_onset_us`、單顆 A、單顆 B）的先行量分布統計
+    ——`reports/VAD_FUSION_OPTIONS.md` 問題 4 提出的事後檢驗方法。
+
+    ⚠️ **這是事後檢驗方法本身的煙霧測試，不是真實結論。** `E05` 之前
+    沒有任何真實資料會流進這裡；這個函式現階段只能證明「篩選邏輯正確、
+    程式跑得動」，**不能**拿它在合成資料上的輸出去判斷 `union_min`
+    當初選得對不對——那個問題只有真實資料能回答。
+    """
+    samples = lip_lead_samples(trials)
+    result = {}
+    for version in LIP_LEAD_VERSIONS:
+        values = samples[version]
+        n = len(values)
+        result[version] = {
+            "n": n,
+            "median_ms": float(np.median(values)) / 1000.0 if n else None,
+            "mean_ms": float(np.mean(values)) / 1000.0 if n else None,
+            # `E07.md`/`E06.md` 引用的預期先行量區間，見 story 原文；
+            # 這裡只回報落在區間內的比例，不下任何「這代表策略選對了」
+            # 的結論。
+            "frac_within_50_150ms": (
+                sum(1 for v in values if 50_000.0 <= v <= 150_000.0) / n
+                if n else None
+            ),
+        }
+    return result
+
+
+def format_lip_lead_report(result, is_synthetic=True):
+    """把 `compare_lip_lead_versions()` 的結果轉成 Markdown 片段。"""
+    lines = ["## 唇動先行量：融合前後三個版本的事後檢驗（煙霧測試）", ""]
+    if is_synthetic:
+        lines += [
+            "> ⚠️ **本節使用合成資料，只驗證讀取端程式邏輯正確，"
+            "不是真實結論。** 真實資料到手後才能回答「`union_min` "
+            "當初選得對不對」，見 `reports/VAD_FUSION_OPTIONS.md` 問題 4。",
+            "",
+        ]
+    lines += ["| 版本 | n | median (ms) | mean (ms) | 落在 50–150ms 的比例 |",
+              "|---|---|---|---|---|"]
+    labels = {"fused": "融合後 (lip_onset_us)", "single_a": "單顆 A (lip_onset_us_A)",
+              "single_b": "單顆 B (lip_onset_us_B)"}
+    for version in LIP_LEAD_VERSIONS:
+        cell = result[version]
+        if cell["n"] == 0:
+            lines.append(f"| {labels[version]} | 0 | — | — | — |")
+            continue
+        lines.append(
+            f"| {labels[version]} | {cell['n']} | {cell['median_ms']:.1f} | "
+            f"{cell['mean_ms']:.1f} | {cell['frac_within_50_150ms']:.0%} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _fricative_section(report):
     check = report["fricative_check"]
     lines = ["## 擦音檢查（驗收條件）", ""]

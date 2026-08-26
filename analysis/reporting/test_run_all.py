@@ -132,6 +132,37 @@ def test_load_session_reads_meta_and_trials(tmp_path):
     assert mu.shape == (2 * N_ZONES,) and sigma.shape == (2 * N_ZONES,)
 
 
+def test_load_session_exposes_mic_peak_and_paired_timestamps(tmp_path):
+    """SCHEMA_SUPPLY_DEMAND.md 標記過的「結構性讀不到」：`mic_peak`（必填
+    dataset）跟 `mel_t_us`/`tof_ambient_t_us`（分別跟 `mel`/`tof_ambient_*`
+    成對必寫）以前寫得進 HDF5，`Trial` dataclass 卻沒有對應欄位可以讀出來
+    ——`mel_t_us` 尤其要緊：沒有它，任何要對齊 mel 幀跟其他串流時間戳的
+    分析都做不到。"""
+    path = write_session(tmp_path / "s.h5", wear_id=1, seed=0, with_ambient=True)
+    session = session_loader.load_session(path)
+    trial = session.trials[0]
+
+    assert trial.mic_peak is not None
+    assert trial.mic_peak.shape == trial.mic_rms.shape
+
+    assert trial.mel is not None and trial.mel_t_us is not None
+    assert trial.mel_t_us.shape[0] == trial.mel.shape[0]
+
+    assert trial.ambient_a is not None and trial.ambient_t_us is not None
+    assert trial.ambient_t_us.shape[0] == trial.ambient_a.shape[0]
+
+
+def test_load_session_mel_t_us_and_ambient_t_us_absent_when_optional_data_is(tmp_path):
+    """`mel`/`tof_ambient_*` 都是選填；沒有的時候，成對的時間戳也該是
+    `None`，不是報錯，也不是留一個跟資料對不上的陣列。"""
+    path = write_session(tmp_path / "s.h5", wear_id=1, seed=0,
+                         with_mel=False, with_ambient=False)
+    session = session_loader.load_session(path)
+    trial = session.trials[0]
+    assert trial.mel is None and trial.mel_t_us is None
+    assert trial.ambient_a is None and trial.ambient_t_us is None
+
+
 def test_load_session_rejects_a_file_without_meta(tmp_path):
     path = tmp_path / "bad.h5"
     with h5py.File(path, "w") as handle:

@@ -141,3 +141,22 @@ html[data-projector-mode="true"] {
   border: 2px solid var(--status-unknown);
   flex-shrink: 0;
 }
+
+/* --- C25: keyboard-accessibility audit -- global focus-visible ring ---
+   Before this, the whole app relied on each browser's own default focus
+   ring (only two ad-hoc `:focus`/`:focus-within` rules existed anywhere,
+   both in record.css, covering one input and one list item). Everything
+   else -- every nav item, every mode-btn, every toggle across all five
+   modes -- had no explicit focus style at all. A thin default outline on
+   this dark background, on a washed-out projector, is exactly the kind of
+   thing this story's whole "text is legible" pass was about, just for
+   focus rings instead of font-size. One global rule instead of five
+   per-mode copies that would drift.
+   :focus-visible (not :focus) on purpose: only shows for keyboard
+   navigation, not for a mouse click -- a presenter clicking around with a
+   mouse shouldn't see a ring flash on every click, only someone actually
+   tabbing through needs the cue. */
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}

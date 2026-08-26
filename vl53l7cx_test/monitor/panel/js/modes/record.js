@@ -197,6 +197,13 @@ function zoneListText(zones) {
 const DEFAULT_TARGET_PER_LABEL = 8; // E06 convention: "8 詞 × 8 樣板 + 靜止 × 8"
 const RECENT_TRIALS_MAX = 10;
 const ETA_SAMPLES_MAX = 8; // rolling window for the "actual average" ETA estimate
+
+// Disconnect-during-CAPTURE audit (ca): matches shell.js's own
+// LINK_DATA_FRESHNESS_MS (not exported, so not imported -- see file-top
+// note) -- same "how long is too long since real data last arrived"
+// threshold, kept in sync by convention rather than by import.
+const CAPTURE_STALL_MS = 3000;
+const CAPTURE_STALL_POLL_MS = 750;
 const QUALITY_DOT_LABEL = { ok: "●", low: "●", rejected: "●" };
 
 // Small self-contained z-score color, deliberately not imported from
@@ -266,6 +273,8 @@ registerMode("record", (() => {
   let savedTrialTotal = 0;
   let recentTrials = []; // newest first, capped at RECENT_TRIALS_MAX
   let captureWindowStartMs = null; // performance.now() at this trial's CAPTURE-entry
+  let captureStallTimer = null; // setInterval id, running only while trialState === "CAPTURE"
+  let captureStalled = false; // true once CAPTURE has gone quiet for CAPTURE_STALL_MS
   let etaSamplesMs = []; // recent inter-SAVE wall-clock gaps, rolling window
   let lastSaveAtMs = null;
   let previewTrialIdx = null; // idx of the recentTrials entry open in the preview overlay
@@ -741,6 +750,49 @@ registerMode("record", (() => {
     };
   }
 
+  // --- disconnect-during-CAPTURE watch (ca's audit) -----------------------
+  //
+  // "斷線這件事前端已經知道了，只是 record 模式沒有用這個資訊" -- shell.js
+  // (C04) already computes a correct up/down signal (explicit {type:"link"}
+  // events plus a data-freshness fallback for when the bridge process itself
+  // dies before it can even send a down event), but doesn't export it
+  // (grepped: only registerMode/forEachRegisteredMode/activateMode/
+  // notifySseConnection/notifyGlobalStatus are exported, nothing exposes the
+  // computed link state) -- and shell.js isn't this file's to add an export
+  // to right now. Rather than build a second, separate disconnect detector,
+  // this reuses bus.js's dataStore -- already the single source of truth for
+  // "has real tof data actually arrived recently" (it's a public ring
+  // buffer, not new logic) -- and asks the exact question CAPTURE cares
+  // about: is data for *this* trial still flowing, regardless of which
+  // layer stopped it. Flagged in the completion report as a case where a
+  // small shell.js export would let this reuse the richer signal directly.
+
+  function isCaptureDataFresh() {
+    return dataStore.getRecent("tofA", CAPTURE_STALL_MS).length > 0
+      || dataStore.getRecent("tofB", CAPTURE_STALL_MS).length > 0;
+  }
+
+  function checkCaptureFreshness() {
+    if (trialState !== "CAPTURE") return; // stale timer tick racing a state change; ignore
+    const stalled = !isCaptureDataFresh();
+    if (stalled !== captureStalled) {
+      captureStalled = stalled;
+      renderTrialCard();
+    }
+  }
+
+  function startCaptureStallWatch() {
+    captureStalled = false;
+    clearInterval(captureStallTimer);
+    captureStallTimer = setInterval(checkCaptureFreshness, CAPTURE_STALL_POLL_MS);
+  }
+
+  function stopCaptureStallWatch() {
+    clearInterval(captureStallTimer);
+    captureStallTimer = null;
+    captureStalled = false;
+  }
+
   function finalizeSavedTrial(evt) {
     const nowMs = performance.now();
     savedTrialTotal += 1;
@@ -884,7 +936,15 @@ registerMode("record", (() => {
 
   function renderTrialCard() {
     const card = els.trialCard;
-    card.className = "trial-card state-" + trialState.toLowerCase();
+    // C-track disconnect audit (ca): a real capture that stalls (device
+    // unplugged, bridge killed) leaves this card frozen on the CSS pulse
+    // forever -- the animation is pure CSS, it doesn't need data to keep
+    // running, so it kept looking like a normal in-progress recording with
+    // no timeout and no message. Reusing .state-confirm's existing
+    // dashed-warn look here (not inventing a new class -- css/modes/record.css
+    // isn't this file's to edit right now, see completion report) since it
+    // already means "something needs your attention" on this same card.
+    card.className = "trial-card " + (captureStalled ? "state-confirm" : "state-" + trialState.toLowerCase());
 
     if (trialState === "CONFIRM") {
       els.trialWord.textContent = trialLabel || "—";
@@ -906,9 +966,17 @@ registerMode("record", (() => {
     els.trialRequeueNote.style.display = pendingRequeueLabel && (trialState === "IDLE" || trialState === "REST")
       ? "block" : "none";
 
-    els.trialStateLabel.textContent = TRIAL_STATE_LABEL[trialState] || trialState;
+    els.trialStateLabel.textContent = captureStalled
+      ? "⚠ 連線中斷 — 這筆沒錄到"
+      : (TRIAL_STATE_LABEL[trialState] || trialState);
     els.trialIdx.textContent = trialIdx != null ? `#${trialIdx}` : "—";
     els.trialSeed.textContent = trialSeed != null ? `seed=${trialSeed}` : "";
+
+    if (captureStalled) {
+      setTrialError("這一筆沒錄到（收不到感測器資料），請放開重念一次");
+    } else if (trialState === "CAPTURE") {
+      setTrialError(""); // clears a stale "沒錄到" message once data resumes flowing
+    }
 
     const showPrefix = trialState === "REST" && trialLabel;
     els.trialPrevLabel.style.display = showPrefix ? "block" : "none";
@@ -933,6 +1001,7 @@ registerMode("record", (() => {
     // moment CAPTURE is entered, before trialState gets overwritten below --
     // this is what lets finalizeSavedTrial() slice the right span out of
     // bus.js's dataStore once SAVE arrives.
+    const wasCapturing = trialState === "CAPTURE";
     if (evt.state === "CAPTURE" && trialState !== "CAPTURE") {
       captureWindowStartMs = performance.now();
     }
@@ -945,6 +1014,13 @@ registerMode("record", (() => {
     if (trialState === "COUNTDOWN") playBeep(BEEP_GET_READY_HZ);
     if (trialState === "CAPTURE") playBeep(BEEP_GO_HZ);
     if (trialState === "SAVE") finalizeSavedTrial(evt);
+
+    // A real trial event arriving at all is itself proof the link is up
+    // (SAVE/CONFIRM/etc. only exist if the backend is alive and talking to
+    // us) -- so any state change away from CAPTURE ends the stall watch,
+    // even if it never actually detected a stall.
+    if (!wasCapturing && trialState === "CAPTURE") startCaptureStallWatch();
+    else if (wasCapturing && trialState !== "CAPTURE") stopCaptureStallWatch();
 
     renderTrialCard();
   }
@@ -1411,6 +1487,7 @@ registerMode("record", (() => {
       if (holdKeyDown) triggerHoldStop();
       closePreview(); // don't leave the overlay stuck open over another mode
       pendingRequeueLabel = null; // C14: don't let a stale requeue intent survive a mode switch
+      stopCaptureStallWatch(); // don't leave this interval running while another mode is visible
     },
 
     onData(evt) {

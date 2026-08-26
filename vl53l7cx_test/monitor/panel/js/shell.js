@@ -297,6 +297,12 @@ const statusSummaryBtn = document.querySelector("[data-status-summary]");
 const linkDotEl = document.getElementById("linkDot");
 
 let sseUp = false;
+// Distinguishes "never connected yet" (normal for the first ~instant after
+// page load, before EventSource's first onopen) from "was connected, now
+// isn't" (a real disconnect) -- the alert ring below should only fire for
+// the latter, or every fresh page load would flash red for that first
+// instant even when nothing is actually wrong.
+let everConnectedSse = false;
 // A page that (re)loads after the device link was already established never
 // sees that one-time {type:"link",state:"up"} broadcast -- bridge_server.py
 // only relays *transitions* to whoever's subscribed at the moment, it
@@ -402,12 +408,28 @@ function renderStatusBar() {
 
   // unknown must never look like it passed (same rule as C09's hollow-ring
   // dot) -- here that means "not counted as red", not "counted as green".
-  const anyRed = qualityLevels.drop_rate === "red" || qualityLevels.symmetry === "red";
+  //
+  // !sseUp belongs in this same "loudest alert" tier, not a smaller one --
+  // found live via the disconnect audit: a degraded quality metric (still
+  // receiving data, just not great) already triggered this ring, but the
+  // browser having NO connection to the bridge at all didn't. That's the
+  // severity ordering backwards (a bad-but-present signal alarmed harder
+  // than no signal at all), and it was easy to miss since the only other
+  // cue was one line of small sidebar text -- exactly the failure mode this
+  // ring exists to prevent. Clears itself automatically the moment sseUp
+  // flips back to true (EventSource's native reconnect already calls
+  // notifySseConnection(true) -> renderStatusBar() with no reload needed,
+  // verified in that same audit), so no separate recovery logic is needed.
+  // everConnectedSse guards against a false-alarm flash during the first
+  // instant after page load, before the very first onopen -- that's normal,
+  // not a disconnect, and shouldn't ring the loudest alert this app has.
+  const anyRed = qualityLevels.drop_rate === "red" || qualityLevels.symmetry === "red" || (everConnectedSse && !sseUp);
   sidebar.classList.toggle("status-alert", anyRed && !inReplay);
 }
 
 export function notifySseConnection(isUp) {
   sseUp = isUp;
+  if (isUp) everConnectedSse = true;
   renderStatusBar();
 }
 

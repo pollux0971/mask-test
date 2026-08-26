@@ -16,7 +16,7 @@
   `bridge_server.py` 已經在讀、寫入端卻還沒接住，直到這輪把它加進
   `session_writer.py` 才補上。細節見下方，這是這張表唯一「抓到現行進行式
   的那三種歷史 bug」的一筆，不是舉例。
-- 第二類（有寫、沒人讀）有 **11 筆**，大多是「D14/D-track 還沒做完」的
+- 第二類（有寫、沒人讀）有 **12 筆**，大多是「D14/D-track 還沒做完」的
   正常暫態，不是 bug；但其中 `mel_t_us`/`tof_ambient_t_us` 是**結構性**
   讀不到（`session_loader.py` 的 `Trial` dataclass 沒有對應欄位，不是
   「剛好沒人寫」），值得記一筆。
@@ -91,15 +91,14 @@ B09/B11 之前的示範路徑**，程式裡自己的註解寫著「B09（session
 | `mel` | `write_trial()`（選填） | `Trial.mel`；`run_all.py` 的 `mel_features()` |
 | `tof_ambient_A/B` | `write_trial()`（選填，全有或全無） | `Trial.ambient_a/b`；`stacked_ambient()`、crosstalk 報告 |
 | `speaking_mode` | `write_trial()`（選填，B21 已接線，目前固定 `"normal"`——見 `E2E_PIPELINE.md`） | `Trial.speaking_mode`（曝露了，但下面歸類在情況二：D-track 還沒有任何程式碼真的讀它） |
+| `vad_start_us`, `vad_end_us`, `lip_onset_us`, `voice_onset_us`, `lip_onset_us_A`, `lip_onset_us_B`, `comparable` | `write_trial()`（選填；`vad_*`/`lip_onset_us`/`voice_onset_us` 見上方已知缺口，`lip_onset_us_A/B`/`comparable` 是這輪剛加、`4f` 剛接的） | **這輪剛接上**：`analysis/experiments/d14_viseme_sensitivity.py` 新增 `lip_lead_samples()`/`compare_lip_lead_versions()`，走 `Trial.attrs`（不直接開 h5py，`comparable` 的 `numpy.bool_` 陷阱由 `session_loader._as_scalar()` 擋掉）。只納入 `comparable is True` 且 `voice_onset_us` 存在的 trial；`lip_onset_us_B` 缺席（`union_min` 設計本身允許）只影響 `single_b` 這個版本，不影響 `fused`/`single_a`。**目前只用合成資料測過篩選邏輯本身正確，真實資料到手前不產出任何「哪個版本比較好」的結論**（`reports/VAD_FUSION_OPTIONS.md` 問題 4） |
 
-### 情況二：有寫、沒人讀（浪費但無害）——11 筆
+### 情況二：有寫、沒人讀（浪費但無害）——9 筆
 
 | 欄位 | 誰在寫 | 為什麼現在沒人讀 |
 |---|---|---|
 | `speaking_mode` | `write_trial()`，B21 已接線 | D-track 還沒有 normal/whisper/silent 的分軌分析——`Trial.speaking_mode` 已曝露，是**準備好了、等 D 軌來用**，不是缺陷 |
 | `vad_confidence` | `write_trial()`，選填 | 同上，B15 有算，`analysis/` 沒有消費點 |
-| `vad_start_us`, `vad_end_us`, `lip_onset_us`, `voice_onset_us` | `write_trial()`，選填；目前 `host/trial/state_machine.py` 仍固定傳 `None`（B15/B16 偵測器還沒接進 trial machine——見 `E2E_PIPELINE.md` 的已知缺口） | 目前**連寫都還沒真的發生**（永遠是省略），`Trial.attrs` 有曝露這幾個 key，但 `analysis/` 一次都沒 `.get()` 過 |
-| `comparable` | `write_trial()`；**這輪剛確認 `host/trial/state_machine.py` 已經在傳 `lead.comparable`**（B21，4f 剛接） | `analysis/` 目前完全沒有 `comparable` 字樣（測試檔除外）——**D14 還沒開始讀，調度員已經知道、正在派工**。這是這張表存在的意義：現在就是「有寫、沒人讀」，過幾天如果 D14 忘記接，就會變成「有人假設讀得到、卻讀到 `KeyError`」（響亮失敗，不是靜默——`session_loader.py` 的 `attrs.get()` 模式讓這種缺席至少不會裝成錯誤答案） |
 | `noise_floor_mu`, `noise_floor_sigma` | `SessionWriter._write_meta()`，必填 | `bridge_server.read_baseline_thresholds()` 有讀（給 VAD 用），但 `analysis/` 沒有任何實驗直接用它算東西 |
 | `clock_slope`, `clock_offset`, `clock_residual_p95`, `clock_drift_us`, `clock_drift_ppm`, `clock_sync_span_us`, `clock_sync_confirmed`, `session_start_*`, `session_end_*`, `clock_cross_check_ppm_diff`, `clock_cross_check_ok` | `SessionWriter._write_meta()`，必填/`finalize_session_end()` | 純校時診斷欄位，`analysis/` 沒有任何程式碼檢查它們——**這點比單純的「還沒輪到」更值得注意**：如果一個 session 的 `clock_sync_confirmed=False` 或 `clock_cross_check_ok=False`，代表這個檔案的時間戳可能不可信，但目前**沒有任何分析流程會因此警告或排除它**。不算這次的三種歷史 bug模式，但值得另開一個 story 評估要不要在 `availability()`／`verification_report.py` 加一道檢查 |
 | `mic_peak` | `write_trial()`，必填 dataset | `Trial` dataclass 沒有 `mic_peak` 欄位（`mic_rms` 有，`mic_peak` 沒有）——**結構性讀不到**：不是「沒人剛好去讀」，是 loader 從沒把它接進 `Trial`。目前沒有實驗需要峰值（跟削波偵測相關，`D` 軌尚未有這類實驗），先記錄 |
@@ -107,6 +106,36 @@ B09/B11 之前的示範路徑**，程式裡自己的註解寫著「B09（session
 | `tof_ambient_t_us` | `write_trial()`，跟 `tof_ambient_*` 成對必寫 | 同上，`Trial.ambient_a/b` 有暴露，沒有 `Trial.ambient_t_us` |
 | `audio`, `audio_t0_us` | `write_trial()`，選填 | `Trial` dataclass完全沒有 `audio` 欄位；目前沒有任何錄音管線真的餵 `audio` 給 `write_trial()`（`schema_example.py` 的範例檔是唯一寫過的地方），純示範用途 |
 | `source` | **半供應**——見情況三前的特別說明 | 見下 |
+
+**這輪移出這張表的 7 筆**（`vad_start_us`、`vad_end_us`、`lip_onset_us`、
+`voice_onset_us`、`lip_onset_us_A`、`lip_onset_us_B`、`comparable`）——
+`d14_viseme_sensitivity.py` 剛接上讀取端，移到上面「情況一：有寫、有讀」，
+見下方「三道關卡」小節的更新。
+
+### 一個欄位的三道關卡：`lip_onset_us_A`/`lip_onset_us_B`
+
+這筆值得單獨記錄，因為它示範了調度員點名的重點——**一個 schema 欄位要
+真的「有寫有讀」，中間有好幾道關卡，任何一道卡住都不會變紅**：
+
+1. **契約有定義、兩邊都沒實作**（今天寫這份報告的當下之前）——調度員
+   剛裁定用 `union_min` 融合策略，但 schema 裡完全沒有存放「融合前」的
+   欄位。這個階段如果有人去讀，`session_loader.py` 連 key 都不知道要找。
+2. **有寫、沒人讀**（這輪剛完成的狀態，寫這節的當下）——`session_writer.py`
+   已經加了 `lip_onset_us_A`/`lip_onset_us_B`（選填、各自獨立、沒偵測到
+   就整個省略），`4f` 會接 `state_machine.py` 去真的填值，但 `analysis/`
+   還沒有任何程式碼讀它。
+3. **有寫有讀**（這輪完成）——`d14_viseme_sensitivity.py` 的
+   `lip_lead_samples()`/`compare_lip_lead_versions()` 已經接上，走
+   `Trial.attrs`（不直接開 h5py），篩選規則（`comparable is True`、
+   `voice_onset_us` 必須存在、`lip_onset_us_B` 缺席只影響 `single_b`）
+   跟 `CONTRACTS.md` §2 的語意逐條對齊。**但「有寫有讀」不等於「已經能
+   回答當初選 `union_min` 對不對」**——現在讀到的還是合成資料，這一關
+   只證明「程式邏輯正確、篩選不會靜默納入不該納入的樣本」，`E05` 的
+   真實資料到手之後才能真的回答那個問題。
+
+**中間任何一關卡住，程式都不會報錯、測試都不會變紅**——這正是這份報告
+存在的理由：不是等 bug 出現才回頭查，是先把「這個欄位現在卡在哪一關」
+寫下來，讓下一個接手的人一眼看到，而不是要靠 `grep` 才發現。
 
 ### 情況三：有人讀、但沒人寫（目前 0 筆，但有一筆「今天稍早才不是 0」）
 

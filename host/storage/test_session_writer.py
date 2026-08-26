@@ -879,3 +879,40 @@ def test_lip_onset_b_missing_is_a_legal_state_not_corruption(tmp_path):
         assert "lip_onset_us_B" not in attrs
         with pytest.raises(KeyError):
             attrs["lip_onset_us_B"]  # noqa: B018 -- 故意觸發，驗證「大聲失敗」
+
+
+# -- source (B19 發現的落差：呼叫端在傳，寫入端以前沒接住) ------------------
+
+
+def test_source_omitted_by_default(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        assert "source" not in f["meta"].attrs
+
+
+def test_source_written_when_given(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta(source="mock")) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        assert f["meta"].attrs["source"] == "mock"
+
+
+@pytest.mark.parametrize("value", ["live", "mock", "replay-log", "replay-session"])
+def test_source_accepts_every_value_bridge_server_can_send(tmp_path, value):
+    """跟 bridge_server.py 的 VALID_SOURCES 同一份值域，四個都要能收。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta(source=value)) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+    with h5py.File(path, "r") as f:
+        assert f["meta"].attrs["source"] == value
+
+
+def test_invalid_source_rejected(tmp_path):
+    with pytest.raises(ValueError, match="source"):
+        with SessionWriter(tmp_path / "session.h5", _sample_meta(source="usb")):
+            pass
