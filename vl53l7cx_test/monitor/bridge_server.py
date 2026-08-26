@@ -197,6 +197,10 @@ quality = QualityAggregator(
     # alarm cannot tell the two apart.
     parser_stats=current_parser_stats,
     sensors_seen=lambda: sensors_seen_string(),
+    # $F can legitimately be off (MEL:0). Reporting a deliberately silent
+    # stream as a fault is how an alarm gets trained out of people.
+    mel_enabled=lambda: (protocol_state["parser"].state().get("mel")
+                         if protocol_state.get("parser") else None),
 )
 
 

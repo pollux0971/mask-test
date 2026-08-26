@@ -40,6 +40,19 @@ DEFAULT_WINDOW_S = 30.0
 #: metric reports None rather than a number nobody should act on.
 MIN_CLOCK_BUCKETS = 3
 
+#: How long a stream may go completely silent before it is called stale, in
+#: seconds. Per stream, because the rates differ by more than an order of
+#: magnitude: $T runs at 30 Hz (10 Hz at 8x8), $M around 31 Hz, $F at 62.5 Hz
+#: and $H at 1 Hz. One number for all of them would either cry wolf on the
+#: heartbeat or take a minute to notice a dead sensor.
+DEFAULT_STREAM_TIMEOUTS = {
+    "tof_A": 3.0,
+    "tof_B": 3.0,
+    "mic": 3.0,
+    "mel": 3.0,
+    "heartbeat": 10.0,
+}
+
 METRIC_ORDER = (
     "drop_rate",
     "valid_zones",
@@ -140,6 +153,28 @@ class ThresholdTable:
         return level, hint
 
 
+#: Human-readable names for the alarm text. The panel should be able to
+#: print the message as-is; "sensor A has been silent for 12 s" is
+#: actionable, "something is wrong" is not.
+STREAM_LABELS = {
+    "tof_A": "感測器 A",
+    "tof_B": "感測器 B",
+    "mic": "麥克風",
+    "mel": "Mel 串流",
+    "heartbeat": "裝置心跳",
+}
+
+
+def _stale_stream_message(item):
+    label = STREAM_LABELS.get(item["stream"], item["stream"])
+    return (f"{label} 已經 {item['silent_for_s']:.0f} 秒沒有任何資料"
+            f"（門檻 {item['timeout_s']:.0f} 秒）。"
+            f"這不是掉幀——掉幀看得到 seq 缺口，這條是**完全停了**，"
+            f"而且可能不會自己恢復。"
+            f"裝置端的 drop 計數在這種情況下會凍住不動，$H 上看起來跟正常一樣，"
+            f"所以請直接檢查該感測器的接線。")
+
+
 def _transport_alarm_message(stream, host, device, malformed):
     """Explain a positive delta without over-claiming its cause.
 
@@ -186,6 +221,8 @@ class QualityAggregator:
         host_clock=time.time,
         parser_stats=None,
         sensors_seen=None,
+        mel_enabled=None,
+        stream_timeouts=None,
     ):
         self.thresholds = thresholds
         self.drop_tracker = drop_tracker
@@ -211,6 +248,16 @@ class QualityAggregator:
         #: reports: a sensor that fails to initialise is announced over
         #: ESP_LOGE, which never reaches the host.
         self.sensors_seen = sensors_seen
+        #: Callable returning whether $F is switched on, or None if unknown.
+        #: A Mel stream turned off with MEL:0 is silent on purpose, and
+        #: reporting that as a fault would train people to ignore the alarm.
+        self.mel_enabled = mel_enabled
+        self.stream_timeouts = dict(stream_timeouts or DEFAULT_STREAM_TIMEOUTS)
+        #: Monotonic time each stream was last heard from. A stream that has
+        #: never been heard from is absent here and is NOT reported stale:
+        #: "never came up" is a different fault with its own signal
+        #: (sensors_seen), and reporting both would double-count it.
+        self._last_seen: dict[str, float] = {}
         self._lock = threading.Lock()
 
         self._zones = deque()        # (t, n_valid, dim)
@@ -236,8 +283,57 @@ class QualityAggregator:
             self._bytes.append((now, n))
             self._prune(now)
 
+    def mark_seen(self, stream: str, now: float | None = None) -> None:
+        """Record that `stream` just delivered something."""
+        with self._lock:
+            self._last_seen[stream] = self._clock() if now is None else now
+
+    def stale_streams(self, now: float | None = None):
+        """Streams that have gone silent for longer than their timeout.
+
+        This answers a question the seq-gap detector structurally cannot.
+        A gap is inferred from the distance between two *received* frames,
+        so a stream that stops and never resumes produces no gap at all --
+        there is no next frame to measure against. On the firmware side the
+        same event is equally invisible: when the I2C bus drops,
+        check_data_ready() itself fails and the whole block that increments
+        drop_A/drop_B is skipped, so $H's counters freeze at whatever they
+        were. A dead sensor and a perfectly healthy one look identical.
+
+        Three distinct failures, three separate signals:
+          malformed  -- it arrived, but the line was corrupt
+          seq gap    -- it arrived, but some frames in between did not
+          stale      -- nothing arrived, and nothing may ever arrive again
+        """
+        now = self._clock() if now is None else now
+        mel_on = None
+        if self.mel_enabled is not None:
+            try:
+                mel_on = self.mel_enabled()
+            except Exception:
+                mel_on = None
+
+        out = []
+        with self._lock:
+            last_seen = dict(self._last_seen)
+        for stream, limit in self.stream_timeouts.items():
+            last = last_seen.get(stream)
+            if last is None:
+                continue          # never seen: sensors_seen covers that case
+            if stream == "mel" and mel_on is False:
+                continue          # switched off with MEL:0, not broken
+            silent = now - last
+            if silent > limit:
+                out.append({"stream": stream,
+                            "silent_for_s": round(silent, 2),
+                            "timeout_s": limit})
+        return out
+
     def observe_tof(self, event: dict, now: float | None = None) -> None:
         now = self._clock() if now is None else now
+        sensor = event.get("sensor")
+        if sensor in ("A", "B"):
+            self.mark_seen(f"tof_{sensor}", now)
         dim = event.get("dim")
         valid = event.get("valid")
         distance = event.get("distance")
@@ -254,6 +350,7 @@ class QualityAggregator:
 
     def observe_mic(self, event: dict, now: float | None = None) -> None:
         now = self._clock() if now is None else now
+        self.mark_seen("mic", now)
         rms = event.get("rms")
         if rms is not None:
             with self._lock:
@@ -262,7 +359,9 @@ class QualityAggregator:
         self._note_clock(event, now)
 
     def observe_mel(self, event: dict, now: float | None = None) -> None:
-        self._note_clock(event, self._clock() if now is None else now)
+        now = self._clock() if now is None else now
+        self.mark_seen("mel", now)
+        self._note_clock(event, now)
 
     def observe_heartbeat(self, event: dict, now: float | None = None) -> None:
         """Record the device's drop counters, paired with the host's own.
@@ -280,6 +379,7 @@ class QualityAggregator:
         injected drops the alarm fired with delta=1 on a perfectly healthy
         transport.
         """
+        self.mark_seen("heartbeat", self._clock() if now is None else now)
         drops = {}
         for stream, key in (("tof_A", "drop_A"), ("tof_B", "drop_B"), ("mic", "drop_M")):
             value = event.get(key)
@@ -439,6 +539,18 @@ class QualityAggregator:
                 entry["hint"] = alarm["message"]
 
         event = {"type": "quality", "t": time.time(), "metrics": metrics}
+
+        stale = self.stale_streams(now)
+        if stale:
+            event["stale_streams"] = stale
+            alarms.extend({
+                "metric": "drop_rate",
+                "kind": "stale",
+                "stream": item["stream"],
+                "silent_for_s": item["silent_for_s"],
+                "message": _stale_stream_message(item),
+            } for item in stale)
+
         if self.sensors_seen is not None:
             try:
                 seen = self.sensors_seen()

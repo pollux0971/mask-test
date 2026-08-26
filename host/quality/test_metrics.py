@@ -386,3 +386,81 @@ def test_event_matches_the_contract_shape(thresholds):
     for entry in event["metrics"].values():
         assert set(entry) <= {"value", "level", "hint"}
         assert entry["level"] in ("green", "yellow", "red", "unknown")
+
+
+# -- stream staleness: the failure seq gaps cannot see --------------------
+
+
+def _tof(sensor="A"):
+    return {"type": "tof", "sensor": sensor, "dim": 16,
+            "valid": [True] * 16, "distance": [100] * 16, "t_us": 0}
+
+
+def test_a_stream_that_stops_forever_is_reported(thresholds):
+    """A seq gap needs a next frame to measure against; a dead stream has none.
+
+    On the real board this is what a disconnected sensor looks like: the
+    firmware's check_data_ready() fails, so the block that increments
+    drop_A is skipped entirely and $H freezes at its old value. Dead and
+    healthy are identical by every other signal.
+    """
+    clock = FakeClock()
+    agg = QualityAggregator(thresholds, clock=clock, host_clock=clock)
+    agg.observe_tof(_tof("A"))
+    agg.observe_tof(_tof("B"))
+    assert agg.snapshot().get("stale_streams") is None
+
+    clock.advance(5.0)
+    agg.observe_tof(_tof("B"))          # B keeps going, A does not
+    event = agg.snapshot()
+    stale = event["stale_streams"]
+    assert [s["stream"] for s in stale] == ["tof_A"]
+    assert stale[0]["silent_for_s"] >= 5.0
+
+
+def test_the_stale_alarm_names_the_stream(thresholds):
+    """"Sensor A has been silent for 12 s" is actionable; "something is wrong" is not."""
+    clock = FakeClock()
+    agg = QualityAggregator(thresholds, clock=clock, host_clock=clock)
+    agg.observe_tof(_tof("A"))
+    clock.advance(12.0)
+    alarm = next(a for a in agg.snapshot()["alarms"] if a.get("kind") == "stale")
+    assert alarm["stream"] == "tof_A"
+    assert "感測器 A" in alarm["message"]
+    assert "12" in alarm["message"]
+
+
+def test_a_stream_never_seen_is_not_reported_stale(thresholds):
+    """"Never came up" is a different fault, and sensors_seen already says it."""
+    clock = FakeClock()
+    agg = QualityAggregator(thresholds, clock=clock, host_clock=clock)
+    agg.observe_tof(_tof("A"))
+    clock.advance(30.0)
+    stale = {s["stream"] for s in agg.snapshot()["stale_streams"]}
+    assert "tof_B" not in stale, "a stream that never existed cannot go stale"
+    assert "tof_A" in stale
+
+
+def test_mel_switched_off_is_not_a_fault(thresholds):
+    """MEL:0 makes $F silent on purpose."""
+    clock = FakeClock()
+    mel_on = {"value": True}
+    agg = QualityAggregator(thresholds, clock=clock, host_clock=clock,
+                            mel_enabled=lambda: mel_on["value"])
+    agg.observe_mel({"type": "mel", "t_us": 0, "log_mel": [0.0] * 40})
+    clock.advance(10.0)
+    assert "mel" in {s["stream"] for s in agg.snapshot()["stale_streams"]}
+
+    mel_on["value"] = False
+    assert "mel" not in {s["stream"] for s in (agg.snapshot().get("stale_streams") or [])}
+
+
+def test_heartbeat_gets_a_looser_timeout_than_the_data_streams(thresholds):
+    """$H is 1 Hz; the same threshold as a 30 Hz stream would cry wolf."""
+    clock = FakeClock()
+    agg = QualityAggregator(thresholds, clock=clock, host_clock=clock)
+    agg.observe_heartbeat({"type": "heartbeat", "drop_A": 0, "drop_B": 0, "drop_M": 0})
+    clock.advance(5.0)
+    assert "heartbeat" not in {s["stream"] for s in (agg.snapshot().get("stale_streams") or [])}
+    clock.advance(8.0)
+    assert "heartbeat" in {s["stream"] for s in agg.snapshot()["stale_streams"]}

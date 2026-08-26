@@ -161,7 +161,7 @@ def build_and_save_templates(sessions, out_path, subject, wear_id, require_quali
     `analysis/run_all.py`'s `build_feature_seqs()`, without reusing that
     function itself -- see the module docstring for why).
     """
-    templates_by_class, provenance, skipped = build_templates(sessions, require_quality)
+    templates_by_class, provenance, skipped, coverage_warnings = build_templates(sessions, require_quality)
     if not templates_by_class:
         detail = ("；" + "；".join(f"{key}（{reason}）" for key, reason in skipped)) if skipped else ""
         raise ValueError(f"0 筆可用 trial（quality 篩選：{require_quality}）——沒有東西可以建樣板{detail}")
