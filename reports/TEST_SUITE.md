@@ -163,6 +163,31 @@ CPU。**不需要第二個 agent，一個 pytest 行程自己就會把自己餓�
 > 這正是 `reports/HANDOFF.md` §4.4 講的那件事：**寫在訊息裡等於沒寫。**
 > 現在它們在這裡了。
 
+## 🔴 守門員清單：這些測試紅了**代表真的有問題**
+
+> **這一節跟下一節的判準表是同一件事**，只是換個方向切：
+> 判準表教你**怎麼判斷一條沒見過的測試**；這一節列出**已知的、
+> 絕對不可以放寬的那幾條**。
+>
+> ⚠️ **它們的共同特徵：斷言本身就是題目。** 放寬 = 刪掉它，只是看起來還在。
+
+| 測試 | 它在守什麼 | 放寬的後果 |
+|---|---|---|
+| `test_grouping_removes_the_wear_leakage`<br>（`test_d18_permutation_test.py`） | 按 `wear_id` 分組之後準確率**必須下降** | 🔴 **這條測試會自己偵測自己失效**——失敗訊息就寫著「洩漏訊號可能沒有生效，這條測試就失去意義了」。放寬它，整個分組 CV 的正當性就沒有證據了 |
+| `test_single_group_is_reported_not_silently_downgraded` | 只有一個 group 時**必須明講「分組驗證無法進行」** | **宣稱一個沒做的方法學保證**——比不做還糟 |
+| `test_matches_the_c21_worked_example`<br>（`test_effect_size.py`） | Python 的 Wilson CI 與 `quiz.js:602` **算出同一個數字** | **Demo 上的數字與報告上的數字會靜靜漂開** |
+| `test_three_of_three_gives_a_very_wide_interval` | 小樣本的 CI **必須很寬**，且解讀文字要說「寬度本身就是結論」 | 有人為了「數字好看」改成 90% 信心水準或常態近似，**而那正是 `C21` 當初拒絕的東西** |
+| `test_above_chance_uses_the_ci_lower_bound_not_the_point_estimate` | 「比隨機好」**必須用 CI 下界比** | **算了 CI 卻拿點估計去比基準，等於白算** |
+| `test_extras_are_populated_for_the_three_way_vote`<br>（`test_run_all.py`） | 「第二顆 ToF 有沒有用」的三方投票**不可以是空的** | 🔴 **這條的存在就是因為它真的壞過**：讀錯一個鍵名讓 `D13` 那一票永遠是 `None`，交叉檢查永遠只有兩票、永遠不會發現矛盾，**而報告看起來完全正常** |
+| `test_ablation_can_be_switched_off_but_says_so` | 關掉 `D19` 時要講出「三方投票少一票」 | **「沒有資料」與「沒有矛盾」變得分不出來** |
+| `test_an_in_range_hold_saves_without_asking`<br>（`test_bridge_trial_api.py`） | 正常長度的 hold **不會反問** | 見下一節——**它的名字就是斷言** |
+| `test_a_too_short_hold_goes_to_confirm...`<br>`test_confirm_keeps_a_pending_trial`<br>`test_discard_drops_a_pending_trial` | 太短的 hold **必須**落到 `CONFIRM` | 那是「狀態機不猜」這條設計的唯一證據 |
+| `test_pure_noise_is_classified_weak_not_medium`<br>（`test_d14_viseme_sensitivity.py`） | 純雜訊**不可以**被判成「中等敏感」 | **整張熱力圖會變成看起來很有內容、實際上量的是雜訊** |
+| `test_truncated_heartbeat_is_still_malformed`<br>（`test_protocol.py`） | 放寬前向相容**不可以**放寬到連截斷都吃下去 | 傳輸損壞會被當成正常資料 |
+
+> 🔴 **新增守門員時請加進這張表。** 一條沒有被記錄的守門員，
+> 在它紅的那天跟一條普通測試長得一模一樣。
+
 ## 🔴 判準：紅燈是「環境」還是「它就是在測這件事」
 
 **這是這份文件最重要的一段。** 碰到這類偽陽性紅燈時，**不要「紅了就放寬」**。

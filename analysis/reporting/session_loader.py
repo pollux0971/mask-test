@@ -389,4 +389,37 @@ def availability(sessions):
     if len(labels) < 2 and "E" not in missing:
         missing["E"] = f"Viseme 熱力圖需要至少 2 個詞，目前只有 {labels}"
 
+    # 🔴 `reports/DEGRADED_SESSION.md`：一顆從頭到尾沒有送過資料的感測器，
+    # 在特徵向量裡會被填成 0.0、標準差 0——在 z-score 空間裡那代表「讀數
+    # 完美等於基線、毫無抖動」，被三張卡片（A/B/C/E）誤判成表現最好的那顆。
+    # `/meta` 的 `sensors_seen`（`bridge_server.py` 實際觀察到的、不是
+    # `sensors_enabled` 那個下達的指令）能抓到「整個 session 從頭到尾都
+    # 沒有」這一種——**只有這一種**：中途掉線／斷斷續續 `sensors_seen`
+    # 仍然會是 `"AB"`（該報告第二輪已經實測證明），那兩種不歸這裡管
+    # （中途掉線在 `build_feature_seqs()` 用 per-trial 值排除；斷斷續續
+    # 目前沒有可靠的判定門檻，故意只把 `coverage` 數字列出來，不判定）。
+    # `sensors_seen` 是選填欄位，沒有值（舊檔案／合成測試資料）時不能當
+    # 「感測器缺席」的證據，只能略過這個檢查。
+    #
+    # **放在最後、無條件覆蓋**：上面幾個檢查（`wear_ids`/`labels` 數量）
+    # 各自都有可能先設定 missing["B"]/["C"]/["E"]，而感測器整個缺席是
+    # 比「詞彙不夠」「wear_id 不夠」更根本的問題，理應覆蓋掉那些理由，
+    # 不是被它們蓋掉。
+    seen_values = [s.meta.get("sensors_seen") for s in sessions]
+    known_seen = [v for v in seen_values if v is not None]
+    if known_seen:
+        seen_union = set()
+        for value in known_seen:
+            seen_union.update(value)
+        absent = {"A", "B"} - seen_union
+        if absent:
+            reason = (
+                f"根據 `/meta` 的 `sensors_seen`（{sorted(set(known_seen))}），"
+                f"感測器 {'/'.join(sorted(absent))} 這批 session 全程沒有出現過任何資料"
+                "——這不是「量了、結果不好」，是「這批資料量不了雙感測器系統」。"
+                "先確認接線／初始化，不要調整戴法或分析參數。"
+            )
+            for key in ("A", "B", "C", "E"):
+                missing[key] = reason
+
     return {key: missing.get(key) for key in ("C0", "A", "B", "C", "E")}

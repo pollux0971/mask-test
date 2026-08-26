@@ -28,6 +28,7 @@
 建議加 `--fast`。
 """
 import argparse
+import math
 import sys
 import time
 import traceback
@@ -215,6 +216,21 @@ def build_feature_seqs(trials, session_by_trial):
         if trial.mel_t_us is None:
             skipped.append((trial.key, "沒有 mel_t_us（§2 規定跟 mel 成對必寫，缺了就沒有真實時間可以對齊）"))
             continue
+        # `reports/DEGRADED_SESSION.md` 第二輪：中途掉線（B 錄到一半停）
+        # 時，session 層級的 `sensors_seen` 仍然是 `"AB"`（有出現過就算），
+        # 只有 per-trial 的值抓得到「這一筆」受影響。跟上面幾個 skip 理由
+        # 同一個原則：只排除受影響的這幾筆，不用整個 session 作廢——
+        # 前面的 trial（B 還活著）一樣可以用。沒有這個欄位（舊檔案／
+        # 合成測試資料）時不判定，跳過這個檢查。
+        trial_sensors_seen = trial.attrs.get("sensors_seen")
+        if trial_sensors_seen is not None and {"A", "B"} - set(trial_sensors_seen):
+            skipped.append((
+                trial.key,
+                f"per-trial sensors_seen={trial_sensors_seen!r}，"
+                f"感測器 {'/'.join(sorted({'A', 'B'} - set(trial_sensors_seen)))} "
+                "這筆錄音期間沒有資料（中途掉線），排除這一筆，不影響其他筆"
+            ))
+            continue
         n_tof = trial.tof_a.shape[0]
         n_mel = trial.mel.shape[0]
         if n_tof < 2 or n_mel < 2:
@@ -282,6 +298,54 @@ def build_feature_seqs(trials, session_by_trial):
 # ------------------------------------------------------------------ 各實驗
 
 
+def _fmt_metric(value, *, missing_hint="N/A（無資料）"):
+    """`reports/DEGRADED_SESSION.md` 提案 4：`nan` 對操作者不是資訊，
+    是雜訊——`'104.24 / nan'` 這種字串會直接出現在通過矩陣的 `measured`
+    欄，讓人以為是計算出來的一個數字，而不是「這裡量不到」。"""
+    try:
+        if math.isnan(value):
+            return missing_hint
+    except TypeError:
+        pass
+    return f"{value:.2f}"
+
+
+def _dead_sensor_hint(dead_signal, sensor, sessions):
+    """三張卡片（A/B/C）共用：**在給任何「調戴法／調參數」的建議之前，
+    先看一眼是不是有一顆感測器根本沒有資料**（`reports/DEGRADED_SESSION
+    .md`：這種情況下分數會是 `NaN` 或剛好 `0.0`，而三張卡片原本的診斷
+    文字完全沒提到感測器，會把人導去調整戴法、PCA 維度、CV 流程）。
+
+    `dead_signal`：呼叫端已經算出來的可疑值（NaN 或剛好 0.0）本身，
+    這裡不重新判斷「這個數字算不算異常」——那是每個實驗自己的專業判斷，
+    這裡只負責在異常出現時，**檢查 `sensors_seen` 能不能給一個具體原因**，
+    給不出來就講出「這個數字是 NaN／0」這個事實本身，仍然比完全不提
+    感測器好。
+
+    回傳字串或 `None`（`dead_signal` 看起來正常時不出聲）。
+    """
+    is_dead = False
+    try:
+        is_dead = math.isnan(dead_signal)
+    except TypeError:
+        pass
+    if not is_dead and dead_signal != 0.0:
+        return None
+
+    seen_values = [s.meta.get("sensors_seen") for s in sessions]
+    known_seen = {v for v in seen_values if v is not None}
+    if known_seen and all(sensor not in (v or "") for v in known_seen):
+        basis = f"`/meta` 的 `sensors_seen={sorted(known_seen)}`，感測器 {sensor} 全程沒有出現過"
+    else:
+        basis = f"感測器 {sensor} 這次算出來的數值是 {dead_signal}"
+    return (
+        f"🔴 **先看感測器，不要先調戴法／參數**：{basis}——"
+        f"這代表感測器 {sensor} 沒有真的送資料，不是訊號品質不好。"
+        "這批結果不能代表雙感測器系統，建議先確認接線／初始化，"
+        "而不是調整戴法、PCA 維度或錄音流程。"
+    )
+
+
 def _skipped(key, reason):
     name, metric, criterion = EXPERIMENT_META[key]
     return ExperimentOutcome(key=key, name=name, metric=metric, measured="—",
@@ -298,7 +362,7 @@ def _errored(key, exc):
     )
 
 
-def run_silhouette(feature_seqs, labels, *, fast, is_synthetic):
+def run_silhouette(feature_seqs, labels, sessions, *, fast, is_synthetic):
     from analysis.experiments import exp_c_silhouette as mod
     from analysis.reporting import effect_size
 
@@ -312,6 +376,21 @@ def run_silhouette(feature_seqs, labels, *, fast, is_synthetic):
     tof_score = table["tof_combined"]["score"]
     passed = mod.verdict_for_score(score) != "fail"
 
+    # `reports/DEGRADED_SESSION.md`：一顆死掉的感測器會讓它那半的 32 維
+    # 全部是常數，`tof_l`/`tof_r` 其中一個的 Silhouette 分數會剛好是
+    # `0.000`——這個數字**已經在** `mod.format_report(report)` 的表格裡，
+    # 只是原本的 `diagnosis`（「先懷疑維度詛咒，不要先懷疑資料或模型」）
+    # 完全沒讀它，而且在這個情況下正好把人推離真因。
+    sensor_column = {"A": "tof_l", "B": "tof_r"}
+    sensor_hint = None
+    for sensor, column in sensor_column.items():
+        col = table.get(column)
+        if col is None:
+            continue
+        sensor_hint = _dead_sensor_hint(col["score"], sensor, sessions)
+        if sensor_hint:
+            break
+
     # Silhouette 本身就是效果量（`effect_size.silhouette_interpretation()`
     # 只負責解釋尺度，不重新定義通過門檻——那個門檻仍然是
     # `verdict_for_score()`，這裡不重複也不覆蓋）。附上解讀文字，不是只有
@@ -321,6 +400,17 @@ def run_silhouette(feature_seqs, labels, *, fast, is_synthetic):
          ("Silhouette（ToF-only）", effect_size.silhouette_interpretation(tof_score))],
         title="效果量：這個分開有多明顯",
     )
+
+    if passed:
+        diagnosis = sensor_hint  # 可能是 None——通過了本來就不需要診斷
+    else:
+        fail_reason = (
+            "Silhouette 落在 fail 區間。**先懷疑維度詛咒，不要先懷疑資料或模型**"
+            "（見 `exp_c_silhouette` 的模組說明）：分數普遍偏低通常代表訊號集中"
+            "在少數 zone/band，攤平後被大量無關維度稀釋。可先試 `--fast`（較低的"
+            " PCA 維度）看分數會不會回升。"
+        )
+        diagnosis = f"{sensor_hint}\n\n{fail_reason}" if sensor_hint else fail_reason
 
     name, metric, criterion = EXPERIMENT_META["C"]
     return ExperimentOutcome(
@@ -339,12 +429,7 @@ def run_silhouette(feature_seqs, labels, *, fast, is_synthetic):
             # `tof_separable` 給跨實驗一致性檢查用：ToF 單獨是不是分得開。
             "tof_separable": mod.verdict_for_score(tof_score) != "fail",
         },
-        diagnosis=None if passed else (
-            "Silhouette 落在 fail 區間。**先懷疑維度詛咒，不要先懷疑資料或模型**"
-            "（見 `exp_c_silhouette` 的模組說明）：分數普遍偏低通常代表訊號集中"
-            "在少數 zone/band，攤平後被大量無關維度稀釋。可先試 `--fast`（較低的"
-            " PCA 維度）看分數會不會回升。"
-        ),
+        diagnosis=diagnosis,
         report_md=mod.format_report(report) + "\n" + effect_size_md,
     )
 
@@ -413,17 +498,31 @@ def run_snr(sessions, trials, *, is_synthetic):
     verdict, action, detail = mod.three_way_verdict(outcomes["A"], outcomes["B"])
     passed = verdict == mod.VERDICT_PASS
     name, metric, criterion = EXPERIMENT_META["A"]
+
+    # `reports/DEGRADED_SESSION.md`：「單邊通過，調整戴法」在 B 完全沒有
+    # 資料時是誤導——`detail` 裡早就有 `snr_a`/`snr_b`，只是原本的診斷
+    # 文字沒有讀它。先看有沒有一顆感測器的 SNR 是 NaN/0，有的話這個原因
+    # 排在 `action` 前面，不是取代它——`action` 本身還是有效資訊。
+    sensor_hint = None
+    for sensor in ("A", "B"):
+        sensor_hint = _dead_sensor_hint(outcomes[sensor], sensor, sessions)
+        if sensor_hint:
+            break
+    diagnosis = None if passed else action
+    if sensor_hint:
+        diagnosis = sensor_hint + "\n\n" + (action or "")
+
     return ExperimentOutcome(
         key="A", name=name, metric=metric,
-        measured=f"{outcomes['A']:.2f} / {outcomes['B']:.2f}",
+        measured=f"{_fmt_metric(outcomes['A'])} / {_fmt_metric(outcomes['B'])}",
         criterion=criterion,
         status=STATUS_PASS if passed else STATUS_FAIL,
         detail={"verdict": verdict, **detail},
-        diagnosis=None if passed else action,
+        diagnosis=diagnosis,
     )
 
 
-def run_wear_cv(trials, feature_by_trial, *, is_synthetic):
+def run_wear_cv(trials, feature_by_trial, sessions, *, is_synthetic):
     """實驗 B：同次戴 vs 跨次戴的 CV。
 
     兩個層面各算一次（`D12` 兩者都要）：純量特徵的 CV，以及**同一個詞**在
@@ -462,9 +561,29 @@ def run_wear_cv(trials, feature_by_trial, *, is_synthetic):
     diagnosis = None
     if not passed:
         diagnosis = "\n".join(f"* {item}" for item in mod.IMPROVEMENT_SUGGESTIONS)
+
+    # `reports/DEGRADED_SESSION.md`：`tof_L_distance`/`tof_R_distance` 是
+    # `extract_scalar_features()` 分感測器算的兩個純量欄位——一顆感測器
+    # 全程沒有資料時，對應那一欄的 CV 會是 NaN，而原本的診斷文字（一份
+    # 靜態的「改善建議」清單）完全不提這件事，會被讀成「戴法流程要改進」。
+    sensor_column = {"A": "tof_L_distance", "B": "tof_R_distance"}
+    sensor_hint = None
+    for sensor, column in sensor_column.items():
+        v = verdicts.get(column)
+        if v is None:
+            continue
+        sensor_hint = _dead_sensor_hint(v.get("cv_between"), sensor, sessions)
+        if sensor_hint:
+            break
+    if sensor_hint:
+        diagnosis = sensor_hint + "\n\n" + (diagnosis or "")
+
+    worst_cv = worst[1]["cv_between"]
+    worst_str = _fmt_metric(worst_cv) if isinstance(worst_cv, float) and math.isnan(worst_cv) \
+        else f"{worst_cv:.1%}"
     return ExperimentOutcome(
         key="B", name=name, metric=metric,
-        measured=f"最差 {worst[0]} {worst[1]['cv_between']:.1%}",
+        measured=f"最差 {worst[0]} {worst_str}",
         criterion=criterion,
         status=STATUS_PASS if passed else STATUS_FAIL,
         detail={"verdicts": verdicts, "worst_feature": worst[0],
@@ -804,8 +923,8 @@ def run_experiments(sessions, *, fast=False, is_synthetic=True,
         "C0": lambda: run_crosstalk(crosstalk, crosstalk_diagnosis,
                                     is_synthetic=is_synthetic),
         "A": lambda: run_snr(sessions, trials, is_synthetic=is_synthetic),
-        "B": lambda: run_wear_cv(trials, feature_by_trial, is_synthetic=is_synthetic),
-        "C": lambda: run_silhouette(feature_seqs, labels, fast=fast,
+        "B": lambda: run_wear_cv(trials, feature_by_trial, sessions, is_synthetic=is_synthetic),
+        "C": lambda: run_silhouette(feature_seqs, labels, sessions, fast=fast,
                                     is_synthetic=is_synthetic),
         "E": lambda: run_viseme(feature_seqs, labels, is_synthetic=is_synthetic),
     }

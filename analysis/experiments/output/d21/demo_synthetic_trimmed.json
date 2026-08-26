@@ -105,6 +105,8 @@
     "word_6": 1.2372813813306704,
     "word_7": 1.2820315348352813
   },
+  "raw_distance_cv": 0.11429876317488243,
+  "top1_margin": 15.337117520620083,
   "speech_window": {
     "trimmed": true,
     "source": "lip_A+lip_B+voice",

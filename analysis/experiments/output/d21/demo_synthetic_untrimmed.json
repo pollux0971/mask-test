@@ -105,6 +105,8 @@
     "word_6": 0.9994525128643604,
     "word_7": 1.0336041911998337
   },
+  "raw_distance_cv": 0.02468243535045233,
+  "top1_margin": 1.3338883547247917,
   "speech_window": null,
   "rankings": {
     "euclidean": {

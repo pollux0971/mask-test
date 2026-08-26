@@ -59,8 +59,23 @@ def _trial_arrays(rng, word, n_frames=30):
 def write_session(path, *, wear_id, seed, n_per_word=3, words=WORDS,
                   with_mel=True, quality="ok", sensors_enabled="AB",
                   sensors_confirmed=False, with_ambient=False,
-                  crosstalk_shift_mm=0.0):
-    """`crosstalk_shift_mm` 讓 dual 錄製的距離整體偏移，模擬串擾。"""
+                  crosstalk_shift_mm=0.0, sensors_seen=None,
+                  degrade_sensor_from_trial=None, degraded_sensor="B",
+                  write_per_trial_sensors_seen=True):
+    """`crosstalk_shift_mm` 讓 dual 錄製的距離整體偏移，模擬串擾。
+
+    `sensors_seen`：寫進 `/meta`，模擬 `bridge_server.py` 實際觀察到的
+    在線感測器（跟 `sensors_enabled` 那個下達的指令是兩件事——見
+    `reports/DEGRADED_SESSION.md`）。
+
+    `degrade_sensor_from_trial`：從第幾筆 trial（0-indexed，依詞彙／
+    `n_per_word` 展開後的整體索引）開始，把 `degraded_sensor` 那顆的
+    `tof_*` 陣列填成全 `NaN`、`tof_valid_*` 全 `False`，並把該筆 trial
+    的 `sensors_seen` attr 設成只剩另一顆——模擬中途掉線（第二輪的
+    dropout 情境）。傳 `0` 就是從頭到尾都掉（第一輪的「整個 session
+    只有一顆」情境，此時通常還要另外傳 `sensors_seen` 設定 `/meta` 層級
+    的值，因為兩者是分開寫的兩個欄位）。`None`（預設）不做任何降級。
+    """
     rng = np.random.RandomState(seed)
     with h5py.File(path, "w") as handle:
         meta = handle.create_group("meta")
@@ -80,7 +95,10 @@ def write_session(path, *, wear_id, seed, n_per_word=3, words=WORDS,
         if sensors_enabled is not None:
             meta.attrs["sensors_enabled"] = sensors_enabled
             meta.attrs["sensors_enabled_confirmed"] = sensors_confirmed
+        if sensors_seen is not None:
+            meta.attrs["sensors_seen"] = sensors_seen
 
+        other_sensor = "A" if degraded_sensor == "B" else "B"
         index = 0
         for word in words:
             for _ in range(n_per_word):
@@ -96,6 +114,12 @@ def write_session(path, *, wear_id, seed, n_per_word=3, words=WORDS,
                             5.0, 0.2, (max(1, n // 10), N_ZONES)).astype(np.float32)
                     arrays["tof_ambient_t_us"] = (
                         np.arange(max(1, n // 10)) * 1_000_000).astype(np.int64)
+                degraded_this_trial = (degrade_sensor_from_trial is not None
+                                        and index >= degrade_sensor_from_trial)
+                if degraded_this_trial:
+                    tof_key, valid_key = f"tof_{degraded_sensor}", f"tof_valid_{degraded_sensor}"
+                    arrays[tof_key] = np.full_like(arrays[tof_key], np.nan)
+                    arrays[valid_key] = np.zeros_like(arrays[valid_key])
                 for name, value in arrays.items():
                     if name.startswith("mel") and not with_mel:
                         continue
@@ -105,6 +129,8 @@ def write_session(path, *, wear_id, seed, n_per_word=3, words=WORDS,
                 group.attrs["wear_id"] = wear_id
                 group.attrs["mode"] = "quiz"
                 group.attrs["quality"] = quality
+                if degrade_sensor_from_trial is not None and write_per_trial_sensors_seen:
+                    group.attrs["sensors_seen"] = other_sensor if degraded_this_trial else "AB"
                 index += 1
     return path
 
@@ -242,6 +268,89 @@ def test_missing_baseline_skips_the_zscore_experiments(tmp_path):
     reasons = session_loader.availability([session_loader.load_session(path)])
     for key in ("A", "C", "E"):
         assert reasons[key] is not None and "baseline" in reasons[key]
+
+
+# --------------------------- reports/DEGRADED_SESSION.md：死掉的感測器
+
+
+def test_availability_skips_abce_when_a_sensor_is_entirely_absent(tmp_path):
+    """整個 session 從頭到尾只有一顆感測器（`/meta` 的 `sensors_seen`
+    抓得到的那一種）：A/B/C/E 要 `SKIPPED`，不是安靜地繼續跑、也不是
+    `FAIL`——這不是「量了結果不好」，是「這批資料量不了」。"""
+    path = write_session(tmp_path / "degraded.h5", wear_id=1, seed=1,
+                          sensors_seen="A", degrade_sensor_from_trial=0)
+    reasons = session_loader.availability([session_loader.load_session(path)])
+
+    for key in ("A", "B", "C", "E"):
+        assert reasons[key] is not None, f"{key} 應該被 SKIP"
+        assert "感測器 B" in reasons[key]
+        assert "sensors_seen" in reasons[key]
+    assert reasons["C0"] is not None  # 串擾本來就會因為配對不到而 skip，不受這個影響
+
+
+def test_availability_does_not_skip_when_sensors_seen_is_absent(two_sessions):
+    """`sensors_seen` 是選填欄位——舊檔案／沒有這個欄位的合成測試資料，
+    不能被誤判成「感測器缺席」，否則所有既有測試資料都會被誤傷。"""
+    reasons = session_loader.availability(
+        [session_loader.load_session(p) for p in two_sessions])
+    assert reasons["A"] is None
+    assert reasons["C"] is None
+
+
+def test_build_feature_seqs_excludes_only_the_dropout_affected_trials(tmp_path):
+    """中途掉線：`/meta` 的 `sensors_seen` 仍然是 `"AB"`（第二輪的發現），
+    只有 per-trial 的值抓得到「這幾筆」——要精準排除受影響的 trial，
+    不是整個 session 作廢，也不能連好的 trial 一起丟掉。"""
+    n_per_word = 4
+    dropout_from = 8  # words=("wu","yi","si","ba") × 4 筆，第 8 筆開始掉線
+    path = write_session(tmp_path / "dropout.h5", wear_id=1, seed=1,
+                          n_per_word=n_per_word, sensors_enabled="AB",
+                          degrade_sensor_from_trial=dropout_from)
+    session = session_loader.load_session(path)
+    trials = [t for t in session.trials]
+
+    feature_seqs, labels, skipped, by_trial, trim_info = run_all.build_feature_seqs(
+        trials, {id(t): session for t in trials})
+
+    dropout_keys = {f"trial_{i:03d}" for i in range(dropout_from, len(trials))}
+    healthy_keys = {f"trial_{i:03d}" for i in range(dropout_from)}
+    skipped_keys = {k for k, _ in skipped}
+
+    assert dropout_keys <= skipped_keys, "掉線的 trial 都該被排除"
+    assert not (healthy_keys & skipped_keys), "沒掉線的 trial 不該被牽連"
+    assert any("中途掉線" in reason for _, reason in skipped)
+    assert len(feature_seqs) == len(healthy_keys)
+
+
+def test_run_experiments_points_at_the_dead_sensor_not_at_wear_or_pca(tmp_path):
+    """`reports/DEGRADED_SESSION.md` 的核心發現：一顆死掉的感測器，原本
+    的診斷文字會說「調整戴法」／「先懷疑維度詛咒不要懷疑資料」——這條
+    測試釘住修好之後的行為：診斷文字要先提到感測器，`measured` 不能
+    直接印 `nan`。
+
+    這裡刻意**不**設 `sensors_seen`（session 層與 per-trial 都不設，
+    模擬那個欄位不可得的情況——`degrade_sensor_from_trial` 平常會順便
+    幫忙寫 per-trial `sensors_seen`，這裡用
+    `write_per_trial_sensors_seen=False` 關掉，才能真的測到
+    `build_feature_seqs()` 的 dropout 排除邏輯**沒有**搶先把這批資料
+    濾掉，而是讓 `run_snr`/`run_silhouette` 自己的防禦性檢查
+    （不只是 `availability()` 那道閘）接手抓到。
+    """
+    path = write_session(tmp_path / "degraded_no_seen.h5", wear_id=1, seed=1,
+                          n_per_word=6, degrade_sensor_from_trial=0,
+                          write_per_trial_sensors_seen=False)
+    session = session_loader.load_session(path)
+    outcomes, extras, notes, side = run_all.run_experiments(
+        [session], ablation_permutations=0)
+
+    a = next(o for o in outcomes if o.key == "A")
+    assert "nan" not in a.measured.lower()
+    assert a.diagnosis is not None and "感測器 B" in a.diagnosis
+    assert "先看感測器" in a.diagnosis
+
+    c = next(o for o in outcomes if o.key == "C")
+    if c.status != run_all.STATUS_SKIPPED:
+        assert c.diagnosis is not None and "感測器 B" in c.diagnosis
 
 
 # ------------------------------------------------------- 一個指令跑完

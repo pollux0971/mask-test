@@ -121,11 +121,26 @@ def run_probe(enrollment_by_label, query_session, query_trial, out_dir, tag, n_c
         print(f"可分性比值 (> {SEPARABLE_RATIO_THRESHOLD} 才算真的可分):",
               {k: (round(v, 2) if v is not None else None) for k, v in ratios.items()})
 
+        # `esp-mask-test-22` 獨立審查發現：光看排名（trimmed/untrimmed 這裡
+        # 都排第一，因為 demo 訊噪比刻意調很高）容易誤以為「裁不裁切沒差」
+        # ——真正的證據（測試裡已經嚴謹驗證過的「未裁切時距離擠成一團」）
+        # 沒有被存進這份「留給未來的人的證據」裡。這裡把同一個量尺
+        # （raw distance 的離散係數）跟 rank-1/rank-2 margin 一起印出來、
+        # 存進 JSON，不能只看排名。
+        tof_raw = tracks_by_dist["euclidean"]["tof"].d_raw
+        raw_distance_cv = float(tof_raw.std() / tof_raw.mean())
+        tof_ranked = tracks_by_dist["euclidean"]["tof"].ranked
+        top1_margin = float(tof_ranked[1][1] - tof_ranked[0][1]) if len(tof_ranked) >= 2 else None
+        print(f"ToF 軌（euclidean）raw distance 離散係數（std/mean）：{raw_distance_cv:.4f}"
+              f"　rank1→rank2 margin：{top1_margin:.2f}" if top1_margin is not None else "")
+
         payload = {
             "tag": tag, "trim": trim, "n_candidates": len(labels), "labels": labels,
             "true_label": true_label,
             "pairwise_distance_matrix": matrix.tolist(),
             "separability_ratio": ratios,
+            "raw_distance_cv": raw_distance_cv,
+            "top1_margin": top1_margin,
             "speech_window": speech_window.to_dict() if speech_window is not None else None,
             "rankings": {
                 dist_method: {
