@@ -88,25 +88,28 @@
 
 ---
 
-## 已知缺口（story 明講：這是進度，不是失敗）
+## 已解決的缺口（原本是 skip，wiring 落地後自動變成真斷言）
 
-### `speaking_mode` 沒有被寫入（skip）
+### `speaking_mode`（原 skip，B21 落地後轉綠）
 
-`host/trial/state_machine.py` 呼叫 `write_trial()` 時完全沒有傳 `speaking_mode` 這個參數——不是傳了空值，是壓根沒接這條線。`SessionWriter`（B07）跟回放（B17）都已經支援這個欄位，只要 `/trial/*` 的 request body 開始把它傳進 `TrialStateMachine`，這個測試不用改就會變成真的檢查。
+寫這支測試的當下，`host/trial/state_machine.py` 呼叫 `write_trial()` 完全沒有傳 `speaking_mode`。`B21` 把它接上之後（`TrialStateMachine` 建構時預設 `"normal"`，`start_trial()`/`hold_start()` 都能覆寫），現在每筆 trial 都會寫入這個欄位。**還留著一個小缺口**：`bridge_server.py` 的 `_dispatch_trial()` 目前沒有把 `/trial/hold/start` request body 的 `speaking_mode` 傳給 `machine.hold_start()`，所以線上錄到的每一筆現在都固定是 `"normal"`——欄位有寫入，但還沒有人能透過 API 真的錄到 `whisper`/`silent`。這不影響這支測試的斷言（只驗證「有寫入、值域合法」），但值得記錄成下一步。
 
-### `/replay/*` 沒有 HTTP 路由（skip）
+### `/replay/*` HTTP 路由（原 skip，ed 落地後轉綠）
 
-`bridge_server.py` 的 `do_GET`/`do_POST` 目前完全沒有 `/replay` 開頭的分支，打下去是純 404（`send_error()` 的預設 HTML，不是 JSON——測試裡特地寫了一個容忍非 JSON body 的小 helper 來探這個狀態，不能直接重用 `_request()`）。這條測試已經把「library 層級驗證過同一個檔案」的結論寫在 skip 訊息裡；等 HTTP 端點接上，只要把 `test_replay_http_endpoint` 從 skip 換成真斷言（開始回放、poll `/events` 收到帶 `replay:true` 的事件、確認回放期間 `status.source` 不會被真實序列埠資料蓋掉）就是完整的端對端 regression。
+寫這支測試的當下，`bridge_server.py` 完全沒有 `/replay` 開頭的路由。`esp-mask-test-ed` 接上之後（`/replay/start`、`/replay/sessions`、`/replay/state`、`/replay/control`、`/replay/speed` 等），`test_replay_http_endpoint` 從「一旦收到非 404 就主動 `pytest.fail()`」的自我提醒機制被觸發，換成了真斷言：開始回放、確認 `/events` 收到帶 `replay:true` 的事件、確認回放期間即時 `tof`/`mic`/`mel` 真的被 `bridge_server.py` 的 `handle_parsed_event()` 擋下（沒有任何未標記的即時資料混進來）、確認 `status.source` 不受影響。
 
 ---
 
 ## 修改的檔案
 
-- `host/replay/session_replay.py`（我的檔案，B17）—— 上述兩個回放形狀修正
-- `vl53l7cx_test/monitor/test_e2e_pipeline.py`（新檔案）—— 這支測試
+- `host/replay/session_replay.py`（我的檔案，B17）—— 兩個回放形狀修正（`dim`、`mic.rms` 型別）
+- `host/storage/session_writer.py`（我的檔案，B07）—— 新增選填的 `sensors_enabled`/`sensors_enabled_confirmed`
+- `host/storage/test_session_writer.py` —— 對應的 6 個新測試
+- `ssi-backlog/tools/schema_example.py`（我的檔案，T02）—— 補 `sensors_enabled`，順便修掉 VAD `-1` 佔位值的舊 bug
+- `vl53l7cx_test/monitor/test_e2e_pipeline.py`（新檔案）—— 這支測試，19 個測試函式
 - `reports/E2E_PIPELINE.md`（新檔案）—— 這份報告
 
-沒有動任何不是自己負責的檔案（`bridge_server.py`、`host/trial/state_machine.py` 都只讀不改，兩個已知缺口都已回報，不是自己動手接線）。
+沒有動任何不是自己負責的檔案——`bridge_server.py`、`host/trial/state_machine.py` 全程只讀不改；兩個原本的已知缺口（`speaking_mode`、`/replay/*`）都是其他 agent 自己接上、這裡的測試被動偵測到才轉綠，不是這裡主動去接線。
 
 ---
 

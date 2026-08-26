@@ -22,6 +22,17 @@
   display: flex;
   align-items: baseline;
   gap: 10px;
+  /* C19/C25 follow-up: the first section-label (ToF depth/signal grids)
+     packs a title + the zone-layout warning badge + the keyboard-shortcut
+     hint into one row -- at 130% projector-mode font-size and a
+     projector-realistic viewport (tested at 1280x720), that stopped
+     fitting on one line, and without wrapping the ROW, each item's own
+     text wrapped individually instead, squeezing words into narrow
+     columns. flex-wrap lets whole items drop to their own line instead,
+     which stays readable. No-op for the other three section-labels
+     (PCA/Mel/quality), which already fit on one line at 130%. */
+  flex-wrap: wrap;
+  row-gap: 4px;
 }
 
 /* D11 flagged the zone->physical-position mapping (row-major) as an

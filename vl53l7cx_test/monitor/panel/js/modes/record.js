@@ -74,12 +74,14 @@
 // they might need new backend surface; neither did:
 //
 //   1. Full vocab list (to show labels with a ZERO count, not just ones
-//      already seen): `bridge_server.py`'s load_vocab() is server-side
-//      only (grepped, no /vocab route) -- but quiz.js (C15/16) already
-//      fetches the same word list client-side from the static file
-//      panel/data/vocab.json (see its VOCAB_URL). Reused verbatim here
-//      (loadVocab() below) -- no new endpoint, no CONTRACTS change.
-//      Falls back to "labels seen so far" if that fetch ever fails.
+//      already seen): originally this fetched the static copy at
+//      panel/data/vocab.json (matching quiz.js's own C15-era stopgap,
+//      before bridge_server.py had a vocab route at all). ed has since
+//      added GET /config/vocab (reads config/vocab.json fresh on every
+//      request, no caching/restart needed) and quiz.js switched to it --
+//      this file now does too, making panel/data/vocab.json's only
+//      remaining reader go away. Falls back to "labels seen so far" if
+//      that fetch ever fails, same as before.
 //
 //   2. Per-trial preview data (Δ heatmap + waveform for one of the last
 //      10 trials): no CONTRACTS endpoint exists for reading back a past
@@ -257,7 +259,7 @@ registerMode("record", (() => {
   let audioCtx = null; // created lazily on first real user gesture (browser autoplay policy)
 
   // --- C13: progress dashboard state ---
-  let vocabWords = null; // [{id,text,..}] from data/vocab.json, or null if unavailable
+  let vocabWords = null; // [{id,text,..}] from GET /config/vocab, or null if unavailable
   let vocabReject = null; // {id:"_reject", text:"..."} from the same file
   let targetPerLabel = DEFAULT_TARGET_PER_LABEL;
   let labelCounts = {}; // label id -> saved-trial count (any quality), dynamic-discovery fallback too
@@ -590,7 +592,7 @@ registerMode("record", (() => {
 
   async function loadVocab() {
     try {
-      const res = await fetch("data/vocab.json");
+      const res = await fetch("/config/vocab");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       vocabWords = Array.isArray(data.words) ? data.words : null;
@@ -599,7 +601,7 @@ registerMode("record", (() => {
       // Falls back to dynamic discovery (labelCounts grows as SAVE events
       // arrive) -- see file-top note. Not fatal, just less complete until
       // every label has appeared at least once.
-      console.warn("[record] data/vocab.json unavailable, falling back to dynamic label discovery:", err);
+      console.warn("[record] /config/vocab unavailable, falling back to dynamic label discovery:", err);
       vocabWords = null;
       vocabReject = null;
     }

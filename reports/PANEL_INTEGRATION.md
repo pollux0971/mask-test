@@ -48,7 +48,7 @@
 
 **四個真正模式的 mark 全部原封不動地存活**（`sentinel-monitor-xxx` 等，
 逐一比對前後字串完全相同）—— 證明 `shell.js` 的 mode 生命週期真的是
-「只切 `.active` class，不重新 `init()` DOM」，這正是 `README.md`「架構關鍵：
+「只切 `.active` class，不重新 `init()` DOM」，這正是 `ssi-backlog/README.md`「架構關鍵：
 資料層與模式層分離」要保證的行為，在四個真正模式間確認過了。
 
 ## 3. 故障隔離（一個模式拋例外，其他模式仍收得到事件）

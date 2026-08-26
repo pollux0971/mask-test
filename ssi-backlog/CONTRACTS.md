@@ -658,6 +658,36 @@ snr_zone = |Δ_round - Δ_spread| / sigma_baseline
 | POST | `/session/baseline?seconds=N` | `B10`／`B19` | 擷取 baseline（預設 30 s，取自緩衝區「過去 N 秒」） |
 | GET | `/baseline` | `B10`／`B19` | 目前 session 的 baseline 統計（未擷取回 204） |
 | GET | `/pca?model=tof_only\|enrollment` | `C10`／`B19` | 已擬合的 PCA 模型（沒有模型回 204） |
+| GET | `/config/<name>` | `B19` | 服務 `config/*.json`（`vocab`／`quality_thresholds`／`session_targets`），每次請求重讀 |
+| POST | `/trial/reject` | `C14`／`B19` | body `{"trial_idx":N}`，把已落盤的 trial 標成 `rejected`（**不刪除**） |
+| POST | `/replay/start?file=<path>&start_trial=<N>` | `B17`／`B19` | 開始回放（`file` 限制在 sessions 目錄內） |
+| POST | `/replay/control?action=pause\|resume\|step` | `B17`／`B19` | 播放控制 |
+| POST | `/replay/speed?value=0.25\|1\|4` | `B17`／`B19` | 只接受這三個值，其餘 400 |
+| POST | `/replay/seek?trial=<N>` | `B17`／`B19` | 跳到某個 trial（不存在回 400） |
+| POST | `/replay/stop` | `B19` | 結束回放，恢復真實資料 |
+| GET | `/replay/sessions` | `C24`／`B19` | 可回放的 session 檔清單（新到舊） |
+| GET | `/replay/state` | `C24`／`B19` | 目前回放狀態（沒有回放時 `state:"idle"`） |
+
+#### 4.1.3 回放（`B17` 的 HTTP wiring，`B19`）
+
+回放進行中（`ReplayController.is_active`）**`tof`／`mic`／`mel` 的真實序列埠資料
+一律不發布**——story 明訂的災難情境是兩條資料流交錯，前端無從分辨哪一幀來自哪裡。
+
+**但 `status` 與 `heartbeat` 照常發布**：那兩者不是被回放的東西，
+把它們一起擋掉會讓鏈路在回放期間看起來像斷線。
+
+每個回放出來的事件都帶 **`"replay": true`**（§4.2）。
+`B17` 除了 `tof`/`mic`/`mel` **也會回放 `trial` 邊界事件**，讓前端能重畫 trial 時間軸；
+它們同樣帶 `replay: true`。
+
+> **`replay: true` 與 `status.source` 是不同層，不可互相取代。**
+> `source` 說的是「這條連線接的是什麼」（整個 session 不變），
+> `replay: true` 說的是「這一筆是從 HDF5 重播出來的」。
+> `T05`（序列埠 log 重播）產出的 pty 對 bridge 而言與 `T04` 的合成 pty 無異，
+> **所以它只有 `source`、不會有 `replay: true`**。
+
+🔴 **`file=` 參數做 resolve-then-contain 限制在 sessions 目錄內**，
+且「目錄外」與「不存在」**回同一個 404**——分開回會讓呼叫端可以探測檔案系統。
 | POST | `/trial/hold/start` \| `/stop` | `B12` | Hold-to-Record |
 | POST | `/trial/abort` \| `/redo` | `B11` | 放棄 / 重錄 |
 | POST | `/recognize` | `D09` | 辨識，回 TriResult |

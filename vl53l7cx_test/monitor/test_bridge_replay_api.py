@@ -173,6 +173,11 @@ def test_live_device_data_is_blocked_while_replaying(rig):
     import threading
     path = _recorded_session(rig)
     _request(rig, "POST", f"/replay/start?file={path}")
+    # Quarter speed so the replay is guaranteed to still be running for the
+    # whole capture window. At 1x it can finish partway through, and then
+    # live data legitimately resumes -- which would make this test pass or
+    # skip for the wrong reason instead of checking the guard.
+    assert _request(rig, "POST", "/replay/speed?value=0.25")[0] == 200
 
     collected = []
 
@@ -183,12 +188,9 @@ def test_live_device_data_is_blocked_while_replaying(rig):
     t.start()
     t.join()
 
-    # Only meaningful while the replay is still running: once it finishes,
-    # live data is supposed to resume, so a leak check over a window that
-    # outlasts the replay would be testing the wrong thing.
-    state = _request(rig, "GET", "/replay/state")[1]
-    if not state["active"]:
-        pytest.skip("the replay finished inside the capture window")
+    assert _request(rig, "GET", "/replay/state")[1]["active"] is True, (
+        "the replay ended early; this test proves nothing about the guard"
+    )
 
     data = [e for e in collected if e.get("type") in ("tof", "mic", "mel")]
     assert data, "nothing was published at all"

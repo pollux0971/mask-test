@@ -40,11 +40,14 @@
 }
 .quiz-vad-status.ready {
   color: var(--good);
-  background: rgba(95, 191, 122, 0.14);
+  background: var(--status-good-soft);
 }
+/* "unavailable" here means "this mode doesn't apply" (silent speaking mode
+   has no meaningful Auto-VAD state), not a failure -- amber, matching the
+   "caution/caveat, not broken" language the rest of the app uses. */
 .quiz-vad-status.unavailable {
-  color: var(--warn);
-  background: var(--warn-soft);
+  color: var(--status-warn);
+  background: var(--status-warn-soft);
 }
 .quiz-vad-icon.breathing {
   display: inline-block;
@@ -83,9 +86,11 @@
   color: var(--accent);
   border-color: var(--accent);
 }
+/* Informational, not an error -- manual trigger selection is expected
+   whenever Auto-VAD doesn't apply, not something gone wrong. */
 .quiz-trigger-row {
   font-size: 0.75rem;
-  color: var(--warn);
+  color: var(--status-warn);
 }
 
 .quiz-cards {
@@ -128,13 +133,16 @@
   padding: 2px 8px;
   border-radius: 999px;
 }
+/* Ties this badge's color to the ToF heatmap's own cell palette elsewhere
+   in the app (monitor.css's --cell-near/--cell-far) -- same tokens, not a
+   coincidence, and now spelled out instead of two copies of the same hex. */
 .quiz-card-expect[data-expect="ToF"] {
-  color: #17495a;
-  background: #dfe7e2;
+  color: var(--cell-near);
+  background: var(--cell-far);
 }
 .quiz-card-expect[data-expect="音訊"] {
-  color: #f1b441;
-  background: rgba(255, 191, 64, 0.16);
+  color: var(--expect-audio);
+  background: var(--expect-audio-soft);
 }
 .quiz-card-expect[data-expect="雙模態"] {
   color: var(--accent);
@@ -194,7 +202,7 @@
 }
 .quiz-progress-stage.done {
   color: var(--good);
-  background: rgba(95, 191, 122, 0.14);
+  background: var(--status-good-soft);
 }
 /* "分析中" 沒有真實的伺服器進度事件（POST /recognize 送出後只能等
    回應，不是真的知道伺服器內部跑到哪）-- 呼吸動畫代表不定進度，
@@ -456,11 +464,16 @@
 }
 .quiz-result-col.fused .quiz-result-col-head { color: var(--accent); }
 
+/* C25: reject is an honest result, not a failure -- C18's big result card
+   already treats "未偵測到" this way (dashed border, --text-dim, same size
+   as a real answer, never red). This per-track badge was still red,
+   inconsistent with that established precedent within the very same mode. */
 .quiz-reject-badge {
   font-size: 0.6875rem;
   font-weight: 700;
-  color: var(--warn);
-  background: var(--warn-soft);
+  color: var(--status-unknown);
+  background: var(--surface-2);
+  border: 1px dashed var(--border);
   border-radius: 999px;
   padding: 1px 8px;
 }
@@ -609,13 +622,21 @@
   border: 1px solid var(--border);
   border-radius: 10px;
 }
+/* C25: this is a REFERENCE LINE (random-chance baseline), not a score --
+   the three stat columns below it are real measured results. It used to
+   share the same bold accent-amber look as a real number, which on a
+   washed-out projector could read as a fourth data point instead of the
+   thing the other three are being compared against. Dashed underline +
+   dimmed color mark it as context, not a result. */
 .quiz-stats-baseline {
   margin-left: auto;
   font-size: 0.75rem;
   letter-spacing: normal;
   text-transform: none;
-  color: var(--accent);
-  font-weight: 700;
+  color: var(--text-dim);
+  font-weight: 600;
+  border-bottom: 1px dashed var(--text-dim);
+  padding-bottom: 1px;
 }
 
 .quiz-stats-grid {
