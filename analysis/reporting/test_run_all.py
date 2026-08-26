@@ -133,17 +133,22 @@ def test_load_session_reads_meta_and_trials(tmp_path):
 
 
 def test_load_session_exposes_mic_peak_and_paired_timestamps(tmp_path):
-    """SCHEMA_SUPPLY_DEMAND.md 標記過的「結構性讀不到」：`mic_peak`（必填
-    dataset）跟 `mel_t_us`/`tof_ambient_t_us`（分別跟 `mel`/`tof_ambient_*`
-    成對必寫）以前寫得進 HDF5，`Trial` dataclass 卻沒有對應欄位可以讀出來
-    ——`mel_t_us` 尤其要緊：沒有它，任何要對齊 mel 幀跟其他串流時間戳的
-    分析都做不到。"""
+    """SCHEMA_SUPPLY_DEMAND.md 標記過的「結構性讀不到」：`mic_peak`/
+    `mic_t_us`（必填 dataset）跟 `mel_t_us`/`tof_ambient_t_us`（分別跟
+    `mel`/`tof_ambient_*` 成對必寫）以前寫得進 HDF5，`Trial` dataclass
+    卻沒有對應欄位可以讀出來。`mic_t_us` 是這一批裡最後一個漏網的：
+    `8f` 做語音 VAD 裁切時卡在這裡——沒有它，offline 分析只能做唇動-only
+    裁切，跟線上唇動+語音聯集裁切的窗口定義不同，會造成樣板與查詢用兩種
+    不同定義比對的訓練/推論不一致。"""
     path = write_session(tmp_path / "s.h5", wear_id=1, seed=0, with_ambient=True)
     session = session_loader.load_session(path)
     trial = session.trials[0]
 
     assert trial.mic_peak is not None
     assert trial.mic_peak.shape == trial.mic_rms.shape
+
+    assert trial.mic_t_us is not None
+    assert trial.mic_t_us.shape == trial.mic_rms.shape
 
     assert trial.mel is not None and trial.mel_t_us is not None
     assert trial.mel_t_us.shape[0] == trial.mel.shape[0]
@@ -396,7 +401,7 @@ def test_wear_distance_ratio_works_with_two_wears(two_sessions):
     pairs = session_loader.usable_trials(sessions)
     trials = [t for _, t in pairs]
     session_by_trial = {id(t): s for s, t in pairs}
-    _, _, _, by_trial = run_all.build_feature_seqs(trials, session_by_trial)
+    _, _, _, by_trial, _ = run_all.build_feature_seqs(trials, session_by_trial)
 
     result, note = run_all._wear_distance_ratio(trials, by_trial)
     assert note is None

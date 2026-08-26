@@ -125,8 +125,47 @@ def _infer_tof_rate_hz(tof_t_us):
     return 1e6 / median_us
 
 
+def _speech_window_for_trial(trial, session, mu_a, sigma_a, mu_b, sigma_b):
+    """算這筆 trial 的裁切窗——唇動（A/B 兩顆）+ 語音，取聯集（完整理由見
+    `host/features/live_pipeline.py` 的 `compute_speech_window()`）。
+
+    `mic_t_us` 現在已經在 `Trial` 上（`session_loader.py` 的既有欄位，
+    `18` 補上的），語音 VAD 因此跟線上路徑一樣可以算——不需要「offline
+    只能唇動-only」的降級：那個不對稱本身會是新的「訓練/推論不一致」
+    （樣板可能是別條路徑建的、查詢又是另一條），今天早上才修過同一種
+    問題（見 `reports/ALIGNMENT_MISMATCH.md`）。
+    """
+    from host.features.live_pipeline import compute_speech_window
+    from host.vad.audio_vad import DEFAULT_SPEAKING_MODE, SPEAKING_MODES, detect_voice_activity
+    from host.vad.tof_vad import detect_lip_activity
+
+    energy_mu = session.meta.get("energy_mu")
+    energy_sigma = session.meta.get("energy_sigma")
+    lip_a = detect_lip_activity(trial.tof_a, trial.tof_t_us, mu_a, sigma_a,
+                                 energy_mu=energy_mu, energy_sigma=energy_sigma)
+    lip_b = detect_lip_activity(trial.tof_b, trial.tof_t_us, mu_b, sigma_b,
+                                 energy_mu=energy_mu, energy_sigma=energy_sigma)
+
+    speaking_mode = trial.speaking_mode if trial.speaking_mode in SPEAKING_MODES else DEFAULT_SPEAKING_MODE
+    voice = detect_voice_activity(
+        trial.mic_rms, trial.mic_t_us,
+        session.meta.get("noise_floor_mu"), session.meta.get("noise_floor_sigma"),
+        speaking_mode=speaking_mode,
+    )
+
+    segments = []
+    if lip_a.detected:
+        segments.append(("lip_A", lip_a.primary.start_us, lip_a.primary.end_us))
+    if lip_b.detected:
+        segments.append(("lip_B", lip_b.primary.start_us, lip_b.primary.end_us))
+    if voice.detected:
+        segments.append(("voice", voice.primary.start_us, voice.primary.end_us))
+    return compute_speech_window(segments)
+
+
 def build_feature_seqs(trials, session_by_trial):
-    """把 trial 走一遍 `D01` → `D02` → `D03`，回傳 `(feature_seqs, labels)`。
+    """把 trial 走一遍 `D01` → `D02` → `D03`，回傳
+    `(feature_seqs, labels, skipped, by_trial, trim_info)`。
 
     **跨模態對齊走 `host/align/aligner.py` 的 `Aligner` +
     `host/features/live_pipeline.py` 的 `assemble_query_from_aligned_frames()`
@@ -141,14 +180,20 @@ def build_feature_seqs(trials, session_by_trial):
     向量幾乎量不出差異（ToF 通道把 Mel 通道的落差稀釋掉了），拆開來看
     Mel-only 的 cosine 距離達 0.86–1.46（值域 0–2），且會讓分類結果翻轉。
 
+    **這裡也裁切到「真的在講話」那一段**（`_speech_window_for_trial()`），
+    修 hold-to-record 按鍵按多久會洩漏進固定 `T=24` 幀的問題（同一份報告
+    「按住多久」章節）。`trim_info` 是每筆 trial 的裁切診斷
+    （`key`/`trimmed`/`source`/`reason`）——**裁切與否永遠被記錄**，不會
+    有「一部分樣板裁過、一部分沒裁但沒人知道」的情況。
+
     ⚠️ **改這裡會讓 `D06`/`D09`/`D22` 的數字跟著變，這是預期的**——
-    舊數字是拿一條違反自己前提的管線算出來的，不是「不小心變了」。
+    舊數字是拿一條違反自己前提、也沒有裁切的管線算出來的，不是「不小心
+    變了」。
 
     任何一筆組裝失敗（幀數不足、缺 mel/`mel_t_us`、baseline 缺漏）就
     **跳過那一筆並記錄**，不是整批放棄——一次 session 幾十筆，為了一筆
-    壞掉的丟掉全部太貴。回傳 `(feature_seqs, labels, skipped, by_trial)`
-    ——`skipped` 是被跳過的清單（會寫進報告），`by_trial` 是
-    `id(trial) -> 特徵`，給 `D12` 的距離比用。
+    壞掉的丟掉全部太貴。`skipped` 是被跳過的清單（會寫進報告），`by_trial`
+    是 `id(trial) -> 特徵`，給 `D12` 的距離比用。
     """
     from host.align.aligner import Aligner
     from host.features.live_pipeline import (
@@ -156,7 +201,7 @@ def build_feature_seqs(trials, session_by_trial):
         assemble_query_from_aligned_frames,
     )
 
-    feature_seqs, labels, skipped, by_trial = [], [], [], {}
+    feature_seqs, labels, skipped, by_trial, trim_info = [], [], [], {}, []
     for trial in trials:
         session = session_by_trial[id(trial)]
         mu_a, sigma_a = session.baseline("A")
@@ -199,7 +244,11 @@ def build_feature_seqs(trials, session_by_trial):
             frames = list(aligner.frames(
                 int(trial.tof_t_us[0]), int(trial.tof_t_us[-1]), rate_hz=rate_hz,
             ))
-            seq = assemble_query_from_aligned_frames(frames, mu_a, sigma_a, mu_b, sigma_b)
+
+            window_result = _speech_window_for_trial(trial, session, mu_a, sigma_a, mu_b, sigma_b)
+            seq = assemble_query_from_aligned_frames(
+                frames, mu_a, sigma_a, mu_b, sigma_b, speech_window=window_result,
+            )
         except InsufficientFramesError as exc:
             skipped.append((trial.key, f"三個模態同時有資料的幀不足，無法對齊：{exc}"))
             continue
@@ -209,7 +258,11 @@ def build_feature_seqs(trials, session_by_trial):
         feature_seqs.append(seq.data)
         labels.append(trial.label)
         by_trial[id(trial)] = seq.data
-    return feature_seqs, labels, skipped, by_trial
+        trim_info.append({
+            "key": trial.key, "trimmed": window_result.trimmed,
+            "source": window_result.source, "reason": window_result.reason,
+        })
+    return feature_seqs, labels, skipped, by_trial, trim_info
 
 
 # ------------------------------------------------------------------ 各實驗
@@ -606,12 +659,22 @@ def run_experiments(sessions, *, fast=False, is_synthetic=True,
     outcomes, notes = [], []
     feature_seqs, labels, feature_by_trial = [], [], {}
     if available["C"] is None or available["E"] is None or available["B"] is None:
-        feature_seqs, labels, skipped, feature_by_trial = build_feature_seqs(
+        feature_seqs, labels, skipped, feature_by_trial, trim_info = build_feature_seqs(
             trials, session_by_trial)
         if skipped:
             notes.append(f"{len(skipped)} 筆 trial 未能組裝成特徵："
                          + "、".join(f"{k}（{why}）" for k, why in skipped[:5])
                          + ("…" if len(skipped) > 5 else ""))
+        if trim_info:
+            n_trimmed = sum(1 for t in trim_info if t["trimmed"])
+            note = (f"{n_trimmed}/{len(trim_info)} 筆 trial 有裁切到「真的在講話」那一段"
+                    "（見 reports/ALIGNMENT_MISMATCH.md「按住多久」章節）")
+            untrimmed = [t for t in trim_info if not t["trimmed"]]
+            if untrimmed:
+                note += "；退回整段的：" + "、".join(
+                    f"{t['key']}（{t['reason']}）" for t in untrimmed[:5]
+                ) + ("…" if len(untrimmed) > 5 else "")
+            notes.append(note)
 
     crosstalk, crosstalk_diagnosis = session_loader.crosstalk_pairs(sessions)
     runners = {

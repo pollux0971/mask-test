@@ -52,7 +52,11 @@ if str(ROOT_DIR) not in sys.path:
 
 from analysis.similarity.cosine_baseline import cosine_dist, modality_cosine_dist  # noqa: E402
 from host.align.aligner import Aligner  # noqa: E402
-from host.features.live_pipeline import assemble_query_from_aligned_frames  # noqa: E402  只 import，不修改
+from host.features.live_pipeline import (  # noqa: E402  只 import，不修改
+    assemble_query_from_aligned_frames,
+    compute_speech_window,
+)
+from host.vad.tof_vad import detect_lip_activity  # noqa: E402  只 import，不修改
 
 N_TOF_ZONES = 16
 N_MEL_BANDS = 40
@@ -77,8 +81,14 @@ WORD_PATTERNS = {
     "word_B": {"tof_zones": range(8, 13), "mel_bands": range(20, 25), "sign": -1.0},
 }
 
-AMPLITUDE = 3.0   # z-score 後的振幅量級，跟 D09 的 magnitude=10、noise=0.15 同一種尺度感（相對噪音的訊噪比類似）
+AMPLITUDE = 10.0  # z-score 後的振幅量級，跟 D09 的 magnitude=10、noise=0.15 同一種尺度感（相對噪音的訊噪比類似）
 NOISE_STD = 0.15 * AMPLITUDE
+# 原本 AMPLITUDE=3.0 量距離用的 cosine 效應沒問題，但拿去餵
+# `detect_lip_activity()` 的真實 3σ 進入閾值時，跨 16 個 zone 平均後的
+# 能量峰值不夠高，五種時長裡沒有一個能真的偵測到（見驗證這支腳本時的
+# 診斷）——改成 10.0 之後在所有測試時長都能穩定偵測到，且合成訊號本身
+# 是否被偵測到，不影響第 2 段落「不套用裁切」的距離量測結果不變（該段落
+# 不呼叫 `detect_lip_activity()`）。
 
 
 def _bump(t, center, width):
@@ -125,8 +135,42 @@ def synth_hold(word, hold_duration_s, *, tof_rate_hz=TOF_RATE_HZ, mel_rate_hz=ME
     )
 
 
-def build_query(record, tof_rate_hz=TOF_RATE_HZ):
-    """真正呼叫 `Aligner` + `assemble_query_from_aligned_frames()`。"""
+def _reference_energy_floor():
+    """模擬 `B10` 的 baseline 期間——一段保證沒有動作的純靜止合成訊號，
+    用它算穩定的 `energy_mu`/`energy_sigma`。
+
+    **這不是可省的一步**：驗證這支腳本時發現，讓 `detect_lip_activity()`
+    自己從含動作的 trial 裡自動估（不傳 `energy_mu`/`energy_sigma`），
+    在按住時長接近講話動作本身長度時（例如 0.5s 按住、0.45s 的動作幾乎
+    占滿整段），trial 裡幾乎沒有真正安靜的幀可以估，自動估計器會把
+    「這段幾乎全在動」誤判成「baseline 過期」而拒絕偵測——這正是
+    `host/vad/tof_vad.py` 模組文件裡說的「拿得到乾淨的靜止資料時，請
+    明確傳 baseline 期間算好的值，那比從含動作的 trial 自己估準得多」。
+    跟 `analysis/run_all.py::_speech_window_for_trial()` 用
+    `session.meta.get("energy_mu")` 是同一個原則，這裡沒有真的 session，
+    用一段乾淨的合成靜止訊號代替。
+    """
+    quiet = synth_hold("word_A", 3.0, seed=999, amplitude=0.0)
+    from host.vad.tof_vad import zone_energy, estimate_energy_floor
+    energy, _, _ = zone_energy(quiet["tof_a"], BASELINE_MU, BASELINE_SIGMA)
+    return estimate_energy_floor(energy)
+
+
+_REFERENCE_ENERGY_MU, _REFERENCE_ENERGY_SIGMA = _reference_energy_floor()
+
+
+def build_query(record, tof_rate_hz=TOF_RATE_HZ, use_trim=False):
+    """真正呼叫 `Aligner` + `assemble_query_from_aligned_frames()`。
+
+    `use_trim=True`：**修好之後的路徑**——用真正的 `detect_lip_activity()`
+    （唇動，兩顆感測器都測，餵 `_reference_energy_floor()` 算好的穩定
+    baseline 能量門檻）算出 `speech_window`，裁到「真的在講話」那段再
+    重採樣（見 `host/features/live_pipeline.py` 的 `compute_speech_window()`）。
+    這裡沒有語音 VAD（合成資料沒有麥克風訊號），只用唇動——跟
+    `analysis/run_all.py::_speech_window_for_trial()` 的差別只在於「這支
+    腳本沒有 mic_rms 可以餵」，裁切機制本身是同一份程式碼。
+    `use_trim=False`（預設）：修好之前的行為，整段不裁切，用來對照。
+    """
     aligner = Aligner()
     n_tof = record["tof_a"].shape[0]
     for i in range(n_tof):
@@ -140,21 +184,39 @@ def build_query(record, tof_rate_hz=TOF_RATE_HZ):
 
     frames = list(aligner.frames(int(record["tof_t_us"][0]), int(record["tof_t_us"][-1]),
                                   rate_hz=tof_rate_hz))
+
+    speech_window = None
+    if use_trim:
+        lip_a = detect_lip_activity(record["tof_a"], record["tof_t_us"], BASELINE_MU, BASELINE_SIGMA,
+                                     energy_mu=_REFERENCE_ENERGY_MU, energy_sigma=_REFERENCE_ENERGY_SIGMA)
+        lip_b = detect_lip_activity(record["tof_b"], record["tof_t_us"], BASELINE_MU, BASELINE_SIGMA,
+                                     energy_mu=_REFERENCE_ENERGY_MU, energy_sigma=_REFERENCE_ENERGY_SIGMA)
+        segments = []
+        if lip_a.detected:
+            segments.append(("lip_A", lip_a.primary.start_us, lip_a.primary.end_us))
+        if lip_b.detected:
+            segments.append(("lip_B", lip_b.primary.start_us, lip_b.primary.end_us))
+        speech_window = compute_speech_window(segments)
+
     seq = assemble_query_from_aligned_frames(frames, BASELINE_MU, BASELINE_SIGMA,
-                                              BASELINE_MU, BASELINE_SIGMA)
-    return seq.data
+                                              BASELINE_MU, BASELINE_SIGMA,
+                                              speech_window=speech_window)
+    return seq.data, speech_window
 
 
 DURATIONS_S = (0.5, 1.0, 2.0, 4.0, 5.0)
 
 
-def scan_duration_vs_word_distance():
+def scan_duration_vs_word_distance(use_trim=False):
     """對每個按住時長各建一次 word_A/word_B 的向量，量：
     - 同一個詞、不同時長的距離（該死的方向，理想值應該很小）
     - 不同詞、同一時長的距離（訊號的量級參考）
+
+    `use_trim=True`：套用 `compute_speech_window()` 裁切（修好之後的路徑）。
     """
     queries = {
-        (word, d): build_query(synth_hold(word, d, seed=1 if word == "word_A" else 2))
+        (word, d): build_query(synth_hold(word, d, seed=1 if word == "word_A" else 2),
+                                use_trim=use_trim)[0]
         for word in WORD_PATTERNS for d in DURATIONS_S
     }
 
@@ -179,18 +241,18 @@ def scan_duration_vs_word_distance():
     return same_word_diff_duration, diff_word_same_duration, cross, queries
 
 
-def classification_test(reference_duration=2.0):
+def classification_test(reference_duration=2.0, use_trim=False):
     """樣板在一個「典型」按住時長下建，查詢用不同的按住時長，看 cosine
     最近鄰會不會選錯詞——這是「長度會不會實際造成誤判」的直接測試，
     比單純看距離數字更貼近後果。"""
     templates = {
-        word: build_query(synth_hold(word, reference_duration, seed=100 + i))
+        word: build_query(synth_hold(word, reference_duration, seed=100 + i), use_trim=use_trim)[0]
         for i, word in enumerate(WORD_PATTERNS)
     }
     results = []
     for true_word in WORD_PATTERNS:
         for d in DURATIONS_S:
-            query = build_query(synth_hold(true_word, d, seed=777))
+            query, _ = build_query(synth_hold(true_word, d, seed=777), use_trim=use_trim)
             dists = {w: float(cosine_dist(query, t)) for w, t in templates.items()}
             pred = min(dists, key=dists.get)
             results.append({
@@ -200,9 +262,10 @@ def classification_test(reference_duration=2.0):
     return results
 
 
-def main():
-    same_word, diff_word, cross, _ = scan_duration_vs_word_distance()
+def _report_pass(use_trim, label):
+    same_word, diff_word, cross, _ = scan_duration_vs_word_distance(use_trim=use_trim)
 
+    print(f"\n########## {label} ##########")
     print("=== 同一個詞、不同按住時長的 cosine 距離 ===")
     for r in same_word:
         print(f"  [{r['word']}] {r['d1']}s vs {r['d2']}s: {r['dist']:.4f}")
@@ -226,17 +289,37 @@ def main():
         print(f"  word_A@{r['d1']}s vs word_B@{r['d2']}s: {r['dist']:.4f}{flag}")
 
     print("\n=== 分類測試：樣板固定在 2.0s 建，查詢用不同按住時長 ===")
-    for r in classification_test():
+    for r in classification_test(use_trim=use_trim):
         flag = "" if r["correct"] else "  🔴 翻轉！"
         print(f"  真實詞={r['true_word']} 按住={r['duration']}s → 判定={r['pred']}"
               f"（{'對' if r['correct'] else '錯'}）{flag}  距離={r['dists']}")
 
-    print("\n=== 4s vs 5s 這個改動本身有沒有額外影響 ===")
-    d4 = build_query(synth_hold("word_A", 4.0, seed=1))
-    d5 = build_query(synth_hold("word_A", 5.0, seed=1))
+    return max_same_word_dist, min_diff_word_dist
+
+
+def main():
+    old_max, old_min = _report_pass(use_trim=False, label="修之前（整段不裁切，舊行為）")
+    new_max, new_min = _report_pass(use_trim=True, label="修之後（裁到「真的在講話」那段）")
+
+    print("\n########## 新舊對照 ##########")
+    print(f"同一詞不同長度最大距離：修前 {old_max:.4f} → 修後 {new_max:.4f}")
+    print(f"不同詞相同長度最小距離：修前 {old_min:.4f} → 修後 {new_min:.4f}")
+    old_ratio = old_max / old_min if old_min else float("inf")
+    new_ratio = new_max / new_min if new_min else float("inf")
+    print(f"「長度效應／詞義效應」比例：修前 {old_ratio:.1%} → 修後 {new_ratio:.1%}")
+    if new_max < old_max:
+        print(f"✅ 洩漏確實變小了（同一詞不同長度的最大距離下降 {(1 - new_max / old_max):.1%}）")
+    else:
+        print("🔴 洩漏沒有變小，甚至變大——裁切沒有解決問題，這個結論比「修好了」更有價值，照實回報")
+
+    print("\n=== 4s vs 5s 這個改動本身有沒有額外影響（修之後的路徑）===")
+    d4, w4 = build_query(synth_hold("word_A", 4.0, seed=1), use_trim=True)
+    d5, w5 = build_query(synth_hold("word_A", 5.0, seed=1), use_trim=True)
     print(f"  word_A @4s vs @5s cosine 距離：{cosine_dist(d4, d5):.4f}")
     print(f"  ToF-only：{modality_cosine_dist(d4, d5, FEATURE_SLICES, 'tof'):.4f}　"
           f"Mel-only：{modality_cosine_dist(d4, d5, FEATURE_SLICES, 'mel'):.4f}")
+    print(f"  裁切窗口 @4s：{w4.to_dict()}")
+    print(f"  裁切窗口 @5s：{w5.to_dict()}")
 
 
 if __name__ == "__main__":
