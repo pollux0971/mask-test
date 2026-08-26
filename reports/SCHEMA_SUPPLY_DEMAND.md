@@ -284,12 +284,37 @@
   合法值各自都能收、非法值拒絕）。
 - 都跑過對應測試套件確認全線通過，見文末。
 
-## `mel_writer.py`：偵察清單交出去，沒有動手刪
+## `mel_writer.py`：偵察清單交出去，`ed` 已處理完成（第三輪更新）
 
 見上方第一部分的完整偵察小節（誰引用、`bridge_server.py` 精確到哪個
 函式與哪一行、`--h5-session` 有沒有人在用、刪掉會不會連累
-`wav_to_log_mel_timed` 這條完全正常的 `.npy` 路徑）。**這輪沒有刪除或
-修改 `mel_writer.py`**，也沒有動 `bridge_server.py` 的 import 結構。
+`wav_to_log_mel_timed` 這條完全正常的 `.npy` 路徑）。這輪**沒有**動手
+刪，也沒有動 `bridge_server.py` 的 import 結構——後續 `ed` 已經把
+`host/storage/mel_writer.py`、`host/storage/test_mel_writer.py`、
+`--h5-session` 旗標全部清掉，`bridge_server.py` 裡確認過偵察清單標的
+那個 import 風險（`wav_to_log_mel_timed` 跟 `write_mel_to_trial` 綁在
+同一個 `try/except`）有被一併處理，不是留著地雷單純刪檔。**這一項結案。**
+
+## 附註：第五類？「有寫、有讀，但語意方向反了」（範圍外，僅記錄）
+
+`8f` 發現 `config/quality_thresholds.json` 的 `noise_floor` 指標
+`direction` 設成 `lower_better`（數值越低越好，`<=` green 門檻即綠燈），
+但麥克風完全沒接上時 RMS 恆為 0——**全域最低值**，會被判成「全綠」，
+跟正常運作在儀表板上長得一模一樣，而且是能顯示的最好結果。
+
+**這不是這份報告涵蓋的範圍**：它是 `host/quality/metrics.py`／
+`config/quality_thresholds.json` 即時品質儀表板的門檻方向設定，跟本報告
+談的 `CONTRACTS.md` §2 HDF5 schema 讀寫（`session_writer.py` ↔
+`session_loader.py`）是完全不同的兩個子系統，數字上也跟 `/meta` 的
+`noise_floor_mu`/`noise_floor_sigma`（baseline 統計）無關，只是剛好同名。
+
+但它確實是調度員點名的「有寫、有讀，但讀的方向/解讀錯了」這一類，
+本報告原本的四分類（有寫有讀／有寫沒人讀／有人讀沒人寫／契約定義但
+兩邊都沒實作）沒有涵蓋這種「兩邊都『做了』，但語意方向對不上」的情況。
+**是否要把這類問題正式列為schema對帳表的第五類、以及要不要去
+`quality_thresholds.json` 裡逐一核對每個指標的 `direction` 是否也有同樣
+風險（例如「完全沒資料」是不是總落在某個方向的極端值），留給調度員／
+接手 `host/quality/` 的人判斷——這裡只記錄發現，不擴大這份報告的範圍。
 
 ---
 

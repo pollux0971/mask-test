@@ -1188,7 +1188,7 @@ registerMode("record", (() => {
         (lastTrialEvent && lastTrialEvent.warning === "too_short")
           ? "按住時間太短（< 0.3s），可能是誤觸"
           : (lastTrialEvent && lastTrialEvent.warning === "too_long")
-          ? "按住時間太長（> 5s），可能忘了放開"
+          ? "按住時間太長（> 4s），可能忘了放開"
           : "時長超出正常範圍";
     }
   }

@@ -27,7 +27,7 @@
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 新增 `POST /trial/confirm/keep` 與 `/trial/confirm/discard`（`CONFIRM` 狀態原本只定義了語意沒有端點，`C12` 實作時提案）。前端鍵盤慣例 Enter=keep／ESC=discard——ESC 在整個錄製畫面上一律代表「不要、丟掉」，不另外發明規則 | `B12`, `B19`, `C12`, `C14` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件新增 `next_label`（只在 `IDLE`/`REST`/`SAVE` 出現）。原因：Hold-to-Record 在使用者按下之前，前端完全不知道下一個要念哪個詞，只能盲按（`C12` 實作時發現）。詞指標改在 `_do_save()` 之前前進，`SAVE`/`REST` 才能 peek 到「下一個」。`abort` 讓它前進、`redo` 不會。另 `TrialStateMachine` 新增 `first_trial_idx` 參數，避免與 baseline 的 `trial_000` 撞號 | `B11`, `B12`, `B19`, `C12`, `C13` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 定義 `session` 事件在 `state:"baseline"` 時的 `progress` 形狀（`elapsed_s`/`remaining_s`/`duration_s`/`live_sigma_A|B`，完成時帶 `outcome`），並新增 `POST /session/baseline/retry`。原本 `progress` 只是佔位符沒有形狀，`C11` 實作時提案。前端須用 `elapsed_s` 重新對時；`live_sigma_*` 為 null 時必須明示「倒數是本地估計」不可假裝正常 | `B10`, `B19`, `C11`, `C12` | 是 |
-| 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件補上 `CONFIRM` 狀態（`B12` Hold-to-Record 專用：按住時間超出 0.3–5 s 範圍時，資料算好但**不落盤**，等使用者決定保留或跳過）。與 `B11` 「放棄的 trial 完全不落盤」一致 | `B12`, `B19`, `C12`, `C14` | 是 |
+| 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件補上 `CONFIRM` 狀態（`B12` Hold-to-Record 專用：按住時間超出 0.3–4 s 範圍時，資料算好但**不落盤**，等使用者決定保留或跳過）。與 `B11` 「放棄的 trial 完全不落盤」一致（上限原為 5 s，2026-08-26 依使用者要求改為 4 s——樣板不超過 4 秒） | `B12`, `B19`, `C12`, `C14` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件補上 `IDLE` 狀態與 `seed` 欄位；明訂 `abort`（跳過此詞）與 `redo`（保留同詞重試）語意不同，兩者都不寫入 HDF5 與 manifest；明訂 `quality` 值域凍結為 `{ok, low, rejected}`（棄用＝`rejected`，不新增第四個值）與 `B11` 的暫定門檻 0.7／0.3，並標註該門檻無實測依據、待 `E01`/`E03` 校準 | `B11`, `B12`, `B19`, `C12`, `C14`, `D12` | 是 |
 | 2026-08-26 | 6. 詞彙集 | 明訂實驗 A（逐 zone SNR）的對照詞為 `五`（round）vs `一`（spread）。`D11` 的公式用了 round／spread 但契約沒規定是哪兩個詞，`D15` 的 `run_all` 只能自己對應 | `D11`, `D15`, `E03` | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | `/meta` 新增 **`source`**（`live`/`mock`/`replay-log`/`replay-session`）。§4.2 已規定 SSE 的 `status` 要帶它，但那只在連線期間看得到——`SessionWriter._write_meta()` 只寫 `REQUIRED_META_KEYS`，傳進去的 `source` 被**靜默丟掉**（`B19` wiring 時發現）。**SSE 說得出來、檔案說不出來，而分析時只剩檔案**：`E05` 的四小時資料若錄錯來源，這是唯一能事後發現的地方 | `B07`, `B19`, `D13`, `D15`, `E05` | 是 |
@@ -70,6 +70,7 @@
 | 2026-08-26 | 7. Enrollment 樣板檔格式（新增章節） | 補記 `templates/*.npz` 的內部格式——`D08.md` 只寫了檔名慣例，`.npz` 內部的鍵、形狀、dtype、`_reject` 怎麼存全部只活在 `enrollment.py` 的 docstring 裡。原因：這個持久化格式已有三個生產/消費者（`D08` 自己、`bridge_server.py` 的 `recognition_service.py`、即將加入的「trial 轉樣板」端點），跟 §2 的 HDF5 schema 補記前的處境一樣。以程式碼實際行為為準，沒有發現跟 `D08.md` 衝突之處 | D08, D22, T06 | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | `/trial_NNN` 新增選填的 `baseline_age_s`（f32）：這筆 trial 錄的當下 baseline 已經是幾秒前錄的。原因：`ca` 發現 `record.js` 完全沒有 baseline 過期偵測（`monitor.js` 有 10 分鐘 `stale` 判定，`record.js` 沒有），`E05` 要連續錄 4 小時，baseline 中途過期幾乎必然發生，畫面警告只保護當下操作者，事後從 HDF5 看不出哪幾筆是過期後錄的。只存年齡本身，不存「算不算過期」的判斷——過期門檻是 `monitor.js` 的產品決策，將來可能調整，門檻變了不該讓已經錄好的資料跟著變義 | B21, D14, D15, T02 | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | `/meta` 新增選填的 `sensors_seen`（`""`/`"A"`/`"B"`/`"AB"`）：真板子上線當天發現 `sensors_enabled`/`sensors_enabled_confirmed` 都測不出「韌體回報活著、但這個 session 期間資料流其實沒送過來」這類落差（`$H` 的 drop_A/drop_B 只統計讀取失敗，不是根本沒在讀；`$STATUS` 沒有欄位能說哪幾顆真的在跑）。三個欄位問的是三個不同的問題（指令設什麼／裝置有沒有確認／實際有沒有資料流過來），可以互相不一致，不一致本身是診斷資訊。🔴 `""` 是合法值，代表「監測過整個 session 確實沒有任何資料」，跟「attr 不存在」（舊檔、沒量過）意義相反，不可互相取代——這點經過 `ed` 跟調度員來回確認才定案，寫入端要無條件塞值（含 `""`），不能因為是 falsy 就省略。⚠️ 語意上這個欄位只到「看到幾條資料流、自稱是誰」為止，不是「哪幾顆硬體是好的」判定，主機端看不到韌體那一側的實體對應 | B18, B19, D15, E05, T02 | 是 |
+| 2026-08-26 | 2. HDF5 Session Schema | `/trial_NNN` 新增選填的 `sensors_seen`（同 `/meta` 的欄位名跟值域，涵蓋範圍不同）：真板子的感測器接頭會在錄製途中隨機斷線、且沒有重置線可以重打，`/meta` 只在 baseline 當下寫死一次，記不住 session 中途才發生的斷線——20 分鐘內親眼看到 A 從「兩顆都活」變成「A 沒了」兩次，使用者沒有動任何東西。逐筆的 trial attr 記錄「這一筆到底哪幾顆真的有送資料」，跟 `/meta` 不一致就是中途掉線的直接證據，`E05` 事後靠這個分辨哪些 trial 完整、哪些只有半邊 | B18, B19, D15, E05, T02 | 是 |
 
 ---
 
@@ -414,6 +415,9 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
     baseline_age_s,         # f32，選填；這筆錄的當下 baseline 是幾秒前錄的
                             # ——只存年齡，不存「算不算過期」的判斷（門檻
                             # 由 monitor.js 決定，將來可能改）
+    sensors_seen,           # ""|"A"|"B"|"AB"，選填；⚠️ 跟 /meta 的同名欄位
+                            # 同值域、不同涵蓋範圍——見下方說明，涵蓋的是
+                            # 「這一筆 trial 期間」不是整個 session
     quality ∈ {ok, low, rejected}
 ```
 
@@ -534,6 +538,22 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
 > 這條線之前的舊檔」，而且不會有任何東西變紅——這正是這個欄位存在的
 > 理由。呼叫端只要這個 session 真的跑過監測，就該無條件寫入這個欄位
 > （包含 `""`），不是「有看到才給」。
+>
+> 🔴 **`/trial_NNN` 也有一個同名的 `sensors_seen`，同值域、不同涵蓋範圍
+> ——兩者不是同一件事，不可互相取代：**
+>
+> | 位置 | 涵蓋範圍 |
+> |---|---|
+> | `/meta` 的 `sensors_seen` | **到 baseline 為止**（`/meta` 在 baseline 當下寫入，之後不會更新） |
+> | `/trial_NNN` 的 `sensors_seen` | **這一筆 trial 錄製期間** |
+>
+> 真板子的感測器接頭會在錄製途中隨機斷線、且沒有重置線可以重打
+> （硬體限制，不是軟體 bug）——`/meta` 只在 baseline 當下寫死一次，
+> 沒辦法反映 session 中途才發生的斷線；只有逐筆的 trial attr 才能記錄
+> 「這一筆到底是哪幾顆感測器真的有送資料」。**兩者不一致是正常且有意義
+> 的**：`/meta` 顯示 `"AB"`、某一筆 trial 顯示 `"A"`，就是「baseline 之後
+> B 中途掉線了」的直接證據，`E05` 事後要靠這個分辨哪些 trial 資料完整、
+> 哪些只有半邊。
 >
 > **`mode` 與 `speaking_mode` 是兩條不同的軸，不可共用一個欄位。**
 > - `mode`：**session／面板模式**（`quiz`、`record`…），關於**流程**
@@ -1077,7 +1097,8 @@ bridge 每秒比一次 mtime，**改完存檔即時生效，不需重啟**。
 > **不另外發明規則**。
 >
 > **`CONFIRM` 是 Hold-to-Record（`B12`）專用的狀態**：按住時間短於 0.3 s
-> 或超過 5 s 時進入。此時資料**已算好但尚未落盤**，等
+> 或超過 4 s 時進入（上限原為 5 s，2026-08-26 依使用者要求改為 4 s）。
+> 此時資料**已算好但尚未落盤**，等
 > `confirm_keep()`（還是要存）或 `discard_pending()`（跳過此詞）決定。
 > 這與 `B11` 「放棄的 trial 完全不落盤，不要寫了再刪」一致——
 > **不是「先存再標記警告」，是「先不存，決定要留才存」。**

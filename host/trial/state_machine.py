@@ -9,7 +9,7 @@ IDLE --start_trial()--> PROMPT(1.5s) --> COUNTDOWN(0.5s) --> CAPTURE(2.0s)
 
 Hold-to-record 模式（B12，使用者按住開始、放開結束，取代固定 2.0s）：
 ```
-IDLE --hold_start()--> CAPTURE --hold_stop()--+-- [0.3s,5s] 內 --> SAVE --> REST(1.5s) --> IDLE
+IDLE --hold_start()--> CAPTURE --hold_stop()--+-- [0.3s,4s] 內 --> SAVE --> REST(1.5s) --> IDLE
                                                +-- 超出範圍 --> CONFIRM --confirm_keep()--> SAVE --> REST --> IDLE
                                                                         --discard_pending()--> IDLE
 ```
@@ -72,7 +72,7 @@ VALID_QUALITY_VALUES = ("ok", "low", "rejected")
 HOLD_PRE_ROLL_US = 300_000    # 回溯：反應時間 ~200ms + 緩衝，見 B12.md
 HOLD_POST_ROLL_US = 200_000
 HOLD_MIN_DURATION_S = 0.3     # 短於這個通常是誤觸
-HOLD_MAX_DURATION_S = 5.0     # 長於這個通常是忘記放開
+HOLD_MAX_DURATION_S = 4.0     # 長於這個通常是忘記放開（使用者要求：樣板不超過 4 秒，2026-08-26）
 
 
 class TrialState(str, Enum):
@@ -464,7 +464,7 @@ class TrialStateMachine:
         `B04` 的 `clock_residual_p95` 差不多）。呼叫端／下游不要把它當成
         跟 ToF/mic 原生時間戳一樣精確。
 
-        時長在 `[0.3, 5.0]` 秒內直接落盤（跟固定視窗模式一樣同步寫檔）。
+        時長在 `[0.3, 4.0]` 秒內直接落盤（跟固定視窗模式一樣同步寫檔）。
         超出範圍**不自動存也不自動丟棄**——轉進 `CONFIRM` 狀態，資料留在
         記憶體，由 `confirm_keep()`/`discard_pending()` 決定（B12.md
         「超出範圍時警示並詢問是否保留」）。

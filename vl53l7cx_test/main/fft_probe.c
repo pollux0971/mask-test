@@ -55,5 +55,16 @@ void fft_probe_run(void)
              FFT_PROBE_N, FFT_PROBE_EXPECT_BIN, FFT_PROBE_BIN_TOLERANCE, peak_bin,
              bin_ok ? "OK" : "MISMATCH", (long long)dt_us);
 
-    dsps_fft2r_deinit_fc32();
+    /* No dsps_fft2r_deinit_fc32() here: the twiddle/bit-rev tables it
+     * allocates are a single global in esp-dsp (dsps_fft_w_table_fc32 /
+     * dsps_fft2r_ram_rev_table), shared with bone_mic.c's own FFT (also
+     * N=512). Deiniting after boot-time-only use was harmless when nothing
+     * else had claimed the tables yet, but this function is now also
+     * reachable from a live command (FFTPROBE) after mic_task has already
+     * initialised and is actively using them -- freeing dsps_fft2r_ram_rev_table
+     * out from under mic_task's next dsps_bit_rev_fc32() call would be a
+     * use-after-free. Leaving init'd is safe either way: at boot this just
+     * means mic_task's own dsps_fft2r_init_fc32() call later becomes a
+     * cheap no-op (already-initialised check), and via command it never
+     * touches state mic_task doesn't already own for its own lifetime. */
 }

@@ -11,6 +11,7 @@
 
 #include "bone_mic.h"
 #include "vl53l7cx_test.h"
+#include "fft_probe.h"
 
 static const char *TAG = "uart_cmd";
 
@@ -264,6 +265,11 @@ static void uart_cmd_task(void *arg)
         } else if (sscanf(cmd, "REC:%d", &seconds) == 1 && seconds > 0 && seconds <= 30) {
             ESP_LOGI(TAG, "recording request: %ds", seconds);
             bone_mic_request_recording((uint32_t)seconds);
+        } else if (strcmp(cmd, "FFTPROBE") == 0) {
+            /* A10 diagnostic, not part of CONTRACTS.md #1.2 -- one-shot,
+             * no state change, safe to run anytime after boot (see
+             * fft_probe.c for why it no longer deinits shared FFT state). */
+            fft_probe_run();
         } else {
             ESP_LOGW(TAG, "unrecognised command: '%s'", cmd);
         }

@@ -638,7 +638,7 @@ def test_hold_longer_than_max_goes_to_confirm_not_saved(tmp_path):
     sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
 
     hold_start_t_us = 10_000_000
-    hold_stop_t_us = hold_start_t_us + 6_000_000  # 按了 6 秒，> 5s 門檻
+    hold_stop_t_us = hold_start_t_us + 6_000_000  # 按了 6 秒，> 4s 門檻
     _feed_tof(aligner, "A", hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
     _feed_tof(aligner, "B", hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
     _feed_mic(sm, hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
@@ -648,6 +648,40 @@ def test_hold_longer_than_max_goes_to_confirm_not_saved(tmp_path):
 
     assert event["state"] == "CONFIRM"
     assert event["warning"] == "too_long"
+
+
+def test_hold_max_duration_is_4s_not_5s(tmp_path):
+    """使用者要求（2026-08-26）：樣板不超過 4 秒，`HOLD_MAX_DURATION_S`
+    從 5.0 改成 4.0。鎖住新門檻本身：4.5 秒（曾經合法，5.0 秒門檻下會直接
+    存檔）現在必須落在 CONFIRM，3.9 秒（新門檻內）必須直接存檔。"""
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
+
+    hold_start_t_us = 10_000_000
+    hold_stop_t_us = hold_start_t_us + 4_500_000  # 4.5 秒：新門檻下太長，舊門檻(5s)下合法
+    _feed_tof(aligner, "A", hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+    _feed_tof(aligner, "B", hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+    _feed_mic(sm, hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+
+    sm.hold_start(device_t_us=hold_start_t_us)
+    event = sm.hold_stop(device_t_us=hold_stop_t_us)
+    assert event["state"] == "CONFIRM"
+    assert event["warning"] == "too_long"
+
+
+def test_hold_3_9s_still_saves_directly(tmp_path):
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
+
+    hold_start_t_us = 10_000_000
+    hold_stop_t_us = hold_start_t_us + 3_900_000  # 3.9 秒：在新的 4s 門檻內
+    _feed_tof(aligner, "A", hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+    _feed_tof(aligner, "B", hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+    _feed_mic(sm, hold_start_t_us - 400_000, hold_stop_t_us + 300_000)
+
+    sm.hold_start(device_t_us=hold_start_t_us)
+    events = sm.hold_stop(device_t_us=hold_stop_t_us)
+    assert events[0]["state"] == "SAVE"
 
 
 def test_confirm_keep_saves_the_pending_capture(tmp_path):

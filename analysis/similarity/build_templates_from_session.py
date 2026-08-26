@@ -64,10 +64,19 @@ def _aligner_for_trial(trial):
     return aligner
 
 
+# 低於這個覆蓋率才值得讓使用者看到——**不是拒絕的門檻**。真機上 ToF-A
+# 會間歇性斷線（接頭接觸不良，2026-08-26 現場確認，沒有重置線可以重打，
+# 4 小時 E05 錄製過程中隨時可能再發生）；`union_min` 融合的整個設計前提
+# 就是一顆感測器可能瞎掉，這裡不擅自決定「少一顆就丟掉這筆樣板」，只負責
+# 讓這件事被看見（見 host/features/live_pipeline.py 的 SensorCoverage）。
+LOW_COVERAGE_WARN_THRESHOLD = 0.9
+
+
 def build_template_vector(session, trial):
-    """One trial -> one (T,104) template vector, via the exact same
-    Aligner + live_pipeline path POST /recognize uses (bridge_server.py's
-    _handle_recognize / _frames_from_live_session / _frames_from_stored_trial)."""
+    """One trial -> one (T,104) template vector + its SensorCoverage, via
+    the exact same Aligner + live_pipeline path POST /recognize uses
+    (bridge_server.py's _handle_recognize / _frames_from_live_session /
+    _frames_from_stored_trial)."""
     if trial.mel is None or trial.mel_t_us is None:
         raise ValueError(f"{trial.key}: 沒有 mel/mel_t_us（選填欄位，這筆錄音當下 Mel 未開啟），無法組樣板")
 
@@ -82,32 +91,57 @@ def build_template_vector(session, trial):
     frames = list(aligner.frames(t_start, t_end))
 
     query = assemble_query_from_aligned_frames(frames, mu_A, sigma_A, mu_B, sigma_B)
-    return query.data  # fixed T=24 -- matches RecognitionService's default dist_method="cosine"
+    return query.data, query.coverage  # .data: fixed T=24 -- matches RecognitionService's default dist_method="cosine"
 
 
 def build_templates(sessions, require_quality=("ok", "low")):
-    """回傳 (templates_by_class, provenance, skipped)。
+    """回傳 (templates_by_class, provenance, skipped, coverage_warnings)。
 
-    provenance: {label: [{"session": path, "trial": trial_key}, ...]} ——
-    使用者會錄好幾次 session，這是唯一能回答「這批樣板哪些來自哪次錄製」
-    的地方，分不出來的話發現某次錄壞了也沒辦法只重錄那一批。
+    provenance: {label: [{"session": path, "trial": trial_key, "coverage": {...}}, ...]} ——
+    使用者會錄好幾次 session，這是唯一能回答「這批樣板哪些來自哪次錄製、
+    每筆當下感測器覆蓋率如何」的地方，分不出來的話發現某次錄壞了也沒辦法
+    只重錄那一批。
 
     skipped: [(trial_key, reason), ...] —— 逐筆容錯（跟 run_all.py 的
     build_feature_seqs() 同一種紀律：一筆組不出來就跳過並記錄原因，不是
-    整批放棄），但**不重用**那支函式本身，理由見模組 docstring。
+    整批放棄），但**不重用**那支函式本身，理由見模組 docstring。這只在
+    InsufficientFramesError（整段完全沒有交集）時發生——單純覆蓋率偏低
+    不會讓一筆被跳過，見下面 coverage_warnings。
+
+    coverage_warnings: [str, ...] —— 人話警告，某筆 trial 某個感測器的覆蓋
+    率偏低（低於 LOW_COVERAGE_WARN_THRESHOLD）。**那筆樣板依然被納入**——
+    低覆蓋率不是拒絕的理由，只是讓使用者知道，這批樣板裡有哪幾筆可能因為
+    感測器斷線而失真。
     """
     templates_by_class = {}
     provenance = {}
     skipped = []
+    coverage_warnings = []
     for session, trial in usable_trials(sessions, require_quality=require_quality):
         try:
-            vec = build_template_vector(session, trial)
+            vec, coverage = build_template_vector(session, trial)
         except (ValueError, InsufficientFramesError) as exc:
             skipped.append((trial.key, str(exc)))
             continue
         templates_by_class.setdefault(trial.label, []).append(vec)
-        provenance.setdefault(trial.label, []).append({"session": str(session.path), "trial": trial.key})
-    return templates_by_class, provenance, skipped
+        provenance.setdefault(trial.label, []).append({
+            "session": str(session.path), "trial": trial.key,
+            "coverage": {
+                "tof_A": round(coverage.fraction("tof_A"), 3),
+                "tof_B": round(coverage.fraction("tof_B"), 3),
+                "mel": round(coverage.fraction("mel"), 3),
+                "usable_fraction": round(coverage.usable_fraction(), 3),
+            },
+        })
+        for key, zh in (("tof_A", "感測器 A"), ("tof_B", "感測器 B"), ("mel", "Mel")):
+            frac = coverage.fraction(key)
+            if frac < LOW_COVERAGE_WARN_THRESHOLD:
+                coverage_warnings.append(
+                    f"{trial.key}（{trial.label}）：{zh} 只在這筆錄音 {frac * 100:.0f}% 的時間內有資料"
+                    f"（其餘時間可能斷線）——這筆樣板還是被納入了，但距離量測可能因此偏移，"
+                    f"準確率若異常可以先檢查這筆"
+                )
+    return templates_by_class, provenance, skipped, coverage_warnings
 
 
 

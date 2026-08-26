@@ -401,7 +401,14 @@ void app_main(void)
             }
             uint8_t ready = 0;
             uint8_t status = vl53l7cx_check_data_ready(&s_dev[i], &ready);
-            if (status == 0 && ready) {
+            if (status != 0) {
+                /* A05: the I2C transaction itself failed (bus down, loose
+                 * connection) -- distinct from get_ranging_data() failing
+                 * below, but was previously silent: nothing incremented,
+                 * $H's drop_A/B stayed frozen, indistinguishable from a
+                 * sensor that never dropped a frame. */
+                s_drop_error[i]++;
+            } else if (ready) {
                 /* Sampled here, not after get_ranging_data(): the I2C
                  * transfer is ~2-4 ms and taking t_us after it would bake
                  * that in as a systematic bias (CONTRACTS.md #1.3). */

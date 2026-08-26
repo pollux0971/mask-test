@@ -31,7 +31,8 @@
 """
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -45,6 +46,75 @@ MIN_USABLE_FRAMES = 2  # assemble_feature_seq()/resample_fixed_length() 的硬�
 
 class InsufficientFramesError(ValueError):
     """可用幀數（三個模態同時 present）低於 MIN_USABLE_FRAMES。"""
+
+
+@dataclass(frozen=True)
+class SensorCoverage:
+    """一次組裝裡，每個模態實際「有資料」的幀數——**不是拒絕的理由，是讓
+    呼叫端自己判斷這筆向量該多信任**（`esp-mask-test-ad` 2026-08-26 的明確
+    要求：真機上 ToF-A 會間歇性斷線，`union_min` 的設計前提本來就是一顆
+    可能瞎掉，這裡不擅自決定「少一顆就拒絕」，只負責讓這件事不再是啞的）。
+
+    `total_frames`：`Aligner` 吐出的原始幀數（含任何模態缺席的那些）。
+    `usable_frames`：三個模態同時 present、真正被拿去組向量的幀數
+    （`assemble_query_from_aligned_frames` 內部已經驗證過 >= `MIN_USABLE_FRAMES`）。
+    `present_frames`：`{"tof_A": n, "tof_B": n, "mel": n}`——各模態單獨
+    present 的幀數（分母是 `total_frames`），跟 `usable_frames`（三者的交集）
+    不同：一顆感測器在整段窗口只活了一半，`present_frames` 看得出來，
+    `usable_frames` 只會告訴你「窗口變窄了」，看不出是哪一顆的問題。
+
+    **實測過的真實風險**（見對應調查報告）：ToF-A 中途斷線但沒有斷到完全
+    掛掉時，`assemble_query_from_aligned_frames` 不會丟例外——它會安靜地
+    只用兩者重疊的那一小段窗口組向量，量出來的距離可能明顯偏移、甚至讓
+    `top1` 選錯類別。`SensorCoverage` 就是讓呼叫端能看見「這一小段」到底
+    有多小，自己決定要不要顯示警告、要不要在 UI 上標示、或要不要照樣用。
+    """
+    total_frames: int
+    usable_frames: int
+    present_frames: Dict[str, int]
+
+    def fraction(self, key: str) -> float:
+        """`key` in {"tof_A", "tof_B", "mel"}。`total_frames == 0` 時回 0.0
+        （沒有任何輸入幀，跟「完全沒訊號」是同一件事，不是除以零的例外）。"""
+        if self.total_frames == 0:
+            return 0.0
+        return self.present_frames.get(key, 0) / self.total_frames
+
+    def usable_fraction(self) -> float:
+        return (self.usable_frames / self.total_frames) if self.total_frames else 0.0
+
+
+@dataclass(frozen=True)
+class QueryAssembly:
+    """`assemble_query_from_aligned_frames()` 的回傳值。`.data`/`.data_raw`/
+    `.slices`/`.t_us`/`.t_us_raw` 直接轉發底下的 `FeatureSeq`——**既有呼叫端
+    （`bridge_server.py` 的 `_handle_recognize`，直接用 `query.data`）完全
+    不用改就能繼續動**，這是刻意的：這條路徑改動時 `bridge_server.py` 不一定
+    歸這一輪的人動。`.coverage` 是新加的欄位，要不要看、看了要怎麼反應由
+    呼叫端自己決定。
+    """
+    feature_seq: FeatureSeq
+    coverage: SensorCoverage
+
+    @property
+    def data(self):
+        return self.feature_seq.data
+
+    @property
+    def data_raw(self):
+        return self.feature_seq.data_raw
+
+    @property
+    def slices(self):
+        return self.feature_seq.slices
+
+    @property
+    def t_us(self):
+        return self.feature_seq.t_us
+
+    @property
+    def t_us_raw(self):
+        return self.feature_seq.t_us_raw
 
 
 def _tof_sample_to_row(sample) -> List[float]:
@@ -68,11 +138,13 @@ def assemble_query_from_aligned_frames(
     cvn: bool = False,
     active_zones_A: Optional[Sequence[int]] = None,
     active_zones_B: Optional[Sequence[int]] = None,
-) -> FeatureSeq:
-    """把一段 `Aligner.frames()` 的輸出組成 `analysis.features.feature_assembly
-    .FeatureSeq`——`.data`（固定 T=`t_fixed`）給 cosine 距離用，`.data_raw`
-    給 DTW 用，跟 `RecognitionService.recognize(query, ...)` 期待的形狀
-    直接對應。
+) -> QueryAssembly:
+    """把一段 `Aligner.frames()` 的輸出組成 `QueryAssembly`——`.data`
+    （固定 T=`t_fixed`）給 cosine 距離用，`.data_raw` 給 DTW 用，跟
+    `RecognitionService.recognize(query, ...)` 期待的形狀直接對應
+    （`QueryAssembly` 轉發這些欄位，舊呼叫端不用改）。`.coverage` 是
+    `SensorCoverage`，見該類別的說明——**少一顆感測器不會讓這裡拒絕，
+    只會讓呼叫端看得到。**
 
     frames: `Aligner.frames(...)` 的輸出（或任何 `AlignedFrame` 序列）。
     baseline_mu_A/sigma_A, baseline_mu_B/sigma_B: 各 (32,)，B10 現場擷取
@@ -84,7 +156,11 @@ def assemble_query_from_aligned_frames(
         `active_zone_indices`）；為 None 時用全部 16 個 zone。
 
     幀數不足（三個模態同時 present 的幀 < `MIN_USABLE_FRAMES`）時丟
-    `InsufficientFramesError`，不猜測、不補值。
+    `InsufficientFramesError`，不猜測、不補值——這是唯一會擋下的情況
+    （整段完全沒交集）；**一顆感測器只是「間歇性」有資料，不會觸發這個
+    例外，向量照樣組得出來，這正是 `SensorCoverage` 存在的理由**：真機上
+    ToF-A 中途斷線的實測顯示，這種情況下距離量測會明顯偏移、`top1` 可能
+    選錯類別，而且完全不會有任何例外或錯誤訊息。
     """
     usable = _extract_usable_frames(frames)
     if len(usable) < MIN_USABLE_FRAMES:
@@ -92,6 +168,16 @@ def assemble_query_from_aligned_frames(
             f"三個模態同時有資料的幀只有 {len(usable)} 個，至少需要 {MIN_USABLE_FRAMES} 個"
             f"（原始輸入 {len(frames)} 幀）"
         )
+
+    coverage = SensorCoverage(
+        total_frames=len(frames),
+        usable_frames=len(usable),
+        present_frames={
+            "tof_A": sum(1 for f in frames if f.tof_A_present),
+            "tof_B": sum(1 for f in frames if f.tof_B_present),
+            "mel": sum(1 for f in frames if f.mel_present),
+        },
+    )
 
     tof_a_raw = np.array([_tof_sample_to_row(f.tof_A) for f in usable], dtype=np.float64)
     valid_a = np.array([f.tof_A.valid for f in usable], dtype=bool)
@@ -109,4 +195,5 @@ def assemble_query_from_aligned_frames(
     # 方式（目前 RecognitionService 的 slices 假設全部 zone 都在）,
     # 不在這裡重複驗證。
 
-    return assemble_feature_seq(tof_a_z, tof_b_z, mel_cmn, t_us, t_fixed=t_fixed)
+    feature_seq = assemble_feature_seq(tof_a_z, tof_b_z, mel_cmn, t_us, t_fixed=t_fixed)
+    return QueryAssembly(feature_seq=feature_seq, coverage=coverage)
