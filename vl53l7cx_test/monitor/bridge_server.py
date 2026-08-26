@@ -250,6 +250,30 @@ def handle_parsed_event(parsed):
     sse = to_sse_event(parsed)
     if sse:
         broadcaster.publish(sse)
+    publish_status_if_changed()
+
+
+def publish_status_if_changed():
+    """Emit a `status` event whenever the negotiated state actually changes.
+
+    Not only on `$STATUS` lines. A v1 device sends exactly one, at boot, and
+    a panel that connects a moment later would never learn the link is
+    degraded -- so its record button would stay enabled on a link whose data
+    has no timestamps and cannot be verified, which is the one thing B02
+    exists to prevent. The parser works the version out from the data lines
+    within a frame or two; this makes that reach the panel.
+    """
+    parser = protocol_state.get("parser")
+    if parser is None:
+        return
+    state = parser.state()
+    signature = (state.get("protocol_version"), state.get("degraded"),
+                 state.get("version_mismatch"), state.get("recording_allowed"),
+                 state.get("dim"), state.get("fw"), state.get("mel"))
+    if signature == protocol_state.get("last_status_signature"):
+        return
+    protocol_state["last_status_signature"] = signature
+    broadcaster.publish({"type": "status", "source": link_source["value"], **state})
 
 
 def observe_for_quality(event):
@@ -617,9 +641,11 @@ def build_session_meta_base(info, tof_t_us):
         "fw_sha": state.get("fw") or "unknown",
         "proto_version": state.get("protocol_version") or 2,
         "tof_dim": current_resolution["dim"],
-        # Written into the file itself, not just announced over SSE: the
-        # HDF5 outlives the connection, and by analysis time nobody can tell
-        # what it was recorded against.
+        # Passed, but currently dropped: SessionWriter._write_meta only
+        # writes REQUIRED_META_KEYS, so recording the link source in the
+        # file needs a T02 schema addition. Left here deliberately -- the
+        # value is correct and the moment `source` joins the schema this
+        # starts working with no change on this side.
         "source": link_source["value"],
     }
     meta.update(_clock_meta())
@@ -879,6 +905,7 @@ def serial_reader(port, baud, allow_v1=False):
             # belongs to one link, and reconnecting after a reflash means
             # re-reading the new firmware's $STATUS from scratch.
             protocol_state["parser"] = ProtocolParser(allow_v1=allow_v1)
+            protocol_state["last_status_signature"] = None
             print(f"[bridge] serial open: {port} @ {baud}")
             broadcaster.publish({"type": "link", "state": "up"})
             # Ask the device to identify itself right away. The board boots

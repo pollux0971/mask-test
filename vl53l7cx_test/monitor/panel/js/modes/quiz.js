@@ -637,6 +637,13 @@ registerMode("quiz", (() => {
     // reject isn't counted -- it's "no match", not a candidate guess.
     const n = words.length || 1;
     baselineEl.textContent = `隨機基準 ${(100 / n).toFixed(1)}%`;
+
+    // C20: the matrix's axes and the posthoc dropdown both come from the
+    // same vocab, so they have to refresh together whenever it (re)loads --
+    // guarded because init()'s synchronous wiring runs before this async
+    // load resolves in the normal case, but not guaranteed to.
+    if (posthocSelectEl) populateMatrixSelect();
+    if (matrixCanvasEl) renderMatrix();
   }
 
   async function loadVocab() {
@@ -745,6 +752,27 @@ registerMode("quiz", (() => {
             <div class="quiz-bars" data-bars="fused"></div>
           </div>
         </div>
+
+        <div class="quiz-matrix-section">
+          <div class="quiz-matrix-controls">
+            <span class="quiz-control-label">標記模式</span>
+            ${MARKING_MODES.map((m) => `<button class="quiz-mode-btn" data-marking-mode-btn data-marking-mode="${m.key}">${m.label}</button>`).join("")}
+            <span class="quiz-matrix-count mono" data-matrix-count>已記錄 0 筆</span>
+            <button class="quiz-mode-btn" data-matrix-export-btn>匯出 PNG</button>
+            <button class="quiz-mode-btn" data-matrix-clear-btn>清除矩陣</button>
+          </div>
+          <div class="quiz-assigned-prompt" data-assigned-prompt style="display:none">
+            系統指定：請念 <span class="quiz-assigned-word mono" data-assigned-word>—</span>
+          </div>
+          <div class="quiz-posthoc-controls" data-posthoc-controls style="display:none">
+            <span class="quiz-control-label">這次實際上是</span>
+            <button class="quiz-mode-btn quiz-posthoc-correct" data-posthoc-correct-btn>✓ 正確</button>
+            <select class="quiz-posthoc-select" data-posthoc-select></select>
+          </div>
+          <div class="quiz-matrix-wrap">
+            <canvas class="quiz-matrix-canvas" data-matrix-canvas></canvas>
+          </div>
+        </div>
       `;
 
       cardsEl = root.querySelector("[data-cards]");
@@ -785,6 +813,31 @@ registerMode("quiz", (() => {
       ringFillEl = root.querySelector("[data-ring-fill]");
       retryBtn = root.querySelector("[data-retry-btn]");
       retryBtn.addEventListener("click", onRecognizeClick);
+
+      // --- C20: confusion matrix wiring ---
+      markingModeEls = Array.from(root.querySelectorAll("[data-marking-mode-btn]"));
+      assignedPromptEl = root.querySelector("[data-assigned-prompt]");
+      assignedWordEl = root.querySelector("[data-assigned-word]");
+      posthocControlsEl = root.querySelector("[data-posthoc-controls]");
+      posthocCorrectBtn = root.querySelector("[data-posthoc-correct-btn]");
+      posthocSelectEl = root.querySelector("[data-posthoc-select]");
+      matrixCanvasEl = root.querySelector("[data-matrix-canvas]");
+      matrixCountEl = root.querySelector("[data-matrix-count]");
+      matrixExportBtn = root.querySelector("[data-matrix-export-btn]");
+      matrixClearBtn = root.querySelector("[data-matrix-clear-btn]");
+
+      markingModeEls.forEach((el) => el.addEventListener("click", () => setMarkingMode(el.dataset.markingMode)));
+      posthocCorrectBtn.addEventListener("click", () => recordMatrixEntry(predictedLabelFor(lastTriResult, currentW)));
+      posthocSelectEl.addEventListener("change", () => recordMatrixEntry(posthocSelectEl.value));
+      matrixExportBtn.addEventListener("click", exportMatrixPNG);
+      matrixClearBtn.addEventListener("click", () => {
+        matrixEntries = [];
+        matrixCountEl.textContent = "已記錄 0 筆";
+        renderMatrix();
+      });
+
+      setMarkingMode("posthoc");
+      renderMatrix();
     },
 
     onData(evt) {

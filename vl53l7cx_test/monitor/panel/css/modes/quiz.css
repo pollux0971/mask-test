@@ -402,3 +402,73 @@
   outline-offset: 2px;
   border-radius: 4px;
 }
+
+/* --- C20: real-time confusion matrix --- */
+.quiz-matrix-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex-shrink: 0;
+  padding: 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.quiz-matrix-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.quiz-matrix-count {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* Same warning-banner language as .quiz-disagree-banner: a system-assigned
+   prompt is also "pay attention to this", not routine status text. */
+.quiz-assigned-prompt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-radius: 8px;
+  padding: 8px 12px;
+  width: fit-content;
+}
+.quiz-assigned-word {
+  font-size: 18px;
+}
+
+.quiz-posthoc-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.quiz-posthoc-correct {
+  color: var(--good);
+  border-color: var(--good);
+}
+.quiz-posthoc-select {
+  font-family: inherit;
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.quiz-matrix-wrap {
+  overflow-x: auto;
+}
+.quiz-matrix-canvas {
+  display: block;
+}

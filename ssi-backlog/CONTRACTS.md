@@ -21,6 +21,7 @@
 | 2026-08-26 | 1. 序列埠協定 v2 | `A15`：`$H` 新增 `bw_bytes_since_last:u32`（第 7 個資料欄），韌體端在 `uart_out.c` 累計、`tof_print_heartbeat()` 每次回報自上次 `$H` 以來送出的位元組數。**⚠️ 破壞性變更且尚未修好**：`host/capture/protocol.py` 的 `_parse_heartbeat()` 目前硬性要求 `len(parts) == 7`（對應舊格式），本變更讓每行 `$H` 變成 8 段，在該函式更新（放寬成 `>= 7` 或改成 key=value）之前，**每一行 `$H` 都無法解析**，不只是新欄位讀不到。`B03`/`dropwatch.py` 的掉幀判定不受影響（純靠 `seq` 缺口，不吃 `$H`），但 heap／溫度／新頻寬欄位在此之前對主機端全部不可見 | `A15`, `B01`, `B03`, `C04` | ⬜ 待通知（見完成回報） |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 明訂 SSE 的 `mel.bands` 是**已解碼的浮點 log10 值**（約 -10~0），**不是**線上 `$F` 的 `int16 = round(log_mel×100)`（約 -1000~0）——parser 在轉發前就除回浮點了。`C08` 照 §3.1 的線上格式寫色階，結果整張瀑布圖純黃一片、看不出頻譜結構，**而程式邏輯完全正確，只有真的打開瀏覽器看才會發現**。通則：§1 是線上格式、§4.2 是解碼後格式，消費端一律以 §4.2 為準 | `B01`, `B19`, `C08`, `C19` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `status` 事件新增 **`source`**（`live`/`mock`/`replay-log`/`replay-session`），由 bridge 的 CLI 旗標明示，**不可推測**（pty 與真實 UART 分辨不出）。原因：`E05` 要錄 4 小時，對著 mock 錄會產出「裝滿合成資料卻標記成真實量測」的 HDF5，而 `D13`/`D16`/`D17`/`D19` 會拿它跑出漂亮的結論且**沒有任何一層會發現**。`source`（連線層級）與 `replay: true`（單一事件層級）是不同層，不可互相取代 | `T04`, `T05`, `B17`, `B19`, `C04`, `E05` | 是 |
+| 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 更正 `CONFIRM` 的端點路徑為 `POST /trial/confirm` 與 `/trial/discard`（原寫成 `/trial/confirm/keep`、`/trial/confirm/discard`，與實作不符）。理由：所有 trial action 是同一層的兄弟，對應狀態機方法名；把 `discard` 放進 `confirm/` 底下語意不通。另新增 `POST /trial/reject {"trial_idx":N}`（`C14`：棄用**已存檔**的 trial，與 `abort`/`discard` 不同層——棄用不是刪除，資料留著只改 `quality`，`D12` 需要知道錄壞了幾次） | `B11`, `B19`, `C12`, `C14`, `D12` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 新增 `POST /trial/confirm/keep` 與 `/trial/confirm/discard`（`CONFIRM` 狀態原本只定義了語意沒有端點，`C12` 實作時提案）。前端鍵盤慣例 Enter=keep／ESC=discard——ESC 在整個錄製畫面上一律代表「不要、丟掉」，不另外發明規則 | `B12`, `B19`, `C12`, `C14` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 `trial` 事件新增 `next_label`（只在 `IDLE`/`REST`/`SAVE` 出現）。原因：Hold-to-Record 在使用者按下之前，前端完全不知道下一個要念哪個詞，只能盲按（`C12` 實作時發現）。詞指標改在 `_do_save()` 之前前進，`SAVE`/`REST` 才能 peek 到「下一個」。`abort` 讓它前進、`redo` 不會。另 `TrialStateMachine` 新增 `first_trial_idx` 參數，避免與 baseline 的 `trial_000` 撞號 | `B11`, `B12`, `B19`, `C12`, `C13` | 是 |
 | 2026-08-26 | 4. HTTP / SSE 介面 | §4.2 定義 `session` 事件在 `state:"baseline"` 時的 `progress` 形狀（`elapsed_s`/`remaining_s`/`duration_s`/`live_sigma_A|B`，完成時帶 `outcome`），並新增 `POST /session/baseline/retry`。原本 `progress` 只是佔位符沒有形狀，`C11` 實作時提案。前端須用 `elapsed_s` 重新對時；`live_sigma_*` 為 null 時必須明示「倒數是本地估計」不可假裝正常 | `B10`, `B19`, `C11`, `C12` | 是 |
@@ -925,11 +926,26 @@ bridge 每秒比一次 mtime，**改完存檔即時生效，不需重啟**。
 >
 > 另有 `POST /session/baseline/retry`（重錄用，`C11` 的重新擷取按鈕）。
 >
+> **棄用「已存檔」的 trial**（`C14`）：
+> ```
+> POST /trial/reject {"trial_idx": N}   → mark_current_trial_saved_quality(..., "rejected")
+> ```
+> ⚠️ 與 `abort`／`discard` **不同層**：那兩個是「錄製當下、還沒落盤」，
+> 這個是「**已經寫進 HDF5 之後**才決定不要」。
+> **棄用不是刪除**——資料留著，只改 `quality` attr，
+> 因為 `D12` 的 CV 實驗需要知道「這次戴的時候錄壞了幾次」。
+>
 > **`CONFIRM` 狀態的兩個端點**（`C12` 提案，已採納）：
 > ```
-> POST /trial/confirm/keep      → confirm_keep()    仍然要存
-> POST /trial/confirm/discard   → discard_pending() 跳過此詞（語意同 abort）
+> POST /trial/confirm   → confirm_keep()     仍然要存
+> POST /trial/discard   → discard_pending()  跳過此詞（語意同 abort）
 > ```
+>
+> ⚠️ **原本寫成 `/trial/confirm/keep` 與 `/trial/confirm/discard` 是錯的**，
+> 已改成與實作一致。理由：`start` / `hold/start` / `hold/stop` /
+> `confirm` / `discard` / `abort` / `redo` **全部是同一層的兄弟**，
+> 對應狀態機的方法名。把 `discard` 放進 `confirm/` 命名空間底下語意不通——
+> **「丟棄」不是「確認」的一種**。
 > 前端鍵盤慣例：**Enter = keep、ESC = discard**。
 > ESC 在整個錄製畫面上一律代表「不要、丟掉」（一般狀態下是 `abort`），
 > **不另外發明規則**。

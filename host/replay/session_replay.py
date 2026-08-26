@@ -76,6 +76,7 @@ def _trial_events(name: str, grp: h5py.Group) -> List[ReplayEvent]:
         for sensor, values, valid in (("A", tof_A, tof_valid_A), ("B", tof_B, tof_valid_B)):
             events.append(ReplayEvent(t_us, idx, {
                 "type": "tof", "sensor": sensor, "seq": i, "t_us": t_us,
+                "dim": n_zones,
                 "dist": _floats_to_wire_ints(values[i, :n_zones]),
                 "signal": _floats_to_wire_ints(values[i, n_zones:]),
                 "valid": valid[i].astype(bool).tolist(),
@@ -86,7 +87,9 @@ def _trial_events(name: str, grp: h5py.Group) -> List[ReplayEvent]:
     for i, t_us in enumerate(mic_t_us):
         events.append(ReplayEvent(int(t_us), idx, {
             "type": "mic", "seq": i, "t_us": int(t_us),
-            "rms": float(mic_rms[i]), "peak": int(mic_peak[i]),
+            # 線協定的 rms 是整數（CONTRACTS #1.1），HDF5 裡存成 float32
+            # 只是儲存精度考量——回放要重現 live 的事件形狀，得轉回整數。
+            "rms": int(round(float(mic_rms[i]))), "peak": int(mic_peak[i]),
         }))
 
     if "mel" in grp:

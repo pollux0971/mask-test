@@ -179,7 +179,24 @@ def _check_dual_matrix_agreement(by_key, extras):
     if isinstance(ablation, dict) and ablation.get("passed") is not None:
         votes["D19 雙矩陣消融"] = bool(ablation["passed"])
 
-    if len(votes) < 2 or len(set(votes.values())) < 2:
+    if len(votes) < 2:
+        # **票數不足要講出來，不能安靜地回空的。**
+        # 開發時真的踩到：`D13` 那一票因為讀錯鍵名而永遠是 `None`，交叉檢查
+        # 就永遠只有一票、永遠不會發現矛盾——而報告看起來完全正常。
+        # 「這個檢查沒有資料」跟「這個檢查通過了」必須分得出來。
+        have = sorted(votes) or ["（無）"]
+        return [{
+            "topic": "第二顆 ToF 是否帶來額外資訊",
+            "severity": "note",
+            "sources": sorted(votes),
+            "message": (
+                f"**這個交叉檢查目前只有 {len(votes)} 個來源**（{'、'.join(have)}），"
+                "至少要 2 個才比得出矛盾。`D13` 的互補性、`D16` 的資訊增益、"
+                "`D19` 的消融應該三者都在——缺的那幾個請確認有沒有跑起來。"
+                "**「沒有資料」不等於「沒有矛盾」。**"
+            ),
+        }]
+    if len(set(votes.values())) < 2:
         return []
 
     yes = [name for name, v in votes.items() if v]

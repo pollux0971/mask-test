@@ -340,6 +340,11 @@ def test_baseline_meta_carries_the_measured_clock_block(rig):
     if status != 200:
         pytest.skip(f"baseline quality gate rejected the synthetic scene: {body.get('reason')}")
 
+    # The session writer holds the file open (HDF5 takes an exclusive
+    # lock), so close the session before reading it back.
+    assert _request(rig, "POST", "/session/end")[0] == 200
+    time.sleep(0.5)
+
     sessions = list((rig.workdir / "sessions").glob("*.h5"))
     assert sessions, "no session file was written"
     newest = max(sessions, key=lambda p: p.stat().st_mtime)
@@ -349,6 +354,12 @@ def test_baseline_meta_carries_the_measured_clock_block(rig):
     # and clock_sync_confirmed stays False. Either is acceptable -- what is
     # not acceptable is a plausible number with confirmed=True behind it.
     assert "clock_sync_confirmed" in meta
+    # NOT asserted: that `source` reached the file. SessionWriter._write_meta
+    # writes only REQUIRED_META_KEYS, so the key the bridge passes is dropped
+    # silently -- recording the link source in the HDF5 needs a T02 schema
+    # change, not a bridge change. It does reach the panel over SSE (see
+    # test_status_declares_what_the_link_is_connected_to); the gap is that
+    # the file itself cannot say what it was captured against.
     if meta["session_start_rtt_min_us"] != -1:
         assert meta["session_start_device_us"] != -1
         assert meta["session_start_rtt_min_us"] >= 0

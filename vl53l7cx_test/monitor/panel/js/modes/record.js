@@ -61,11 +61,12 @@
 // real 0.5s window; flagged in the completion report rather than
 // fabricating a 3-second countdown the backend doesn't actually run.
 //
-// ⚠ No documented HTTP endpoint exists yet for CONFIRM's confirm_keep()/
-// discard_pending() (only /trial/hold/start|stop and /trial/abort|redo are
-// in CONTRACTS.md's table). This file calls proposed endpoints
-// POST /trial/confirm/keep and POST /trial/confirm/discard -- same
-// propose-now-ratify-later pattern as C11's baseline progress shape.
+// CONFIRM's two endpoints are POST /trial/confirm (keep) and
+// POST /trial/discard (skip this word) -- flat siblings of start/hold-
+// start/hold-stop/abort/redo, matching TrialStateMachine's method names.
+// (This file originally proposed nested /trial/confirm/keep|discard for
+// C12; corrected per the dispatcher after C14 found the real wiring used
+// the flat form -- discard isn't a kind of confirm.)
 //
 // C13 adds: progress bar + n/N + ETA, a per-label count bar chart, a
 // recent-10 list with quality lights, and a click-to-preview overlay
@@ -103,6 +104,29 @@
 // "每詞目標次數" (target reps per label) defaults to 8, matching E06's
 // own "8 詞 × 8 樣板 + 靜止 × 8 = 72 筆" convention -- editable in the UI
 // since nothing in CONTRACTS freezes this number for every session.
+//
+// C14 adds: 棄用 (reject, keeps the HDF5 data but flags quality=rejected)
+// and 重錄 (redo-a-saved-trial: reject + queue the same label for the very
+// next real hold_start() press) on each of the recent-10 items, plus an
+// R-key shortcut for "redo the last one" while IDLE/REST.
+//
+// Two things flagged in the C14 completion report, both since resolved by
+// the dispatcher:
+//   1. The confirm/discard path mismatch above -- CONTRACTS.md corrected to
+//      match bridge_server.py's flat /trial/confirm|/trial/discard.
+//   2. "棄用" needed an HTTP action for TrialStateMachine's already-existing
+//      mark_current_trial_saved_quality() -- proposed as POST /trial/reject
+//      {"trial_idx": N} (still degrades to "後端路由尚未接上" until ed adds
+//      the route), accepted into CONTRACTS.md §4.2.
+// A third item (host/storage/manifest.py excluding rejected by default) was
+// outside this file's scope and is handled separately, not here.
+//
+// "重錄使用相同 label" is done with zero new wire shape beyond what ed
+// already wired: /trial/hold/start already accepts an optional
+// {"label": ...} body override (bridge_server.py: body.get("label")). This
+// file can't queue a label ahead of time -- there's no such wire concept --
+// so it remembers the intent locally (pendingRequeueLabel) and supplies it
+// on the user's next real hold_start() press, one-shot.
 
 import { registerMode } from "../shell.js";
 import { dataStore } from "../bus.js";
@@ -614,11 +638,65 @@ registerMode("record", (() => {
       return;
     }
     els.recentList.innerHTML = recentTrials.map((t) => `
-      <div class="recent-item" data-recent-idx="${t.idx}" tabindex="0" role="button">
+      <div class="recent-item ${t.quality === "rejected" ? "is-rejected" : ""}" data-recent-idx="${t.idx}">
         <span class="quality-dot quality-${t.quality}" title="${t.quality}">${QUALITY_DOT_LABEL[t.quality] || "●"}</span>
-        <span class="recent-label">${t.label}</span>
+        <span class="recent-label" data-recent-open="${t.idx}" tabindex="0" role="button">
+          ${t.label}${t.quality === "rejected" ? ' <span class="rejected-tag">已棄用</span>' : ""}
+        </span>
         <span class="recent-meta mono">#${t.idx} · ${t.n_frames}幀</span>
+        <div class="recent-actions">
+          <button type="button" class="recent-action-btn" data-reject-idx="${t.idx}"
+                  title="標記這筆為壞樣本：資料保留在 HDF5，但 manifest 預設排除">🗑 棄用</button>
+          <button type="button" class="recent-action-btn recent-redo-btn" data-redo-idx="${t.idx}"
+                  title="棄用這筆，下一次按住空白鍵會錄同一個詞（${t.label}）">↺ 重錄</button>
+        </div>
       </div>`).join("");
+  }
+
+  // --- C14: 棄用（reject）與重錄（redo a saved trial） ---------------------
+  //
+  // ⚠ Proposed, not yet wired (grepped bridge_server.py -- no HTTP action
+  // marks an already-*saved* trial's quality; the state machine's own
+  // mark_current_trial_saved_quality() exists precisely for this, per its
+  // own docstring, but nothing calls it from an HTTP handler yet). This
+  // file calls the proposed POST /trial/reject {"trial_idx": N} and
+  // degrades to the standard "後端路由尚未接上" message on 404 -- same
+  // propose-now-ratify-later pattern as every other gap in this file.
+  // Flagged in the completion report, including that adding the route
+  // itself is outside this story's authorized path (bridge_server.py).
+
+  async function rejectTrial(idx) {
+    const t = recentTrials.find((x) => x.idx === idx);
+    if (!t || t.quality === "rejected") return t; // already marked, no-op
+    const ok = await postTrialAction("/trial/reject", { trial_idx: idx });
+    if (!ok) return null;
+    labelCounts[t.label] = Math.max(0, (labelCounts[t.label] || 0) - 1);
+    savedTrialTotal = Math.max(0, savedTrialTotal - 1);
+    t.quality = "rejected";
+    renderProgressDash();
+    renderLabelBars();
+    renderRecentList();
+    return t;
+  }
+
+  async function redoSavedTrial(idx) {
+    const t = recentTrials.find((x) => x.idx === idx);
+    if (!t) return;
+    const label = t.label;
+    if (t.quality !== "rejected") {
+      const rejected = await rejectTrial(idx);
+      if (!rejected) return; // reject failed -- don't queue a requeue on top of an unknown state
+    }
+    // "立刻" 用同一個 label 錄一筆新的：wire protocol 沒有「預先排隊一個
+    // 詞」的機制，只有 hold_start() 呼叫當下的 label 覆寫（body.get("label")，
+    // bridge_server.py 已經支援）。所以這裡只能記住意圖，等使用者真的按下
+    // 空白鍵那一刻才送出 -- 見 triggerHoldStart() 與 pendingRequeueLabel。
+    if (trialState !== "IDLE" && trialState !== "REST") {
+      setTrialError(`目前狀態是 ${trialState}，無法排入重錄——等這個 trial 結束（回到 IDLE/REST）再試`);
+      return;
+    }
+    pendingRequeueLabel = label;
+    renderTrialCard(); // reflect "下一個：<label>（重錄）" immediately, not just on the next real event
   }
 
   function snapshotPreviewFrames(startMs, endMs) {
@@ -784,10 +862,19 @@ registerMode("record", (() => {
       // "顯示下一個詞的預告" (C12.md's REST row) -- IDLE gets the same
       // treatment so Hold-to-Record's very first press also has something
       // to read beforehand, not just after REST once already.
-      els.trialWord.textContent = trialNextLabel || "—";
+      //
+      // C14: a pending "重錄" overrides this -- peek_next_label() reflects
+      // the *normal* cyclic order, which is no longer what the next real
+      // hold_start() call is actually going to send (see
+      // pendingRequeueLabel/triggerHoldStart()). Showing the stale cyclic
+      // word here would make the person say the wrong thing next.
+      els.trialWord.textContent = pendingRequeueLabel || trialNextLabel || "—";
     } else {
       els.trialWord.textContent = trialLabel || "—";
     }
+
+    els.trialRequeueNote.style.display = pendingRequeueLabel && (trialState === "IDLE" || trialState === "REST")
+      ? "block" : "none";
 
     els.trialStateLabel.textContent = TRIAL_STATE_LABEL[trialState] || trialState;
     els.trialIdx.textContent = trialIdx != null ? `#${trialIdx}` : "—";
@@ -832,9 +919,14 @@ registerMode("record", (() => {
     renderTrialCard();
   }
 
-  async function postTrialAction(path) {
+  async function postTrialAction(path, jsonBody) {
     try {
-      const res = await fetch(path, { method: "POST" });
+      const opts = { method: "POST" };
+      if (jsonBody !== undefined) {
+        opts.headers = { "Content-Type": "application/json" };
+        opts.body = JSON.stringify(jsonBody);
+      }
+      const res = await fetch(path, opts);
       if (!res.ok && res.status !== 404) {
         const body = await res.json().catch(() => ({}));
         setTrialError(body.error || `HTTP ${res.status}`);
@@ -855,11 +947,22 @@ registerMode("record", (() => {
     }
   }
 
+  // C14: set by "重錄"/R-key -- the *next* real hold-to-record press should
+  // use this label instead of whatever the state machine's own cyclic order
+  // would give it. One-shot (cleared the moment it's actually used) --
+  // there is no wire-protocol way to "queue" a label ahead of time, only to
+  // override the label a hold_start() call is making *right now* (see
+  // bridge_server.py's body.get("label") passthrough), so this file has to
+  // hold the intent locally until the user's next real keypress supplies it.
+  let pendingRequeueLabel = null;
+
   function triggerHoldStart() {
     if (holdKeyDown) return; // OS key-repeat guard
     holdKeyDown = true;
     ensureAudioCtx(); // arm audio on the same user gesture, before any beep is due
-    postTrialAction("/trial/hold/start");
+    const label = pendingRequeueLabel;
+    pendingRequeueLabel = null;
+    postTrialAction("/trial/hold/start", label != null ? { label } : undefined);
   }
 
   function triggerHoldStop() {
@@ -877,11 +980,17 @@ registerMode("record", (() => {
   }
 
   function triggerConfirmKeep() {
-    postTrialAction("/trial/confirm/keep"); // proposed endpoint, see file-top note
+    // CONTRACTS.md §4.2 corrected: bridge_server.py's real _dispatch_trial()
+    // uses flat sibling actions matching the state machine's method names
+    // (confirm/discard, alongside start/hold-start/hold-stop/abort/redo) --
+    // not the nested /trial/confirm/keep|discard this file originally
+    // proposed for C12 (dispatcher's call: discard isn't a kind of confirm,
+    // nesting it under confirm/ didn't make sense).
+    postTrialAction("/trial/confirm");
   }
 
   function triggerConfirmDiscard() {
-    postTrialAction("/trial/confirm/discard"); // proposed endpoint, see file-top note
+    postTrialAction("/trial/discard");
   }
 
   function isRecordTrialScreenActive() {
@@ -919,12 +1028,25 @@ registerMode("record", (() => {
       // with what ESC means everywhere else on this screen, not a new rule.
       if (trialState === "CONFIRM") triggerConfirmDiscard();
       else triggerAbort();
+    } else if (e.key.toLowerCase() === "r" && (trialState === "IDLE" || trialState === "REST")) {
+      // C14: "R 鍵重錄上一筆" -- targets the most recently *saved* trial
+      // (recentTrials[0]), not the in-flight one (there isn't one; IDLE/REST
+      // is exactly the state where the previous trial already finished).
+      // Distinct from the PROMPT/COUNTDOWN/CAPTURE branch below: the old
+      // in-flight redo() would 409 in these two states anyway (B12's
+      // abort/redo explicitly excludes REST/IDLE, C12's own fix), so this
+      // doesn't take away any working behaviour -- it replaces a dead key
+      // combo with a real one.
+      if (recentTrials.length) redoSavedTrial(recentTrials[0].idx);
+      else setTrialError("還沒有已存檔的 trial 可以重錄");
     } else if (e.key.toLowerCase() === "r" && trialState !== "CONFIRM") {
       // Not in C12.md's literal "包含" list (only ESC/abort is) -- added
       // because esp-mask-test-ad's dispatch explicitly called out that
       // abort vs redo must both be reachable and distinguishable. No key
       // was specified for redo anywhere, so this is this story's own
       // choice; flagged in the completion report for confirmation.
+      // C14: only reaches here for PROMPT/COUNTDOWN/CAPTURE now (IDLE/REST
+      // are handled above) -- retry the current, not-yet-saved trial.
       triggerRedo();
     }
   }
@@ -1051,6 +1173,7 @@ registerMode("record", (() => {
               <div class="trial-card state-idle" data-trial-card>
                 <div class="trial-prev-label" data-trial-prev-label style="display:none"></div>
                 <div class="trial-word" data-trial-word>—</div>
+                <div class="trial-requeue-note" data-trial-requeue-note style="display:none">🔁 重錄模式：下一次按住空白鍵會錄這個詞</div>
                 <div class="trial-state-label" data-trial-state-label>準備中</div>
               </div>
 
@@ -1066,7 +1189,7 @@ registerMode("record", (() => {
               <div class="trial-error" data-trial-error style="display:none"></div>
 
               <div class="trial-hint mono">
-                按住空白鍵開始錄音、放開結束　｜　Esc 放棄（跳過此詞）　｜　R 重來（保留此詞）
+                按住空白鍵開始錄音、放開結束　｜　Esc 放棄（跳過此詞）　｜　R 重來（錄音中：保留此詞／錄完後：重錄剛存的上一筆）
               </div>
             </div>
 
@@ -1141,6 +1264,7 @@ registerMode("record", (() => {
         trialCard: root.querySelector("[data-trial-card]"),
         trialPrevLabel: root.querySelector("[data-trial-prev-label]"),
         trialWord: root.querySelector("[data-trial-word]"),
+        trialRequeueNote: root.querySelector("[data-trial-requeue-note]"),
         trialStateLabel: root.querySelector("[data-trial-state-label]"),
         trialConfirmBox: root.querySelector("[data-trial-confirm]"),
         trialConfirmReason: root.querySelector("[data-trial-confirm-reason]"),
@@ -1192,6 +1316,13 @@ registerMode("record", (() => {
       // every SAVE, so binding once here (instead of per-item) means new
       // items are clickable without re-attaching anything.
       els.recentList.addEventListener("click", (e) => {
+        // Reject/redo buttons live inside the same clickable row as the
+        // preview trigger -- check them first so clicking a button doesn't
+        // also pop the preview overlay open behind it.
+        const rejectBtn = e.target.closest("[data-reject-idx]");
+        if (rejectBtn) { rejectTrial(Number(rejectBtn.dataset.rejectIdx)); return; }
+        const redoBtn = e.target.closest("[data-redo-idx]");
+        if (redoBtn) { redoSavedTrial(Number(redoBtn.dataset.redoIdx)); return; }
         const item = e.target.closest("[data-recent-idx]");
         if (item) openPreview(Number(item.dataset.recentIdx));
       });
@@ -1225,6 +1356,7 @@ registerMode("record", (() => {
       // nothing left to send its matching hold_stop().
       if (holdKeyDown) triggerHoldStop();
       closePreview(); // don't leave the overlay stuck open over another mode
+      pendingRequeueLabel = null; // C14: don't let a stale requeue intent survive a mode switch
     },
 
     onData(evt) {

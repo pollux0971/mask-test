@@ -24,6 +24,7 @@
 
 import { registerMode } from "../shell.js";
 import { dataStore } from "../bus.js";
+import { melColorRgb } from "../draw/thumbnails.js";
 
 const DIST_MIN = 0, DIST_MAX = 1200; // mm, clamps the distance color scale
 const DIST_NEAR = [23, 73, 90];      // rgb, close object
@@ -275,32 +276,10 @@ const RMS_MAX = 32767; // CONTRACTS.md §1.1 $M's rms range (16-bit PCM amplitud
 const MEL_BG = [10, 8, 20];
 const MEL_ENABLED_TIMEOUT_MS = 3000; // no $STATUS + no traffic this long -> treat mel as off
 
-// Monotonic-luminance magma-ish ramp (C08.md: "viridis 或 magma"), hand-coded
-// the same way distColor/signalColor/zscoreColor above are -- no charting
-// library, zero build per this project's standing rule. Multi-stop version
-// of the file's existing 2-stop lerpColor().
-const MEL_STOPS = [
-  [10, 8, 20],     // near-black violet: silence / noise floor
-  [82, 18, 92],
-  [163, 33, 91],
-  [230, 79, 58],
-  [251, 159, 32],
-  [252, 253, 191], // near-white yellow: loudest
-];
-
-function melColorRgb(int16Value) {
-  const t = Math.max(0, Math.min(1, (int16Value - MEL_MIN) / (MEL_MAX - MEL_MIN)));
-  const segs = MEL_STOPS.length - 1;
-  const scaled = t * segs;
-  const i = Math.min(segs - 1, Math.floor(scaled));
-  const localT = scaled - i;
-  const a = MEL_STOPS[i], b = MEL_STOPS[i + 1];
-  return [
-    Math.round(a[0] + (b[0] - a[0]) * localT),
-    Math.round(a[1] + (b[1] - a[1]) * localT),
-    Math.round(a[2] + (b[2] - a[2]) * localT),
-  ];
-}
+// melColorRgb (the magma-ish ramp, C08.md: "viridis 或 magma") moved to
+// draw/thumbnails.js so C19's static thumbnails can reuse the exact same
+// color math -- its MEL_MIN/MEL_MAX must stay -10/0 to match the constants
+// above.
 
 let warnedBadLength = false;
 

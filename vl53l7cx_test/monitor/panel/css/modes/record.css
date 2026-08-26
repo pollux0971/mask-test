@@ -413,6 +413,16 @@
   word-break: keep-all;
 }
 
+/* C14: shown during IDLE/REST when a "重錄" queued a same-label override --
+   the big word above already reflects it, but this makes *why* explicit,
+   since it briefly disagrees with the normal cyclic order the person may
+   be used to seeing. */
+#mode-record .trial-requeue-note {
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 600;
+}
+
 #mode-record .trial-state-label {
   font-size: 24px;
   color: var(--text-dim);
@@ -602,15 +612,20 @@
   display: grid;
   grid-template-columns: 18px 1fr auto;
   align-items: center;
-  gap: 8px;
+  gap: 4px 8px;
   padding: 6px 8px;
   border-radius: 6px;
   background: var(--surface-2);
-  cursor: pointer;
+}
+
+/* C14: a rejected trial must look visibly different in the list, not just
+   change what a click reveals -- "已存檔的那筆棄用後要有可見的狀態變化". */
+#mode-record .recent-item.is-rejected {
+  opacity: 0.6;
 }
 
 #mode-record .recent-item:hover,
-#mode-record .recent-item:focus {
+#mode-record .recent-item:focus-within {
   outline: 1px solid var(--accent);
 }
 
@@ -628,11 +643,46 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
+}
+
+#mode-record .rejected-tag {
+  color: var(--warn);
+  font-size: 11px;
+  font-weight: 600;
 }
 
 #mode-record .recent-meta {
   font-size: 11px;
   color: var(--text-dim);
+}
+
+/* C14: reject/redo buttons -- second row, spanning the dot/label/meta
+   columns above, rather than a cramped 4th column in a 300px sidebar. */
+#mode-record .recent-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 6px;
+}
+
+#mode-record .recent-action-btn {
+  flex: 1;
+  font-size: 11px;
+  padding: 3px 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+#mode-record .recent-action-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+#mode-record .recent-redo-btn:hover {
+  color: var(--accent);
 }
 
 /* --- C13: trial preview overlay ----------------------------------------- */

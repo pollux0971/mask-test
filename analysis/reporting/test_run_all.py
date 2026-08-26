@@ -190,7 +190,7 @@ def test_one_command_produces_a_complete_report(two_sessions, tmp_path):
     out = tmp_path / "out"
     code = run_all.main(["--session", str(two_sessions[0]),
                          "--session", str(two_sessions[1]),
-                         "--out", str(out)])
+                         "--ablation-permutations", "0", "--out", str(out)])
 
     assert (out / "summary.md").exists()
     assert (out / "summary.html").exists()
@@ -210,14 +210,16 @@ def test_report_finishes_well_inside_the_two_minute_budget(two_sessions, tmp_pat
     ——它證明的是管線本身沒有病態的慢。真實資料的計時見完成回報。
     """
     started = time.perf_counter()
-    run_all.main(["--session", str(two_sessions[0]), "--out", str(tmp_path / "o")])
+    run_all.main(["--session", str(two_sessions[0]),
+                  "--ablation-permutations", "0", "--out", str(tmp_path / "o")])
     assert time.perf_counter() - started < 120.0
 
 
 def test_fast_flag_runs_and_is_not_slower(two_sessions, tmp_path):
-    run_all.main(["--session", str(two_sessions[0]), "--out", str(tmp_path / "full")])
+    run_all.main(["--session", str(two_sessions[0]), "--ablation-permutations", "0",
+                  "--out", str(tmp_path / "full")])
     code = run_all.main(["--session", str(two_sessions[0]), "--fast",
-                         "--out", str(tmp_path / "fast")])
+                         "--ablation-permutations", "0", "--out", str(tmp_path / "fast")])
     assert code in (run_all.EXIT_OK, run_all.EXIT_MUST_PASS_FAILED)
     assert (tmp_path / "fast" / "summary.md").exists()
 
@@ -232,10 +234,12 @@ def test_unreadable_session_exits_with_bad_input(tmp_path, capsys):
 def test_report_defaults_to_synthetic_unless_real_is_passed(two_sessions, tmp_path):
     """**預設是合成。** 預設 real 會讓忘記加旗標的人產出一份看起來像真實
     結論的報告。"""
-    run_all.main(["--session", str(two_sessions[0]), "--out", str(tmp_path / "a")])
+    run_all.main(["--session", str(two_sessions[0]), "--ablation-permutations", "0",
+                  "--out", str(tmp_path / "a")])
     assert "合成資料" in (tmp_path / "a" / "summary.md").read_text(encoding="utf-8")
 
-    run_all.main(["--session", str(two_sessions[0]), "--real", "--out", str(tmp_path / "b")])
+    run_all.main(["--session", str(two_sessions[0]), "--real",
+                  "--ablation-permutations", "0", "--out", str(tmp_path / "b")])
     assert "合成資料" not in (tmp_path / "b" / "summary.md").read_text(encoding="utf-8")
 
 
@@ -243,7 +247,8 @@ def test_missing_mel_downgrades_instead_of_crashing(tmp_path):
     """沒有 `mel` dataset（§2 選填）時整批 trial 組不出特徵——要標成
     SKIPPED 並說明，不是讓整支程式炸掉。"""
     path = write_session(tmp_path / "nomel.h5", wear_id=1, seed=0, with_mel=False)
-    code = run_all.main(["--session", str(path), "--out", str(tmp_path / "o")])
+    code = run_all.main(["--session", str(path), "--ablation-permutations", "0",
+                         "--out", str(tmp_path / "o")])
     assert code in (run_all.EXIT_OK, run_all.EXIT_MUST_PASS_FAILED)
     summary = (tmp_path / "o" / "summary.md").read_text(encoding="utf-8")
     assert "SKIPPED" in summary
@@ -257,7 +262,7 @@ def test_experiment_error_does_not_kill_the_whole_run(two_sessions, tmp_path, mo
 
     monkeypatch.setattr(run_all, "run_viseme", boom)
     sessions = [session_loader.load_session(p) for p in two_sessions]
-    outcomes, _, _ = run_all.run_experiments(sessions)
+    outcomes, _, _, _ = run_all.run_experiments(sessions, ablation_permutations=0)
 
     by_key = {o.key: o for o in outcomes}
     assert by_key["E"].status == STATUS_ERROR
@@ -269,8 +274,8 @@ def test_experiment_error_does_not_kill_the_whole_run(two_sessions, tmp_path, mo
 
 def test_figures_are_written_when_an_experiment_produces_them(two_sessions, tmp_path):
     out = tmp_path / "out"
-    run_all.main(["--session", str(two_sessions[0]),
-                  "--session", str(two_sessions[1]), "--out", str(out)])
+    run_all.main(["--session", str(two_sessions[0]), "--session", str(two_sessions[1]),
+                  "--ablation-permutations", "0", "--out", str(out)])
     figures = list((out / "figures").glob("*.png"))
     per_experiment = list(out.glob("*.md"))
     # summary.md 一定在；有跑起來的實驗會各自多一份
@@ -292,7 +297,7 @@ def test_exit_code_is_one_when_a_must_pass_experiment_fails(two_sessions, tmp_pa
     monkeypatch.setattr(run_all, "run_snr", failing)
     code = run_all.main(["--session", str(two_sessions[0]),
                          "--session", str(two_sessions[1]),
-                         "--out", str(tmp_path / "o")])
+                         "--ablation-permutations", "0", "--out", str(tmp_path / "o")])
     assert code == run_all.EXIT_MUST_PASS_FAILED
     assert "必通過項目失敗" in (tmp_path / "o" / "summary.md").read_text(encoding="utf-8")
 
@@ -307,7 +312,7 @@ def test_the_end_to_end_run_actually_executes_experiments(two_sessions, tmp_path
     from analysis.reporting.verification_report import STATUS_FAIL
 
     sessions = [session_loader.load_session(p) for p in two_sessions]
-    outcomes, _, _ = run_all.run_experiments(sessions)
+    outcomes, _, _, _ = run_all.run_experiments(sessions, ablation_permutations=0)
     by_key = {o.key: o for o in outcomes}
 
     assert by_key["C0"].status == STATUS_SKIPPED
@@ -341,3 +346,70 @@ def test_wear_distance_ratio_works_with_two_wears(two_sessions):
     assert result is not None
     assert result["ratio"] > 0
     assert result["within_distances"].size and result["between_distances"].size
+
+
+# ------------------------------- D16/D19 的 extras（「第二顆 ToF 有沒有用」）
+
+
+def test_extras_are_populated_for_the_three_way_vote(two_sessions):
+    """**這個交叉檢查是專案最重要的一個**，而它在接上 `D16`/`D19` 之前
+    永遠只有一票。三個來源都要有值。"""
+    sessions = [session_loader.load_session(p) for p in two_sessions]
+    outcomes, extras, notes, side = run_all.run_experiments(
+        sessions, ablation_permutations=20)
+
+    assert "d16_gain" in extras and isinstance(extras["d16_gain"], float)
+    assert "d19_dual_matrix" in extras
+    assert extras["d19_dual_matrix"]["passed"] in (True, False)
+
+    silhouette = next(o for o in outcomes if o.key == "C")
+    # `complementarity_check()` 的鍵是 `passed` 不是 `complementary`——
+    # 讀錯鍵名時 `.get()` 會安靜回 None，這一票就沒了。
+    assert silhouette.detail["complementary"] in (True, False)
+
+    assert {slug for slug, _ in side} == {"d16_mutual_information", "d19_ablation"}
+
+
+def test_missing_votes_are_reported_not_silently_empty():
+    """**「沒有資料」不等於「沒有矛盾」。** 票數不足時要講出來。"""
+    from analysis.reporting.verification_report import (
+        STATUS_PASS,
+        ExperimentOutcome,
+        cross_experiment_checks,
+    )
+
+    only_one = [ExperimentOutcome(key="C", name="Silhouette", metric="s",
+                                  measured="0.5", criterion="> 0.15",
+                                  status=STATUS_PASS,
+                                  detail={"complementary": True})]
+    findings = cross_experiment_checks(only_one, {})
+    vote = next(f for f in findings if f["topic"] == "第二顆 ToF 是否帶來額外資訊")
+    assert "只有 1 個來源" in vote["message"]
+    assert "「沒有資料」不等於「沒有矛盾」" in vote["message"]
+
+
+def test_ablation_can_be_switched_off_but_says_so(two_sessions):
+    sessions = [session_loader.load_session(p) for p in two_sessions]
+    _, extras, notes, _ = run_all.run_experiments(sessions, ablation_permutations=0)
+    assert "d19_dual_matrix" not in extras
+    assert any("三方投票少一票" in note for note in notes)
+
+
+def test_side_reports_are_written(two_sessions, tmp_path):
+    out = tmp_path / "out"
+    run_all.main(["--session", str(two_sessions[0]), "--session", str(two_sessions[1]),
+                  "--ablation-permutations", "20", "--out", str(out)])
+    assert (out / "d16_mutual_information.md").exists()
+    assert (out / "d19_ablation.md").exists()
+
+
+def test_figures_are_written_in_both_formats(two_sessions, tmp_path):
+    """`D20` 驗收條件：PNG(300dpi) + PDF 雙輸出，透過 `run_all` 也要成立。"""
+    out = tmp_path / "out"
+    run_all.main(["--session", str(two_sessions[0]), "--session", str(two_sessions[1]),
+                  "--ablation-permutations", "0", "--out", str(out)])
+    pngs = sorted((out / "figures").glob("*.png"))
+    pdfs = sorted((out / "figures").glob("*.pdf"))
+    assert pngs and len(pngs) == len(pdfs)
+    assert [p.stem for p in pngs] == [p.stem for p in pdfs]
+    assert all(p.read_bytes()[:5] == b"%PDF-" for p in pdfs)

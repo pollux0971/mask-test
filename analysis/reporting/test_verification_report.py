@@ -176,13 +176,23 @@ def test_dual_matrix_agreement_produces_no_conflict():
                 if f["topic"] == "第二顆 ToF 是否帶來額外資訊"]
 
 
-def test_dual_matrix_needs_at_least_two_opinions():
-    """只有一個來源時沒有「矛盾」可言——不能對著單一結果報矛盾。"""
+def test_single_opinion_is_reported_as_missing_data_not_as_agreement():
+    """只有一個來源時沒有「矛盾」可言——**但也不能安靜地什麼都不說**。
+
+    這條原本斷言「回空的」。開發 `D20` 時真的踩到那個坑：`D13` 那一票因為
+    讀錯鍵名（`complementary` vs `passed`）永遠是 `None`，交叉檢查就永遠只有
+    一票、永遠不會發現矛盾——**而報告看起來完全正常**。
+
+    「這個檢查沒有資料」跟「這個檢查通過了」必須分得出來，所以現在會回一條
+    `note` 講明缺了幾個來源。
+    """
     outcomes = all_pass()
     outcomes[3] = outcome("C", STATUS_PASS, detail={"complementary": True})
     findings = cross_experiment_checks(outcomes, {})
-    assert not [f for f in findings
-                if f["topic"] == "第二顆 ToF 是否帶來額外資訊"]
+    vote = next(f for f in findings if f["topic"] == "第二顆 ToF 是否帶來額外資訊")
+    assert vote["severity"] == "note"          # 不是 conflict——沒得比就不是矛盾
+    assert "只有 1 個來源" in vote["message"]
+    assert "「沒有資料」不等於「沒有矛盾」" in vote["message"]
 
 
 def test_snr_fail_but_tof_separable_is_the_dangerous_conflict():

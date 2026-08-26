@@ -36,6 +36,7 @@ from pathlib import Path
 import numpy as np
 
 from analysis.reporting import session_loader
+from analysis.reporting.plot_style import apply_style
 from analysis.reporting.verification_report import (
     STATUS_ERROR,
     STATUS_FAIL,
@@ -87,6 +88,10 @@ def parse_args(argv=None):
                              "數字會比完整跑略有出入，報告會標示")
     parser.add_argument("--time-budget", type=float, default=TIME_BUDGET_S, metavar="SEC",
                         help=f"執行時間目標，超過會提示（預設 {TIME_BUDGET_S:.0f} 秒）")
+    parser.add_argument("--ablation-permutations", type=int, default=200, metavar="N",
+                        help="`D19` 消融套件的置換次數（0 = 不跑 D19）。預設 200；"
+                             "`D18`/`D19` 的標準是 1000，但那要約 70 秒，會吃掉"
+                             "大半個時間預算。跑正式報告時請明確指定 1000")
     parser.add_argument("--real", action="store_true",
                         help="標示這批是真實資料。**預設是合成**——假資料是目前的"
                              "常態，預設 real 會讓忘記加旗標的人產出一份看起來像"
@@ -181,7 +186,11 @@ def run_silhouette(feature_seqs, labels, *, fast, is_synthetic):
         detail={
             "score": score, "tof_score": tof_score,
             "verdict": mod.verdict_for_score(score),
-            "complementary": complementarity.get("complementary"),
+            # `complementarity_check()` 的鍵是 `passed`，不是 `complementary`。
+            # 我一開始寫錯，`.get()` 安靜地回 `None`，**三方投票就少了一票而
+            # 且沒有任何跡象**——那正是這個交叉檢查存在要防的事。現在
+            # `_check_dual_matrix_agreement()` 會在票數不足時明講。
+            "complementary": complementarity["passed"],
             # `tof_separable` 給跨實驗一致性檢查用：ToF 單獨是不是分得開。
             "tof_separable": mod.verdict_for_score(tof_score) != "fail",
         },
@@ -351,11 +360,48 @@ def _wear_distance_ratio(trials, feature_by_trial):
                   "「不同的詞長得不一樣」，跟戴法重複性無關。")
 
 
+# ------------------------------------------ 側邊實驗（不進通過矩陣，餵一致性檢查）
+
+
+def run_mutual_information(feature_seqs, labels):
+    """`D16` 的雙矩陣資訊增益，供「第二顆 ToF 有沒有用」的三方投票。
+
+    **不進通過矩陣**——story 的 範圍 只列了五個實驗。它存在的唯一理由是讓
+    `_check_dual_matrix_agreement()` 有第二個意見可比；沒有它，那個交叉檢查
+    永遠只有一票，也就永遠不會發現矛盾。
+    """
+    from analysis.experiments import d16_mutual_information as mod
+
+    table = mod.mutual_information_table(feature_seqs, labels)
+    gain = mod.dual_matrix_gain(table)
+    return gain["gain"], ("d16_mutual_information", mod.format_report(table))
+
+
+def run_ablation(feature_seqs, labels, *, n_permutations, cv=3):
+    """`D19` 消融套件的 `dual_matrix_vs_single`，同樣供三方投票用。
+
+    置換次數預設調低（見 `--ablation-permutations` 的說明）：完整的 1000 次
+    要約 70 秒，會吃掉大半個時間預算，而這裡只需要它的**方向**（拿掉第二顆
+    有沒有掉），不是它的 p 值精度。**正式報告請用 1000。**
+    """
+    from analysis.experiments import d19_ablation_suite as mod
+
+    suite = mod.run_ablation_suite(feature_seqs, labels,
+                                   n_permutations=n_permutations, cv=cv)
+    return suite["dual_matrix_vs_single"], ("d19_ablation", mod.format_report(suite))
+
+
 # ------------------------------------------------------------------ 主流程
 
 
-def run_experiments(sessions, *, fast=False, is_synthetic=True):
-    """跑所有跑得動的實驗。回傳 `(outcomes, extras, notes)`。"""
+def run_experiments(sessions, *, fast=False, is_synthetic=True,
+                    ablation_permutations=200):
+    """跑所有跑得動的實驗。回傳 `(outcomes, extras, notes)`。
+
+    `extras` 裝的是**不在通過矩陣裡、但參與跨實驗一致性檢查**的結果
+    （`D16` 的資訊增益、`D19` 的消融）。它們跟五個主實驗分開的理由見
+    `run_mutual_information()`。
+    """
     available = session_loader.availability(sessions)
     pairs = session_loader.usable_trials(sessions)
     trials = [trial for _, trial in pairs]
@@ -380,6 +426,7 @@ def run_experiments(sessions, *, fast=False, is_synthetic=True):
         "E": lambda: run_viseme(feature_seqs, labels, is_synthetic=is_synthetic),
     }
 
+    extras, side_reports = {}, []
     for key, runner in runners.items():
         reason = available.get(key)
         if reason is not None and key != "C0":
@@ -393,11 +440,44 @@ def run_experiments(sessions, *, fast=False, is_synthetic=True):
         except Exception as exc:                     # noqa: BLE001 — 逐實驗容錯
             outcomes.append(_errored(key, exc))
 
-    return outcomes, {}, notes
+    # 側邊實驗需要跟 `C`/`E` 同一批特徵；特徵不足就跳過，並在備註講明
+    # ——**不是靜靜地讓一致性檢查永遠只有一票**。
+    if len(feature_seqs) >= 2 and len(set(labels)) >= 2:
+        for name, runner in (
+            ("D16 雙矩陣資訊增益", lambda: run_mutual_information(feature_seqs, labels)),
+            ("D19 消融", (lambda: run_ablation(feature_seqs, labels,
+                                               n_permutations=ablation_permutations))
+                          if ablation_permutations > 0 else None),
+        ):
+            if runner is None:
+                notes.append("D19 消融未執行（--ablation-permutations 0）；"
+                             "「第二顆 ToF 有沒有用」的三方投票少一票")
+                continue
+            try:
+                value, report = runner()
+            except Exception as exc:                 # noqa: BLE001 — 側邊實驗容錯
+                notes.append(f"{name} 執行失敗（{type(exc).__name__}: {exc}）；"
+                             "跨實驗一致性檢查會少一個來源")
+                continue
+            key = "d16_gain" if name.startswith("D16") else "d19_dual_matrix"
+            extras[key] = value
+            side_reports.append(report)
+    else:
+        notes.append("特徵序列不足，`D16`/`D19` 未執行；"
+                     "「第二顆 ToF 有沒有用」的三方投票沒有任何來源")
+
+    return outcomes, extras, notes, side_reports
 
 
-def write_outputs(report, out_dir, notes=()):
-    """寫出 `summary.md` / `summary.html` / 各實驗的 md / `figures/`。"""
+def write_outputs(report, out_dir, notes=(), side_reports=()):
+    """寫出 `summary.md` / `summary.html` / 各實驗的 md / `figures/`。
+
+    圖一律走 `plot_style.save_figure()`：同一套樣式、PNG(300dpi) + PDF 雙輸出，
+    並在存檔當下檢查「英文 only」與「灰階可辨」（`D20`）。**在存檔的當下檢查
+    最容易修**——等到論文排版才發現一張圖印出來看不懂，要回頭重跑整個實驗。
+    """
+    from analysis.reporting.plot_style import save_figure
+
     out_dir = Path(out_dir)
     (out_dir / "figures").mkdir(parents=True, exist_ok=True)
 
@@ -417,15 +497,19 @@ def write_outputs(report, out_dir, notes=()):
             written.append(path)
         for filename, make_figure in outcome.figures:
             figure = make_figure()
-            path = out_dir / "figures" / filename
-            figure.savefig(path, bbox_inches="tight")
-            written.append(path)
+            stem = out_dir / "figures" / Path(filename).stem
+            written += save_figure(figure, stem)
             try:
                 import matplotlib.pyplot as plt
 
                 plt.close(figure)
             except Exception:                        # noqa: BLE001 — 關圖失敗無所謂
                 pass
+
+    for slug, markdown in side_reports:
+        path = out_dir / f"{slug}.md"
+        path.write_text(markdown, encoding="utf-8")
+        written.append(path)
     return written
 
 
@@ -440,9 +524,12 @@ def main(argv=None):
             print(f"讀不到 session {path}：{exc}", file=sys.stderr)
             return EXIT_BAD_INPUT
 
+    apply_style()          # D20：所有圖共用同一套樣式
+
     started = time.perf_counter()
-    outcomes, extras, notes = run_experiments(
-        sessions, fast=args.fast, is_synthetic=not args.real)
+    outcomes, extras, notes, side_reports = run_experiments(
+        sessions, fast=args.fast, is_synthetic=not args.real,
+        ablation_permutations=args.ablation_permutations)
     elapsed = time.perf_counter() - started
 
     if elapsed > args.time_budget:
@@ -455,7 +542,7 @@ def main(argv=None):
     report = build_report(outcomes, is_synthetic=not args.real, extras=extras,
                           session_paths=[s.path for s in sessions],
                           elapsed_s=elapsed)
-    written = write_outputs(report, args.out, notes)
+    written = write_outputs(report, args.out, notes, side_reports)
 
     print(f"報告已寫入 {Path(args.out).resolve()}（{len(written)} 個檔案，"
           f"{elapsed:.1f} 秒）")
