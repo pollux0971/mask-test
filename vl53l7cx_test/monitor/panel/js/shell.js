@@ -210,3 +210,186 @@ document.addEventListener("keydown", (e) => {
     activateMode(mode);
   }
 });
+
+// --- C04: global status bar --------------------------------------------
+//
+// Visible in all five modes (it lives in the sidebar, outside any
+// .mode-section), so it can't hook into a mode's onData -- bus.js calls
+// notifyGlobalStatus() on every event instead (see bus.js's handleEvent).
+// Deliberately does NOT rebuild C09's quality dashboard; "點擊展開完整
+// 品質面板" (C04.md) just switches to monitor mode, where that dashboard
+// already lives.
+//
+// Two independent notions of "connected", per CONTRACTS.md: the browser's
+// own SSE connection to bridge_server.py (EventSource-level; main.js
+// reports this via notifySseConnection since it owns the EventSource),
+// and the bridge's serial link to the device itself ({type:"link"}, C03).
+// If the SSE is down the bridge is unreachable and nothing else matters;
+// if SSE is up but the link is down, the device itself is unplugged --
+// two different problems, so they get two different messages.
+
+const REPLAY_WINDOW_MS = 3000;   // how long a single replay:true event's effect lingers
+const TOF_RATE_WINDOW_MS = 2000; // matches monitor.js's own Hz calc window
+const DEVICE_STATE_POLL_MS = 2000;
+
+const statusConnTextEl = document.querySelector("[data-status-conn-text]");
+const statusWarningEl = document.querySelector("[data-status-warning]");
+const statusDropEl = document.querySelector("[data-status-drop]");
+const statusSymmetryEl = document.querySelector("[data-status-symmetry]");
+const statusFpsEl = document.querySelector("[data-status-fps]");
+const statusSummaryBtn = document.querySelector("[data-status-summary]");
+const linkDotEl = document.getElementById("linkDot");
+
+let sseUp = false;
+// A page that (re)loads after the device link was already established never
+// sees that one-time {type:"link",state:"up"} broadcast -- bridge_server.py
+// only relays *transitions* to whoever's subscribed at the moment, it
+// doesn't resend current link state to a newly-joined SSE client (found via
+// real testing: a fresh tab against an already-running bridge showed real
+// tof/quality data but this bar stuck on "裝置斷線" forever). So: trust an
+// explicit link event once we've seen one (in either direction, and that's
+// authoritative from then on); until we have, infer from whether payload
+// data is actually arriving.
+let explicitLinkState = null; // null | "up" | "down"
+let lastDataAt = -Infinity;   // last time ANY payload-carrying event (tof/quality/status/mic) arrived
+const LINK_DATA_FRESHNESS_MS = 3000;
+
+function computeLinkUp(now) {
+  if (explicitLinkState === "down") return false;
+  if (explicitLinkState === "up") return true;
+  return now - lastDataAt < LINK_DATA_FRESHNESS_MS;
+}
+let latestDeviceStatus = null; // last {type:"status", ...} event
+let qualityLevels = { drop_rate: "unknown", symmetry: "unknown" };
+let qualityValues = { drop_rate: null, symmetry: null };
+let tofTimestamps = [];
+let lastReplayAt = -Infinity;
+let resolutionChangeInProgress = false;
+let lastDeviceStatePollAt = -Infinity;
+
+function fmtPercent(v) {
+  return typeof v === "number" ? (v * 100).toFixed(1) + "%" : "--";
+}
+
+// §4.1.2: a resolution switch resets seq (expected, session-boundary
+// behavior per CONTRACTS 1.3) -- poll the existing /device/state endpoint
+// (B18) so a reflash doesn't read as "connection broken" on this bar. C09
+// polls this same endpoint independently for its own reflash note; not
+// shared on purpose -- these are two different files/features and the
+// endpoint is cheap, static JSON.
+function pollDeviceState(now) {
+  if (now - lastDeviceStatePollAt < DEVICE_STATE_POLL_MS) return;
+  lastDeviceStatePollAt = now;
+  fetch("/device/state")
+    .then((r) => (r.ok ? r.json() : null))
+    .then((state) => {
+      resolutionChangeInProgress = !!(state && state.resolution_change_in_progress);
+      renderStatusBar();
+    })
+    .catch(() => {
+      // transient fetch failure -- leave the last known value, don't spam
+    });
+}
+
+function renderStatusBar() {
+  const now = performance.now();
+  const inReplay = now - lastReplayAt < REPLAY_WINDOW_MS;
+  const linkUp = computeLinkUp(now);
+
+  sidebar.classList.toggle("status-replay", inReplay);
+  sidebar.classList.toggle("status-reflashing", resolutionChangeInProgress && !inReplay);
+
+  if (inReplay) {
+    // B17: every event may carry replay:true; this must be unmistakable so
+    // nobody mistakes a replayed session for a live one (CONTRACTS.md 4.2).
+    linkDotEl.classList.remove("up");
+    statusConnTextEl.textContent = "▶ REPLAY";
+    statusConnTextEl.className = "status-conn-text mono replay";
+  } else if (!sseUp) {
+    linkDotEl.classList.remove("up");
+    statusConnTextEl.textContent = "斷線（主機）";
+    statusConnTextEl.className = "status-conn-text mono down";
+  } else if (!linkUp) {
+    linkDotEl.classList.remove("up");
+    statusConnTextEl.textContent = "裝置斷線";
+    statusConnTextEl.className = "status-conn-text mono down";
+  } else if (resolutionChangeInProgress) {
+    linkDotEl.classList.add("up");
+    statusConnTextEl.textContent = "重燒中…";
+    statusConnTextEl.className = "status-conn-text mono reflashing";
+  } else {
+    linkDotEl.classList.add("up");
+    const proto = latestDeviceStatus ? latestDeviceStatus.protocol_version : null;
+    const fw = latestDeviceStatus && latestDeviceStatus.fw ? latestDeviceStatus.fw.slice(0, 7) : "--";
+    const protoText = proto == null ? "proto?" : `proto${proto}`;
+    statusConnTextEl.textContent = `已連線  ${protoText}  ${fw}`;
+    // proto v1 (or an explicit version mismatch) uses the warn color --
+    // CONTRACTS.md 1.1: version_mismatch means the bridge has stopped
+    // parsing all $ lines entirely, so the user needs to know why nothing
+    // on screen is moving.
+    const protoWarn = proto === 1 || (latestDeviceStatus && latestDeviceStatus.version_mismatch);
+    statusConnTextEl.className = "status-conn-text mono" + (protoWarn ? " proto-warn" : "");
+  }
+
+  if (!inReplay && latestDeviceStatus && latestDeviceStatus.warning) {
+    // B02: e.g. "協定 v1 — 無時間戳，資料不可用於驗證分析", recording_allowed=false alongside it.
+    statusWarningEl.textContent = "⚠ " + latestDeviceStatus.warning;
+    statusWarningEl.style.display = "block";
+  } else {
+    statusWarningEl.style.display = "none";
+  }
+
+  statusDropEl.textContent = fmtPercent(qualityValues.drop_rate);
+  statusSymmetryEl.textContent = fmtPercent(qualityValues.symmetry);
+  while (tofTimestamps.length && now - tofTimestamps[0] > TOF_RATE_WINDOW_MS) tofTimestamps.shift();
+  statusFpsEl.textContent = (tofTimestamps.length / (TOF_RATE_WINDOW_MS / 1000)).toFixed(1) + " Hz";
+
+  // unknown must never look like it passed (same rule as C09's hollow-ring
+  // dot) -- here that means "not counted as red", not "counted as green".
+  const anyRed = qualityLevels.drop_rate === "red" || qualityLevels.symmetry === "red";
+  sidebar.classList.toggle("status-alert", anyRed && !inReplay);
+}
+
+export function notifySseConnection(isUp) {
+  sseUp = isUp;
+  renderStatusBar();
+}
+
+export function notifyGlobalStatus(evt) {
+  const now = performance.now();
+  if (evt.replay === true) lastReplayAt = now;
+
+  if (evt.type === "link") {
+    explicitLinkState = evt.state === "up" ? "up" : "down";
+  } else if (evt.type === "status") {
+    latestDeviceStatus = evt;
+    lastDataAt = now;
+  } else if (evt.type === "quality") {
+    const m = evt.metrics || {};
+    if (m.drop_rate) { qualityLevels.drop_rate = m.drop_rate.level; qualityValues.drop_rate = m.drop_rate.value; }
+    if (m.symmetry) { qualityLevels.symmetry = m.symmetry.level; qualityValues.symmetry = m.symmetry.value; }
+    lastDataAt = now;
+  } else if (evt.type === "tof") {
+    tofTimestamps.push(now);
+    lastDataAt = now;
+  } else if (evt.type === "mic") {
+    lastDataAt = now;
+  }
+
+  pollDeviceState(now);
+  renderStatusBar();
+}
+
+statusSummaryBtn.addEventListener("click", () => activateMode("monitor"));
+
+renderStatusBar(); // paint the initial "connecting..." state before any event arrives
+
+// Without this, the bar only updates when notifyGlobalStatus fires -- if
+// data stops arriving entirely (the exact case this bar exists to catch),
+// nothing would trigger a re-render and it'd freeze showing stale "still
+// connected, still 15Hz" numbers forever. A real disconnect's explicit
+// {type:"link",state:"down"} event (near-instant, see C03's testing)
+// already re-renders on its own; this tick is what makes the FPS readout
+// decay toward 0 and the data-freshness link inference actually expire
+// when nothing else is happening.
+setInterval(renderStatusBar, 500);

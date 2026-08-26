@@ -21,6 +21,11 @@
 
 <div id="app" class="app-shell">
   <nav id="sidebar" class="sidebar">
+    <div class="status-connection" data-status-connection>
+      <span id="linkDot" class="link-dot"></span>
+      <span class="status-conn-text" data-status-conn-text>連線中…</span>
+    </div>
+    <div class="status-warning" data-status-warning style="display:none"></div>
     <ul class="mode-nav">
       <li><button class="mode-nav-item active" data-mode="monitor">
         <span class="mode-icon">▣</span><span class="mode-label">監測</span><span class="mode-key mono">1</span>
@@ -38,6 +43,19 @@
         <span class="mode-icon">▶</span><span class="mode-label">回放</span><span class="mode-key mono">5</span>
       </button></li>
     </ul>
+    <button class="status-summary" data-status-summary title="點擊查看完整品質面板（監測模式）">
+      <div class="status-summary-row">
+        <span class="status-summary-label">掉幀</span>
+        <span class="status-summary-value mono" data-status-drop>--</span>
+      </div>
+      <div class="status-summary-row">
+        <span class="status-summary-label">對稱</span>
+        <span class="status-summary-value mono" data-status-symmetry>--</span>
+      </div>
+      <div class="status-summary-row">
+        <span class="status-summary-value mono status-summary-fps" data-status-fps>-- Hz</span>
+      </div>
+    </button>
     <button id="collapseToggle" class="collapse-toggle" title="摺疊側邊欄（\）" aria-label="摺疊側邊欄">
       <span class="mode-icon">«</span><span class="mode-label">摺疊</span><span class="mode-key mono">\</span>
     </button>

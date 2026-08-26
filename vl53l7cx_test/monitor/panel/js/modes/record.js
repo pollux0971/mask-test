@@ -33,8 +33,55 @@
 // Scope per C11.md: settings form + baseline capture screen only. Trial
 // prompting/countdown (C12), progress list (C13), redo/discard UI (C14) are
 // explicitly out of scope -- this mode stops at "baseline done, ready".
+//
+// C12 adds: the actual trial prompt/countdown/capture screen, driven by
+// `{"type":"trial", "state":"PROMPT|COUNTDOWN|CAPTURE|CONFIRM|SAVE|REST|IDLE",
+//  "label":.., "idx":.., "seed":..}` SSE events (CONTRACTS.md §4.2, defined
+// by B11/B12). Three trigger mechanisms share this one wire shape:
+//   - fixed-duration (B11 sm.start_trial(), no UI trigger in this story)
+//   - Hold-to-Record (B12, spacebar -- this is what C12.md actually asks for)
+//   - Auto-VAD (B13, esp-mask-test-18, still in progress as of this story)
+// This file only *renders* whatever state arrives; it doesn't care which
+// mechanism produced it, except for the spacebar handler, which explicitly
+// drives hold_start()/hold_stop() (POST /trial/hold/start|stop, B12).
+//
+// ⚠ Known gap (flagged to esp-mask-test-ad, not resolved as of writing):
+// nothing in the wire protocol exposes the *next* word before the user
+// presses anything -- TrialStateMachine.hold_start()/start_trial() only
+// decide the label at call time. So the prompt card can't show "what to
+// say" before a Hold-to-Record press; it shows a generic "press to begin"
+// hint until the first `trial` event actually carries a label. See
+// completion report for the proposed fix (peek_next_label()).
+//
+// ⚠ Known deviation from C12.md's state/visual table: it describes
+// COUNTDOWN as a literal "3-2-1" count, but B11's actual COUNTDOWN_S is
+// 0.5s (not 3s) -- there is no real backend timing that a 3-2-1 count could
+// honestly track. Rendered instead as a single proportional pulse over the
+// real 0.5s window; flagged in the completion report rather than
+// fabricating a 3-second countdown the backend doesn't actually run.
+//
+// ⚠ No documented HTTP endpoint exists yet for CONFIRM's confirm_keep()/
+// discard_pending() (only /trial/hold/start|stop and /trial/abort|redo are
+// in CONTRACTS.md's table). This file calls proposed endpoints
+// POST /trial/confirm/keep and POST /trial/confirm/discard -- same
+// propose-now-ratify-later pattern as C11's baseline progress shape.
 
 import { registerMode } from "../shell.js";
+
+const TRIAL_STATE_LABEL = {
+  IDLE: "準備下一個",
+  PROMPT: "請準備",
+  COUNTDOWN: "即將開始",
+  CAPTURE: "錄製中",
+  CONFIRM: "尚未存檔 — 請選擇",
+  SAVE: "已存檔",
+  REST: "休息中",
+};
+
+// Web Audio beep tones (OscillatorNode, no audio file -- C12.md "維持零建置").
+const BEEP_GET_READY_HZ = 880; // COUNTDOWN entry: "準備"
+const BEEP_GO_HZ = 1320; // CAPTURE entry: "開始錄了"
+const BEEP_DURATION_S = 0.15;
 
 const REQUIRED_FIELDS = [
   { key: "subject", label: "受試者代號" },

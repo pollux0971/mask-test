@@ -29,6 +29,8 @@ trial 仍然是一份結構完整、可以直接用 `h5py.File(path, "r")` 讀�
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import h5py
 import numpy as np
 
@@ -78,25 +80,61 @@ class SessionWriter:
 
     建構時就把 `/meta` 寫進去並立刻 flush，所以 `meta` 缺欄位會在最早的
     時間點就報錯，而不是等第一個 trial 寫完才發現。
+
+    **`mode="a"`（append/reopen）**：`B10` 的 `capture_baseline_trial()`
+    在 session 一開始就用 `mode="w"` 建檔、寫好 `/meta` 跟 baseline 的
+    `trial_000`；之後 `B11` 的 `TrialStateMachine` 要繼續寫後面的 trial，
+    **不能再用 `mode="w"`**——`h5py.File(path, "w")` 是截斷，會把 baseline
+    連同 `/meta` 一起砍掉。`mode="a"` 改成重開既有檔案，**不寫** `/meta`
+    （已經有了），只驗證它完整（缺欄位一樣報錯，跟 `mode="w"` 的「建構時
+    就檢查」是同一個保證，只是檢查的對象是「檔案裡已經有的」而不是
+    「呼叫端剛給的」）。
+
+    這樣「一個 baseline trial 該長什麼樣子」永遠只有 `capture_baseline_trial()`
+    這一個出處——`mode="a"` 不會、也不需要知道 baseline 的 meta 是怎麼湊出來的。
     """
 
-    def __init__(self, path, meta: dict):
-        missing = [k for k in REQUIRED_META_KEYS if k not in meta]
-        if missing:
-            raise ValueError(f"meta 缺少必填欄位: {missing}")
-        if meta["schema_version"] != SCHEMA_VERSION:
-            raise ValueError(f"schema_version 必須是 {SCHEMA_VERSION}，收到 {meta['schema_version']!r}")
+    def __init__(self, path, meta: Optional[dict] = None, mode: str = "w"):
+        if mode not in ("w", "a"):
+            raise ValueError(f"mode 必須是 'w' 或 'a'，收到 {mode!r}")
+        if mode == "w":
+            if meta is None:
+                raise ValueError("mode='w' 時必須提供 meta")
+            missing = [k for k in REQUIRED_META_KEYS if k not in meta]
+            if missing:
+                raise ValueError(f"meta 缺少必填欄位: {missing}")
+            if meta["schema_version"] != SCHEMA_VERSION:
+                raise ValueError(f"schema_version 必須是 {SCHEMA_VERSION}，收到 {meta['schema_version']!r}")
+        elif meta is not None:
+            raise ValueError("mode='a' 時不可以再傳 meta——/meta 已經在檔案裡了，這裡只驗證不覆寫")
 
         self._path = path
         self._meta = meta
+        self._mode = mode
         self._file = None
         self._trial_indices_written = set()
 
     def __enter__(self) -> "SessionWriter":
-        self._file = h5py.File(self._path, "w")
-        self._write_meta()
+        self._file = h5py.File(self._path, self._mode)
+        if self._mode == "w":
+            self._write_meta()
+        else:
+            self._validate_existing_meta()
         self._file.flush()
         return self
+
+    def _validate_existing_meta(self) -> None:
+        if "meta" not in self._file:
+            raise ValueError(
+                f"{self._path} 沒有 /meta group，不能用 mode='a' 重開——"
+                "這個檔案不是用 SessionWriter 建的，或 baseline 還沒跑完"
+            )
+        attrs = self._file["meta"].attrs
+        missing = [k for k in REQUIRED_META_KEYS if k not in attrs]
+        if missing:
+            raise ValueError(f"{self._path} 的 /meta 缺少必填欄位: {missing}（不完整的 session 檔不能重開繼續寫）")
+        if attrs["schema_version"] != SCHEMA_VERSION:
+            raise ValueError(f"schema_version 必須是 {SCHEMA_VERSION}，檔案裡是 {attrs['schema_version']!r}")
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if self._file is not None:

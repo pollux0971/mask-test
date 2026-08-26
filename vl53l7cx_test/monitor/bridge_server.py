@@ -70,6 +70,9 @@ from host.storage.session_registry import (                         # noqa: E402
     SessionRegistry, MissingFieldsError, SessionAlreadyActiveError, NoActiveSessionError,
 )
 from host.storage.baseline import capture_baseline_trial            # noqa: E402
+from host.clock.ping_sync import (                                  # noqa: E402
+    PingSyncer, SessionClockSync, SESSION_START, SESSION_END,
+)
 
 THRESHOLDS_PATH = ROOT_DIR / "config" / "quality_thresholds.json"
 LAST_SESSION_PATH = ROOT_DIR / "config" / "last_session.json"
@@ -225,6 +228,23 @@ def to_sse_event(event):
         out["proto"] = 1
         out["has_timestamp"] = False
     return out
+
+
+def handle_parsed_event(parsed):
+    """Everything the bridge does with one parsed device event.
+
+    Factored out of the reader loop because the PING burst also produces
+    them: PingSyncer reads lines itself while waiting for a reply, and hands
+    back the $T/$M that arrive in the meantime through `on_event`. Routing
+    those through the same function is what stops a clock sync from punching
+    a hole in the data stream.
+    """
+    if parsed.get("type") == "status" and parsed.get("dim"):
+        current_resolution["dim"] = parsed["dim"]
+    observe_for_quality(parsed)
+    sse = to_sse_event(parsed)
+    if sse:
+        broadcaster.publish(sse)
 
 
 def observe_for_quality(event):
@@ -446,6 +466,107 @@ def capture_session_baseline(info, seconds):
     return outcome, None
 
 
+# --- B05: PING clock sync ------------------------------------------------
+#
+# The burst runs on the serial reader thread, not the HTTP thread, because
+# PingSyncer reads lines itself and there is only one reader on the port.
+# The HTTP handler just leaves a request behind and returns immediately --
+# a 20-ping burst takes up to ~2 s, which is far too long to hold a request
+# open, and the result is not needed until the baseline is captured anyway.
+ping_request = {"label": None}
+clock_sync = {SESSION_START: None, SESSION_END: None}
+
+
+def request_ping_burst(label):
+    ping_request["label"] = label
+
+
+def run_ping_burst(ser, label):
+    """Fire one burst on the reader thread. Never raises: a clock sync that
+    fails must degrade to `confirmed=False`, not take the link down."""
+    previous_timeout = ser.timeout
+
+    def send():
+        with serial_write_lock:
+            ser.write(b"PING\n")
+
+    def read(timeout_s):
+        ser.timeout = timeout_s
+        return ser.readline()
+
+    try:
+        syncer = PingSyncer(
+            send, read,
+            parser=protocol_state["parser"],
+            on_event=handle_parsed_event,   # data lines keep flowing
+        )
+        burst = syncer.burst(label)
+        syncer.feed_into(clock_aligner, burst)
+    except Exception as exc:
+        print(f"[bridge] PING burst ({label}) failed: {exc}")
+        return None
+    finally:
+        ser.timeout = previous_timeout
+
+    clock_sync[label] = burst
+    print(f"[bridge] PING burst {label}: {burst.n_ok}/{burst.attempts} ok, "
+          f"confirmed={burst.confirmed}, rtt_min={burst.rtt_min_us}us")
+    broadcaster.publish({
+        "type": "clock_sync", "label": label,
+        "n_ok": burst.n_ok, "n_attempts": burst.attempts,
+        "confirmed": burst.confirmed,
+        "rtt_min_us": burst.rtt_min_us,
+        "rtt_median_us": burst.rtt_median_us,
+        "meets_acceptance": burst.meets_acceptance,
+    })
+    return burst
+
+
+def _clock_meta():
+    """The `/meta` clock block (CONTRACTS #2), from B04's fit and B05's bursts.
+
+    `None` becomes -1 for the numeric fields because HDF5 attributes cannot
+    hold it, and -1 is already this schema's "not measured" for the other
+    time fields. `clock_sync_confirmed` stays a real boolean and is reported
+    honestly: B05 tells apart a PING reply from the 1 Hz heartbeat by the
+    `$STATUS` that follows it, and when it cannot get that confirmation it
+    still returns the sample but marks it unconfirmed. Passing that through
+    as success would be claiming a calibration nobody verified.
+    """
+    fit = None
+    if clock_aligner.n_buckets >= 3:
+        try:
+            fit = clock_aligner.fit()
+        except Exception:
+            fit = None
+
+    meta = {
+        "clock_slope": float(fit.slope) if fit else 1.0,
+        "clock_offset": float(fit.offset_us) if fit else 0.0,
+        "clock_residual_p95": float(fit.residual_p95_us) if fit else -1.0,
+        "clock_drift_us": -1.0,
+        "clock_drift_ppm": -1.0,
+        "clock_sync_span_us": -1,
+        "clock_sync_confirmed": False,
+        "session_start_device_us": -1,
+        "session_start_host_us": -1.0,
+        "session_start_rtt_min_us": -1.0,
+    }
+
+    start = clock_sync.get(SESSION_START)
+    if start is None:
+        return meta
+
+    sync = SessionClockSync(start=start, end=clock_sync.get(SESSION_END))
+    for key, value in sync.to_meta().items():
+        if key in meta:
+            meta[key] = value if value is not None else meta[key]
+        else:
+            meta[key] = value      # the extra diagnostics B05 also reports
+    meta["clock_sync_confirmed"] = bool(meta.get("clock_sync_confirmed"))
+    return meta
+
+
 def build_session_meta_base(info, tof_t_us):
     """The `/meta` fields that are known at session start (CONTRACTS #2).
 
@@ -455,15 +576,9 @@ def build_session_meta_base(info, tof_t_us):
     `clock_sync_confirmed: False` instead of carrying plausible-looking
     numbers nobody checked.
     """
-    fit = None
-    if clock_aligner.n_buckets >= 3:
-        try:
-            fit = clock_aligner.fit()
-        except Exception:
-            fit = None
     parser = protocol_state.get("parser")
     state = parser.state() if parser is not None else {}
-    return {
+    meta = {
         "schema_version": 1,
         "subject": info.subject,
         "session_date": info.started_at[:10],
@@ -476,17 +591,15 @@ def build_session_meta_base(info, tof_t_us):
         "fw_sha": state.get("fw") or "unknown",
         "proto_version": state.get("protocol_version") or 2,
         "tof_dim": current_resolution["dim"],
-        "clock_slope": fit.slope if fit else 1.0,
-        "clock_offset": fit.offset_us if fit else 0.0,
-        "clock_residual_p95": fit.residual_p95_us if fit else -1.0,
-        "clock_drift_us": 0.0,
-        "clock_drift_ppm": 0.0,
-        "clock_sync_span_us": 0,
-        "clock_sync_confirmed": bool(fit is not None and not getattr(fit, "anomaly", False)),
-        "session_start_device_us": int(tof_t_us[0]),
-        "session_start_host_us": int(time.time() * 1e6),
-        "session_start_rtt_min_us": -1,
     }
+    meta.update(_clock_meta())
+    if meta["session_start_device_us"] == -1:
+        # No usable PING burst. Fall back to the first buffered frame's own
+        # timestamp so the session is still readable, and leave
+        # clock_sync_confirmed False so nobody mistakes it for a calibration.
+        meta["session_start_device_us"] = int(tof_t_us[0])
+        meta["session_start_host_us"] = float(time.time() * 1e6)
+    return meta
 
 
 def load_pca_model(source):
@@ -646,6 +759,10 @@ def serial_reader(port, baud, allow_v1=False):
                 print(f"[bridge] initial PING failed: {exc}")
             try:
                 while not flashing.is_set():
+                    label = ping_request["label"]
+                    if label:
+                        ping_request["label"] = None
+                        run_ping_burst(ser, label)
                     raw = ser.readline()
                     if not raw:
                         continue
@@ -700,14 +817,8 @@ def serial_reader(port, baud, allow_v1=False):
                         continue
 
                     parsed = protocol_state["parser"].feed(text)
-                    if not parsed:
-                        continue
-                    if parsed.get("type") == "status" and parsed.get("dim"):
-                        current_resolution["dim"] = parsed["dim"]
-                    observe_for_quality(parsed)
-                    sse = to_sse_event(parsed)
-                    if sse:
-                        broadcaster.publish(sse)
+                    if parsed:
+                        handle_parsed_event(parsed)
             finally:
                 current_serial_holder["ser"] = None
                 ser.close()
@@ -864,6 +975,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             session_runtime.update(baseline=None, trial=None,
                                    h5_path=sessions_dir() / f"{info.session_id}.h5",
                                    writer=None)
+        clock_sync[SESSION_START] = None
+        clock_sync[SESSION_END] = None
+        request_ping_burst(SESSION_START)
         publish_session_state("started", session=info.to_dict())
         self._send_json(200, info.to_dict())
 
@@ -885,6 +999,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 writer.__exit__(None, None, None)
             except Exception as exc:
                 print(f"[bridge] closing the session writer failed: {exc}")
+        request_ping_burst(SESSION_END)
         publish_session_state("ended", session=info.to_dict())
         self._send_json(200, info.to_dict())
 

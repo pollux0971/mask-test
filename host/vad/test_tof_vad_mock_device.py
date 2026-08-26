@@ -139,8 +139,12 @@ def test_both_sensors_agree_on_the_same_motion():
     a = detect_lip_from_events(events, mu, sigma, sensor="A")
     b = detect_lip_from_events(events, mu, sigma, sensor="B")
     assert a.detected and b.detected
-    # 兩顆的取樣時刻本來就錯開約半幀，容一幀多一點
-    assert abs(a.primary.start_us - b.primary.start_us) < 100_000
+
+    # 比第一段而不是 `primary`：這段串流有好幾次等長的合成動作，
+    # `primary` 取最長的，等長時挑哪一個是任意的。真實 trial 只有一個詞，
+    # 那時 `primary` 才是明確的。
+    assert abs(a.segments[0].start_us - b.segments[0].start_us) < 100_000
+    assert len(a.segments) == len(b.segments)
 
 
 def test_idle_energy_is_far_below_the_threshold():

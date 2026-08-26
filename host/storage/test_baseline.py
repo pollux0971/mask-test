@@ -62,6 +62,58 @@ def test_compute_noise_floor_basic():
 
 
 # ---------------------------------------------------------------------------
+# check_noise_floor_contamination — B15 作者事後指出的第四種訊號：警告不擋
+
+
+def test_pure_noise_does_not_warn():
+    rng = np.random.default_rng(0)
+    rms = rng.normal(loc=300, scale=10, size=930).astype(np.float32)
+    _, sigma = compute_noise_floor(rms)
+
+    warning = check_noise_floor_contamination(rms, sigma)
+
+    assert warning is None
+
+
+def test_speech_contaminated_baseline_triggers_warning():
+    """少數幾幀突然變大聲（混進語音），mean/std 會被拉高，
+    但 median/MAD 幾乎不受影響——這正是要抓的情況。"""
+    rng = np.random.default_rng(1)
+    rms = rng.normal(loc=300, scale=10, size=930).astype(np.float32)
+    rms[100:130] = 2000.0  # 一小段「有人講話」混進了 baseline 錄音
+    _, sigma = compute_noise_floor(rms)
+
+    warning = check_noise_floor_contamination(rms, sigma)
+
+    assert warning is not None
+    assert "語音" in warning
+
+
+def test_noise_floor_contamination_does_not_block_evaluate_baseline():
+    """驗收條件（調度員的裁決）：只警告，不強制擋——`ok` 不該因為這個
+    警告變成 False，`B10` 已經有的三級判準（sigma 太大/太小/沒訊號）
+    保持不變。"""
+    rng = np.random.default_rng(2)
+    tof_A, valid_A = _stable_tof(rng=rng)
+    tof_B, valid_B = _stable_tof(rng=rng)
+    mic_rms = rng.normal(loc=300, scale=10, size=930).astype(np.float32)
+    mic_rms[0:20] = 2000.0  # 混進語音
+
+    outcome = evaluate_baseline(tof_A, valid_A, tof_B, valid_B, mic_rms)
+
+    assert outcome.ok  # ToF 品質沒問題，不該因為音訊警告被擋下來
+    assert outcome.noise_floor_warning is not None
+
+
+def test_zero_variance_noise_floor_does_not_crash_the_check():
+    """穩健 sigma 幾乎是 0 的邊界情況（例如麥克風壞掉、整段完全恆定）
+    不該除以零讓函式壞掉。"""
+    rms = np.full(100, 300.0, dtype=np.float32)
+    warning = check_noise_floor_contamination(rms, sigma=0.0)
+    assert warning is None  # sigma 本身也是 0，沒有汙染的訊號
+
+
+# ---------------------------------------------------------------------------
 # check_zone_quality — 三種情況
 
 

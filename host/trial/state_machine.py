@@ -150,6 +150,7 @@ class TrialStateMachine:
         clock: Callable[[], float] = time.monotonic,
         manifest_root=None,
         mic_buffer_seconds: float = 15.0,
+        first_trial_idx: int = 0,
     ):
         if not words:
             raise ValueError("words 不能是空的")
@@ -174,7 +175,12 @@ class TrialStateMachine:
         self._current_label: Optional[str] = None
         self._capture_start_t_us: Optional[int] = None
         self._capture_end_t_us: Optional[int] = None
-        self._next_trial_idx = 0
+        # C12/ed: baseline is written as trial_000 by a separate SessionWriter
+        # call (host/storage/baseline.py), so a session with a baseline must
+        # start its own trial numbering at 1, not 0, or the first real trial
+        # collides with it. Caller passes the right starting index; this
+        # class doesn't know whether a baseline was recorded.
+        self._next_trial_idx = first_trial_idx
         self._hold_start_device_t_us: Optional[int] = None  # B12: hold-to-record
 
         # mic/mel 原生取樣率的緩衝，跟 Aligner 內部的環形緩衝分開一份。

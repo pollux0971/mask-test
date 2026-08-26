@@ -12,6 +12,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -247,3 +248,109 @@ def test_pca_is_204_when_no_model_has_been_fitted(rig):
 def test_pca_rejects_an_unknown_model_name(rig):
     status, body = _request(rig, "GET", "/pca?model=nonsense")
     assert status == 400 and body["error"]
+
+
+# -- B05: PING clock sync -------------------------------------------------
+
+
+def test_session_start_triggers_a_ping_burst(rig):
+    """The burst runs on the reader thread, so /session/start returns at once.
+
+    Its result is not needed until the baseline is captured, which is a good
+    thirty seconds later -- holding the request open for the ~2 s a burst can
+    take would be paying latency for nothing.
+    """
+    import threading
+    collected = []
+
+    def watch():
+        collected.extend(rig.read_events(6.0))
+
+    t = threading.Thread(target=watch)
+    t.start()
+    time.sleep(0.5)
+    status, _ = _request(rig, "POST", "/session/start", VALID_METADATA)
+    assert status == 200
+    t.join()
+
+    syncs = _of_type(collected, "clock_sync")
+    assert syncs, "no clock_sync event; the PING burst never ran"
+    burst = syncs[0]
+    assert burst["label"] == "session_start"
+    assert burst["n_attempts"] > 0
+    assert burst["n_ok"] > 0, "the mock answered no PINGs at all"
+    assert isinstance(burst["confirmed"], bool)
+
+
+def test_ping_burst_does_not_punch_a_hole_in_the_data_stream(rig):
+    """PingSyncer reads lines while waiting; those must still reach the panel.
+
+    Without on_event routing them back, every $T that arrived during the
+    burst would be swallowed -- and B03 would report it as a burst of drops
+    at the exact moment a session starts.
+    """
+    import threading
+    collected = []
+
+    def watch():
+        collected.extend(rig.read_events(6.0))
+
+    t = threading.Thread(target=watch)
+    t.start()
+    time.sleep(0.5)
+    _request(rig, "POST", "/session/start", VALID_METADATA)
+    t.join()
+
+    assert _of_type(collected, "clock_sync"), "burst did not run"
+    quality = _of_type(collected, "quality")
+    assert quality
+    last = quality[-1]
+    assert last.get("alarms", []) == [], (
+        f"the clock sync lost frames the device says it sent: {last.get('alarms')}"
+    )
+
+
+def test_session_end_triggers_the_closing_burst(rig):
+    import threading
+    collected = []
+
+    def watch():
+        collected.extend(rig.read_events(8.0))
+
+    t = threading.Thread(target=watch)
+    t.start()
+    time.sleep(0.5)
+    _request(rig, "POST", "/session/start", VALID_METADATA)
+    time.sleep(3.0)
+    _request(rig, "POST", "/session/end")
+    t.join()
+
+    labels = [e["label"] for e in _of_type(collected, "clock_sync")]
+    assert "session_start" in labels
+    assert "session_end" in labels, f"only saw {labels}"
+
+
+def test_baseline_meta_carries_the_measured_clock_block(rig):
+    """The session written to HDF5 must record a real sync, or admit it did not."""
+    import h5py
+    rig.read_events(4.0)
+    _request(rig, "POST", "/session/start", VALID_METADATA)
+    time.sleep(2.5)  # let the burst finish
+    status, body = _request(rig, "POST", "/session/baseline?seconds=2")
+    if status != 200:
+        pytest.skip(f"baseline quality gate rejected the synthetic scene: {body.get('reason')}")
+
+    sessions = list((Path(__file__).resolve().parents[2] / "sessions").glob("*.h5"))
+    assert sessions, "no session file was written"
+    newest = max(sessions, key=lambda p: p.stat().st_mtime)
+    with h5py.File(newest, "r") as f:
+        meta = dict(f["/meta"].attrs) if "meta" in f else dict(f.attrs)
+    # A real burst fills these in; without one they stay at the -1 sentinel
+    # and clock_sync_confirmed stays False. Either is acceptable -- what is
+    # not acceptable is a plausible number with confirmed=True behind it.
+    assert "clock_sync_confirmed" in meta
+    if meta["session_start_rtt_min_us"] != -1:
+        assert meta["session_start_device_us"] != -1
+        assert meta["session_start_rtt_min_us"] >= 0
+    else:
+        assert not meta["clock_sync_confirmed"]

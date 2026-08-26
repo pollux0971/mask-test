@@ -346,6 +346,96 @@ def test_clock_cross_check_flags_disagreement_between_methods(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# mode="a"：baseline（mode="w"）建檔後，trial machine 重開繼續寫，
+# 不能砍掉 baseline 的 trial_000（急件：ed 實測過會被 mode="w" 截斷）
+
+
+def test_append_mode_preserves_baseline_trial(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:  # 模擬 B10 的 baseline 建檔
+        w.write_trial(0, label="_baseline", **{k: v for k, v in _sample_trial_kwargs(T=10, M=12).items() if k != "label"})
+
+    with SessionWriter(path, mode="a") as w:  # 模擬 B11 的 trial machine 重開
+        w.write_trial(1, **_sample_trial_kwargs(T=20, M=25))
+
+    with h5py.File(path, "r") as f:
+        assert "trial_000" in f  # baseline 沒有被砍掉
+        assert f["trial_000"].attrs["label"] == "_baseline"
+        assert "trial_001" in f
+        assert f["meta"].attrs["schema_version"] == 1  # /meta 也還在
+
+
+def test_append_mode_does_not_rewrite_meta():
+    """重開時 `/meta` 不該被重新計算——尤其是 `clock_cross_check_*` 這種
+    衍生欄位，重算應該得到同一個值，但這裡驗證的是「根本沒有再跑一次
+    `_write_meta()`」，不是「算出來的值剛好一樣」。"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/session.h5"
+        with SessionWriter(path, _sample_meta()) as w:
+            pass
+
+        with h5py.File(path, "a") as f:
+            f["meta"].attrs["notes"] = "手動改過，重開不該被蓋掉"
+
+        with SessionWriter(path, mode="a") as w:
+            pass
+
+        with h5py.File(path, "r") as f:
+            assert f["meta"].attrs["notes"] == "手動改過，重開不該被蓋掉"
+
+
+def test_append_mode_rejects_meta_argument():
+    """mode='a' 不該讓呼叫端誤以為可以順便更新 meta——/meta 已經固定了。"""
+    with pytest.raises(ValueError, match="mode='a'"):
+        SessionWriter("/nonexistent/path.h5", _sample_meta(), mode="a")
+
+
+def test_append_mode_requires_existing_meta_group(tmp_path):
+    """重開一個根本不是 SessionWriter 建的（或還沒建過 baseline 的）檔案
+    要明確報錯，不能悄悄建一個空的 /meta 或整個炸掉。"""
+    path = tmp_path / "not_a_session.h5"
+    with pytest.raises(ValueError, match="/meta"):
+        with SessionWriter(path, mode="a"):
+            pass
+
+
+def test_append_mode_rejects_incomplete_meta(tmp_path):
+    path = tmp_path / "session.h5"
+    with h5py.File(path, "w") as f:
+        meta = f.create_group("meta")
+        meta.attrs["schema_version"] = 1
+        # 故意漏掉其他必填欄位
+
+    with pytest.raises(ValueError, match="缺少必填欄位"):
+        with SessionWriter(path, mode="a"):
+            pass
+
+
+def test_invalid_mode_rejected():
+    with pytest.raises(ValueError, match="mode"):
+        SessionWriter("/tmp/whatever.h5", _sample_meta(), mode="r+")
+
+
+def test_finalize_session_end_works_after_reopen(tmp_path):
+    """急件裡明確要求：`finalize_session_end()` 在 append 模式下也要能用。"""
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, label="_baseline", **{k: v for k, v in _sample_trial_kwargs(T=5, M=6).items() if k != "label"})
+
+    with SessionWriter(path, mode="a") as w:
+        w.write_trial(1, **_sample_trial_kwargs(T=5, M=6))
+        w.finalize_session_end(
+            session_end_device_us=99_000_000, session_end_host_us=1_756_000_099_000_000,
+            session_end_rtt_min_us=760,
+        )
+
+    with h5py.File(path, "r") as f:
+        assert f["meta"].attrs["session_end_device_us"] == 99_000_000
+        assert f["meta"].attrs["session_end_rtt_min_us"] == 760
+
+
+# ---------------------------------------------------------------------------
 # 異常中斷：已寫入的 trial 仍可讀（正常路徑，context manager 提早 raise）
 
 

@@ -22,7 +22,7 @@
 // 65s (60 + a little slack) -- applies to every stream, not just quality;
 // harmless for the higher-rate ones, just a bigger buffer.
 
-import { forEachRegisteredMode } from "./shell.js";
+import { forEachRegisteredMode, notifyGlobalStatus } from "./shell.js";
 
 const RETENTION_MS = 65000;
 
@@ -101,4 +101,9 @@ export function handleEvent(evt) {
   forEachRegisteredMode((hooks) => {
     if (typeof hooks.onData === "function") hooks.onData(evt);
   });
+  // C04's global status bar (shell.js) needs every event, not just the
+  // ones a specific mode cares about -- it's visible across all five
+  // modes, so it stays a separate hook from forEachRegisteredMode rather
+  // than pretending to be a sixth "mode".
+  notifyGlobalStatus(evt);
 }
