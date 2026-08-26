@@ -94,31 +94,35 @@ VOCAB_PATH = ROOT_DIR / "config" / "vocab.json"
 # feature to an SSE error event instead of killing the whole server.
 _MEL_IMPORT_ERROR = None
 wav_to_log_mel_timed = None
-write_mel_to_trial = None
 
 
 def _load_mel_backend():
-    """Return True once the B14 mel backend is importable; cache the failure."""
-    global wav_to_log_mel_timed, write_mel_to_trial, _MEL_IMPORT_ERROR
+    """Return True once the B14 mel backend is importable; cache the failure.
+
+    Only mel_pipeline is guarded here. It used to import host.storage.
+    mel_writer in the same try/except, which meant anything wrong with that
+    module took the whole backend down -- including the .npy path, which has
+    nothing to do with it -- and did so silently, because the ImportError was
+    swallowed by the except. mel_writer has since been deleted (it wrote a
+    `mel` dataset with no `mel_t_us`, violating the pairing rule in schema
+    section 2, and its own docstring said it was meant to retire once B07
+    landed).
+    """
+    global wav_to_log_mel_timed, _MEL_IMPORT_ERROR
     if wav_to_log_mel_timed is not None:
         return True
     if _MEL_IMPORT_ERROR is not None:
         return False
     try:
         from host.features.mel_pipeline import wav_to_log_mel_timed as _w
-        from host.storage.mel_writer import write_mel_to_trial as _t
     except ImportError as exc:
         _MEL_IMPORT_ERROR = exc
         print(f"[bridge] mel backend unavailable ({exc}); "
               f"MFCC disabled, everything else still works")
         return False
-    wav_to_log_mel_timed, write_mel_to_trial = _w, _t
+    wav_to_log_mel_timed = _w
     return True
 
-# B09（session/trial 狀態機）還沒做，這裡先用「每次錄音自動 +1」模擬 trial_idx，
-# 讓 B07/B09 落地前就能對著一個真實 h5 檔驗證「特徵寫回 HDF5」這條路徑通不通。
-# --h5-session 沒給的話就只算 mel、存 .npy，不寫 HDF5。
-mfcc_target = {"h5_path": None, "next_trial_idx": 0}
 
 RESOLUTION_RE = re.compile(r"#define\s+TOF_RESOLUTION_MODE\s+\d+")
 WAV_HEADER_RE = re.compile(r"rate=(\d+) bits=(\d+) channels=(\d+) bytes=(\d+)")
@@ -436,7 +440,7 @@ def _load_recognition_service():
             return None, recognition_service_state["error"]
 
         from analysis.similarity.recognition_service import RecognitionService
-        from host.storage.enrollment import load_templates
+        from analysis.similarity.enrollment import load_templates
 
         templates_dir = Path(runtime_paths["templates"])
         npz_files = sorted(templates_dir.glob("*.npz")) if templates_dir.is_dir() else []
@@ -1263,11 +1267,15 @@ def save_wav(rate, bits, channels, pcm_bytes):
 
 
 def _process_mfcc(filename):
-    """B14 備援路線：WAV 存好之後算 log-Mel，永遠存一份 `.npy`，
-    有指定 `--h5-session` 的話再多寫一份進該 session 的下一個 trial。
+    """B14 備援路線：WAV 存好之後算 log-Mel，存成一份 `.npy`。
 
-    在自己的執行緒跑，不擋 serial_reader 讀下一行（延遲拆解裡 MFCC 只要
-    ~0.1s，但 h5py I/O 加上 GIL 底下沒必要冒風險卡到即時的 $TOF 解析）。
+    在自己的執行緒跑，不擋 serial_reader 讀下一行（MFCC 只要 ~0.1s，
+    但沒必要冒險在 GIL 底下卡到即時的 $TOF 解析）。
+
+    以前這裡還會把 log-mel 寫進 `--h5-session` 指定的 HDF5，那條路徑
+    已經移除：它產生的 `mel` dataset 沒有配對的 `mel_t_us`（違反 schema
+    §2 的成對要求），而正式的 trial 寫入早就由 `/trial/*` 那條路徑的
+    `SessionWriter` 負責了。
     """
     wav_path = VOICE_DIR / filename
     if not _load_mel_backend():
@@ -1289,20 +1297,6 @@ def _process_mfcc(filename):
         "npy_file": npy_path.name, "n_frames": int(log_mel.shape[0]),
         "elapsed_ms": round(elapsed * 1000, 1),
     }
-
-    h5_path = mfcc_target["h5_path"]
-    if h5_path is not None:
-        trial_idx = mfcc_target["next_trial_idx"]
-        mfcc_target["next_trial_idx"] += 1
-        try:
-            write_mel_to_trial(h5_path, trial_idx, log_mel)
-            event["h5_trial_idx"] = trial_idx
-        except Exception as exc:
-            broadcaster.publish({
-                "type": "mfcc", "state": "error", "file": filename,
-                "message": f"HDF5 寫入失敗 (trial_idx={trial_idx}): {exc}",
-            })
-            return
 
     broadcaster.publish(event)
 
@@ -2363,20 +2357,12 @@ def main():
         help="B02 降級模式：接受舊韌體的 $TOF/$MIC 行。預設關閉——v1 沒有 "
              "t_us，錄下來的 session 無法做時間對齊，所以必須明確打開。")
     parser.add_argument(
-        "--h5-session", default=None,
-        help="B14 備援路線：每次錄音完成後，除了存 .npy，也把 log-mel 寫進這個 "
-             "session HDF5 檔（trial group 要已經存在，例如用 "
-             "ssi-backlog/tools/schema_example.py 產生）。不給就只存 .npy。")
-    parser.add_argument(
         "--templates-dir", default=None,
         help="D09 /recognize、/templates：enrollment 樣板 .npz 的目錄"
-             "（預設 <repo>/templates，見 host/storage/enrollment.py "
+             "（預設 <repo>/templates，見 analysis/similarity/enrollment.py "
              "template_path()）。目錄裡沒有任何 .npz 時兩個端點都回明確的"
              "「尚無樣板」狀態，不是 500。")
     args = parser.parse_args()
-
-    if args.h5_session:
-        mfcc_target["h5_path"] = Path(args.h5_session)
 
     link_source["value"] = args.source
     if args.source != "live":

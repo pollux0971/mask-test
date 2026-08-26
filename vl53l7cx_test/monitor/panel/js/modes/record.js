@@ -172,7 +172,15 @@ const SPEAKING_MODES = [
 ];
 
 const BASELINE_DURATION_S = 30; // host/storage/baseline.py: BASELINE_DURATION_S
-const BASELINE_WAIT_GRACE_MS = 4000; // how long to wait for a real SSE progress event before saying so
+// ca's disconnect/keyboard audit caught this screen never advancing: it ran
+// a local 30s countdown but never actually called POST /session/baseline,
+// so there was nothing to advance it (see requestBaselineCapture() below).
+// bridge_server.py's capture_session_baseline() reads the *device clock's*
+// last BASELINE_DURATION_S of already-buffered frames -- calling it before
+// that much has actually accumulated 409s with "let it run longer first",
+// which isn't a hard failure, just early. Retry on a short interval rather
+// than treating it as broken.
+const BASELINE_POST_RETRY_MS = 2000;
 
 const TARGET_CHECK_LABEL = {
   not_configured: "未設定",

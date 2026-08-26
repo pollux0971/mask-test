@@ -283,15 +283,18 @@ ST 的 ULD 標頭**沒有文件化** zone 的物理佈局。目前全鏈路假�
       → **在 Demo 用的那台筆電上重量一次**（有 GPU、沒有別的 agent 搶 CPU）
       才是乾淨的數字。若 `TaskDuration` 仍明顯超過 15%，
       Demo 期間建議停在測驗模式（11–13%，而且 Demo 四步全在那裡）。
-- [ ] ⚠️ **更正：`validate` 模式已經有內容了**（`C22` 已完成，實測確認
-      `vl53l7cx_test/monitor/panel/js/modes/validate.js` 486 行、已接進
-      `main.js`，不再是空白）。**但它的後端 `POST /verify/run`／
-      `GET /verify/state` 還沒接**（跟 `/recognize` 同一類缺口，
-      `validate.js` 自己的註解寫明「confirmed live, both currently
-      404」）——點進 `validate` 模式畫面會出現，但按下去會顯示「尚未
-      串接」，不是空白畫面，也不是可以跑的驗證。Demo 前確認這個後端
-      有沒有接上，接上了才需要驗證畫面內容，沒接上就當作跟
-      `/recognize` 一起追蹤。
+- [ ] ✅ **更正（第二次）：`validate` 模式現在整條路徑都是通的**——
+      `C22` 完成（`validate.js` 486 行、已接進 `main.js`），**後端
+      `POST /verify/run`／`GET /verify/state` 也已經接上**
+      （`bridge_server.py` 現在有這兩條路由）。**這次不只讀程式碼，
+      實際用瀏覽器（headless Chrome + Playwright）點過一次**：造一份
+      合成 session（`ssi-backlog/tools/schema_example.py`），在
+      `validate` 模式的輸入框填路徑、按「執行」，畫面正確跳出
+      「上次執行：…（耗時 0.5 秒）⚠ 合成資料」，不是「尚未串接」。
+      ⚠️ **`validate.js:8-13` 開頭的註解仍寫著「confirmed live, both
+      currently 404」——那段註解本身過時了，已回報給調度員轉知
+      `esp-mask-test-ed`，不影響這條路徑實際能不能用，只是文件說法
+      要更新。**
 
 ---
 
