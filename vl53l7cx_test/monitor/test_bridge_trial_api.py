@@ -399,3 +399,56 @@ def test_speaking_mode_is_accepted_and_validated_early(rig):
                             {"speaking_mode": "silent"})
     assert status == 200, body
     assert body["state"] == "CAPTURE"
+
+
+# -- _reject must actually be reachable -----------------------------------
+
+
+def test_reject_is_in_the_trial_rotation():
+    """`_reject` used to be structurally absent, not merely rare.
+
+    load_vocab() read only the `words` array, so the label was never in the
+    list the state machine cycles through -- 45 trials over five full cycles
+    produced not one. Meanwhile the panel showed "_reject: 0/72" as though
+    it were still coming.
+
+    Without it there is no rejection calibration (D22's two-sided ROC has no
+    input) and no "say a word it was never taught" demo.
+    """
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "bs_vocab", Path(__file__).resolve().parent / "bridge_server.py")
+    bs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bs)
+
+    labels = bs.load_vocab()
+    assert "_reject" in labels, labels
+    # Keyed by id, not text: scoring.py looks for the class literally named
+    # `_reject`, so recording "靜止／其他" would produce orphan trials.
+    assert "靜止／其他" not in labels
+
+
+def test_reject_comes_up_in_a_full_cycle(rig):
+    """Drive the real machine through one complete rotation.
+
+    The count matters as much as the presence: D22 needs a comparable number
+    of _reject samples, and its method tolerates 1:0.3 to 1:3 imbalance --
+    equal frequency keeps it comfortably inside that.
+    """
+    _session_with_baseline(rig)
+    seen = []
+    for _ in range(12):
+        status, body = _request(rig, "POST", "/trial/start", {})
+        if status != 200:
+            break
+        label = body["events"][0].get("label")
+        if label:
+            seen.append(label)
+        # abort advances the word order without writing anything
+        if _request(rig, "POST", "/trial/abort")[0] != 200:
+            break
+    assert "_reject" in seen, f"never came up in {len(seen)} trials: {seen}"
+    # Equal frequency: over 12 draws of a 9-label rotation it should appear
+    # once or twice, like any other label.
+    assert 1 <= seen.count("_reject") <= 3, seen

@@ -1064,14 +1064,40 @@ def load_pca_model(source):
 
 
 def load_vocab():
-    """Words for the trial order, from config/vocab.json (CONTRACTS #6)."""
+    """Labels for the trial rotation, from config/vocab.json (CONTRACTS #6).
+
+    Includes the `reject` entry. It used to be dropped -- only the `words`
+    array was read -- so `_reject` was not merely rare in the rotation, it
+    was structurally absent: the state machine cycles through this list, and
+    a label that is not in it can never come up. Measured over 45 trials and
+    five full cycles, it never appeared once, while the panel's progress bar
+    showed "_reject: 0/72" as though it were still pending.
+    """
     try:
         data = json.loads(VOCAB_PATH.read_text(encoding="utf-8"))
-        words = [w["text"] for w in data.get("words", []) if w.get("text")]
+        labels = [w["text"] for w in data.get("words", []) if w.get("text")]
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f"[bridge] could not read {VOCAB_PATH}: {exc}")
         return []
-    return words
+
+    reject = (data.get("reject") or {}).get("id")
+    if reject:
+        # Keyed by `id`, not `text`, unlike the words. That is the existing
+        # convention downstream -- analysis/similarity/scoring.py looks for
+        # the class literally named `_reject`, and
+        # ssi-backlog/tools/make_reference_session.py already uses
+        # data["reject"]["id"] -- so recording it under "靜止／其他" would
+        # produce trials nothing could find.
+        #
+        # Same frequency as every other label: D22's two-sided ROC needs
+        # enough _reject samples, and its method is close to immune to class
+        # imbalance between 1:0.3 and 1:3, so equal is the safe default.
+        labels.append(reject)
+    else:
+        print(f"[bridge] ⚠ {VOCAB_PATH} has no `reject` entry — "
+              f"_reject templates cannot be recorded, and without them "
+              f"rejection calibration (D22) has no input")
+    return labels
 
 
 #: The VAD threshold fields B21 takes, as they are named in /meta. Read with
@@ -1548,6 +1574,36 @@ def summarize_verify_sessions(session_paths):
     return out
 
 
+#: Intermediate arrays that are large and that nothing downstream reads.
+#: `permutation_scores` is a thousand floats per modality -- the null
+#: distribution the p-value was computed FROM, not a conclusion. Shipping it
+#: on every /verify/state poll is waste even when it serialises.
+_EXTRAS_DROP_KEYS = ("permutation_scores", "null_scores", "permutation_distribution")
+
+
+def _serialisable_extras(extras):
+    """Make `extras` safe for json.dumps, recursively.
+
+    D19 hands back sklearn output, so the tree contains numpy arrays and
+    numpy scalars, and `json.dumps` raises on the first one it meets.
+    `_json_safe()` does not cover this -- it handles NaN, not ndarray.
+
+    Large intermediate arrays are dropped rather than converted: they are
+    what the p-value was derived from, not the answer, and the answer is
+    what the panel shows.
+    """
+    if isinstance(extras, dict):
+        return {k: _serialisable_extras(v) for k, v in extras.items()
+                if k not in _EXTRAS_DROP_KEYS}
+    if isinstance(extras, (list, tuple)):
+        return [_serialisable_extras(v) for v in extras]
+    if isinstance(extras, np.ndarray):
+        return _serialisable_extras(extras.tolist())
+    if isinstance(extras, np.generic):        # np.float64, np.int64, np.bool_
+        return _serialisable_extras(extras.item())
+    return extras
+
+
 def serialize_verify_report(report, run_id, out_dir, elapsed_s):
     """把 `D15` 的報告轉成前端吃得下的 JSON。
 
@@ -1570,7 +1626,7 @@ def serialize_verify_report(report, run_id, out_dir, elapsed_s):
         "matrix": report["matrix"],
         # D19 的置換檢定 p 值就在這裡面——「這不是運氣」的證據。
         # build_report() 一直有算，只是從來沒有被序列化出去。
-        "extras": report.get("extras", {}),
+        "extras": _serialisable_extras(report.get("extras", {})),
         "outcomes": [o.to_dict() for o in report["outcomes"]],
         "inconsistencies": report["inconsistencies"],
         "limitations": report["limitations"],
@@ -1610,7 +1666,9 @@ def run_verification(session_paths, *, fast, real, ablation_permutations):
                               session_paths=[s.path for s in sessions],
                               elapsed_s=elapsed)
         verifier.write_outputs(report, out_dir, notes, side_reports)
-        payload = serialize_verify_report(report, run_id, out_dir, elapsed)
+        payload = ensure_serialisable(
+            serialize_verify_report(report, run_id, out_dir, elapsed),
+            run_id, out_dir, elapsed)
     except Exception as exc:                     # noqa: BLE001 — 背景執行緒
         # 背景執行緒的例外沒有人接。不抓的話這一輪會靜靜地永遠停在
         # `running=True`，而畫面上只會看到秒數一直加上去。
@@ -1625,6 +1683,47 @@ def run_verification(session_paths, *, fast, real, ablation_permutations):
             if payload is not None:
                 verify_state["last_run"] = payload
         broadcaster.publish(verify_status())
+
+
+def ensure_serialisable(payload, run_id, out_dir, elapsed_s):
+    """Return `payload` if it survives json.dumps, else a degraded stand-in.
+
+    Storing a payload that cannot be serialised poisons the endpoint
+    permanently: `/verify/state` re-serialises `last_run` on every poll, so
+    one bad value makes every future request fail, and re-running does not
+    help because the new run produces the same field. Only restarting the
+    bridge clears it. That happened -- D19 returns sklearn arrays, and one
+    ndarray took the whole endpoint down.
+
+    So: check before storing. Whatever else is wrong, the panel keeps
+    working and gets told what happened, and the files on disk (summary.md,
+    figures, side reports) were written before this point and are fine
+    regardless -- which is worth saying out loud, because "the screen is
+    broken" reads like "the run is lost".
+
+    The `_LAST_GATE_NOTE` rule is "default to passing it through, not
+    dropping it". This is its other half: **check it can be passed through
+    before you commit to it.**
+    """
+    try:
+        json.dumps(_json_safe(payload), ensure_ascii=False, allow_nan=False)
+        return payload
+    except (TypeError, ValueError) as exc:
+        print(f"[bridge] ⚠ verify payload is not serialisable ({exc}); "
+              f"degrading last_run rather than poisoning /verify/state",
+              file=sys.stderr)
+        return {
+            "run_id": run_id,
+            "out_dir": str(out_dir),
+            "finished_at": datetime.now().isoformat(),
+            "elapsed_s": round(elapsed_s, 1),
+            "serialization_error": f"{type(exc).__name__}: {exc}",
+            "note": ("驗證已經跑完，報告檔案（summary.md / figures / "
+                     "side reports）都正常寫到硬碟了；壞掉的只有這一步的 "
+                     "JSON 序列化。請直接看 /verify/reports 的檔案。"),
+            "matrix": [], "outcomes": [], "blocking": [],
+            "inconsistencies": [], "limitations": [], "extras": {},
+        }
 
 
 def list_verify_runs():

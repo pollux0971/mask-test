@@ -510,3 +510,78 @@ def test_an_unreadable_session_does_not_sink_the_whole_summary(tmp_path):
     assert out["n_trials"] == 2
     assert len(out["errors"]) == 1
     assert "missing.h5" in out["errors"][0]
+
+
+# -- a bad payload must not poison the endpoint ---------------------------
+
+
+def _bs_mod():
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "bs_ser", Path(__file__).resolve().parent / "bridge_server.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_numpy_in_extras_survives_serialization():
+    """D19 returns sklearn output, so extras contains numpy.
+
+    json.dumps raises on the first ndarray it meets, and _json_safe() does
+    not cover this -- it handles NaN, not arrays.
+    """
+    import json
+    import numpy as np
+    bs = _bs_mod()
+    extras = {"d19": {"p_value": np.float64(0.004),
+                      "scores": np.array([1.0, 2.0]),
+                      "n": np.int64(200)}}
+    out = bs._serialisable_extras(extras)
+    json.dumps(out)                       # must not raise
+    assert out["d19"]["p_value"] == 0.004
+    assert out["d19"]["scores"] == [1.0, 2.0]
+    assert out["d19"]["n"] == 200
+
+
+def test_the_permutation_null_distribution_is_dropped():
+    """A thousand floats the panel never reads, on every /verify/state poll.
+
+    It is what the p-value was computed FROM, not a conclusion.
+    """
+    import numpy as np
+    bs = _bs_mod()
+    out = bs._serialisable_extras(
+        {"d19": {"p_value": 0.01, "permutation_scores": np.arange(1000.0)}})
+    assert "permutation_scores" not in out["d19"]
+    assert out["d19"]["p_value"] == 0.01
+
+
+def test_an_unserialisable_payload_degrades_instead_of_poisoning(tmp_path):
+    """One bad value used to break /verify/state permanently.
+
+    The endpoint re-serialises last_run on every poll, so storing something
+    json.dumps cannot handle makes every future request fail -- and
+    re-running does not help, because the new run yields the same field.
+    Only a bridge restart cleared it.
+    """
+    import json
+    bs = _bs_mod()
+
+    class NotJson:
+        pass
+
+    out = bs.ensure_serialisable({"matrix": [], "bad": NotJson()},
+                                 "20260826_130000", tmp_path, 12.3)
+    json.dumps(out)                       # the stand-in must itself be safe
+    assert out["serialization_error"]
+    assert out["run_id"] == "20260826_130000"
+    # And it must say the run itself was fine, because "the screen is
+    # broken" reads like "the run is lost".
+    assert "硬碟" in out["note"] or "summary.md" in out["note"]
+
+
+def test_a_good_payload_is_passed_through_untouched(tmp_path):
+    bs = _bs_mod()
+    payload = {"run_id": "r", "matrix": [{"key": "C0"}], "extras": {"p": 0.01}}
+    assert bs.ensure_serialisable(payload, "r", tmp_path, 1.0) is payload
