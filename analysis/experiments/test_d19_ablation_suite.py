@@ -386,18 +386,72 @@ def test_report_shows_grouping_status_once_not_six_times():
     assert text.count("分組驗證無法進行") == 1
 
 
-def test_report_warns_time_reversal_is_not_group_aware_when_grouped():
-    suite = _minimal_suite_for_report()
-    suite["grouping"] = "grouped"
-    suite["n_groups"] = 3
-    suite["grouping_note"] = None
+def test_time_reversal_ablation_reports_its_own_grouping_state():
+    """`time_reversal_ablation()` 不經過 `run_permutation_test()`，但一樣
+    要能回報 grouping 狀態——調度員裁決：它原本是唯一不吃 `groups` 的
+    例外，查證後發現分組驗證要擋的洩漏跟這個檢定完全相關（訓練/測試折
+    之間不能有同一次戴上的樣本），所以補上了，不再是例外。"""
+    from analysis.experiments.d19_ablation_suite import time_reversal_ablation
 
-    text = format_report(suite)
-    assert "時間反轉測試" in text.split("## 4.")[0]  # 出現在頂部摘要，不是只在第 4 節標題
+    feats, labels = _make_trials(tof_amp=6.0, mel_amp=6.0, noise=1.0)
+
+    ungrouped = time_reversal_ablation(feats, labels, cv=5, random_state=0)
+    assert ungrouped["grouping"] == "ungrouped_no_groups_given"
+
+    groups_one = [0] * len(labels)
+    single = time_reversal_ablation(feats, labels, cv=5, random_state=0, groups=groups_one)
+    assert single["grouping"] == "ungrouped_single_group"
+    assert single["grouping_note"] is not None
+
+    groups_two = [0] * (len(labels) // 2) + [1] * (len(labels) - len(labels) // 2)
+    grouped = time_reversal_ablation(feats, labels, cv=5, random_state=0, groups=groups_two)
+    assert grouped["grouping"] == "grouped"
+    assert grouped["n_groups"] == 2
 
 
-def test_report_omits_time_reversal_caveat_when_not_grouped():
-    suite = _minimal_suite_for_report()  # 預設沒有 grouping 欄位 -> ungrouped_no_groups_given
-    text = format_report(suite)
-    summary = text.split("## 1.")[0]
-    assert "不吃 `groups`" not in summary
+def test_run_ablation_suite_time_reversal_shares_the_same_grouping_state():
+    """五項消融（含 time_reversal）必須拿到同一個分組狀態，不能只有
+    `run_permutation_test()` 那五個檢定分組了、time_reversal 卻沒有。"""
+    feats, labels = _make_trials(tof_amp=0.15, mel_amp=0.13, noise=1.0)
+    groups = [0] * (len(labels) // 2) + [1] * (len(labels) - len(labels) // 2)
+
+    suite = run_ablation_suite(feats, labels, n_permutations=20, cv=5,
+                                random_state=0, groups=groups)
+
+    assert suite["grouping"] == "grouped"
+    assert suite["time_reversal"]["grouping"] == "grouped"
+
+
+def test_grouping_changes_the_time_reversal_score_when_leakage_exists():
+    """跟 `7c` 對 D18 的實測是同一個道理：同一次戴上的樣本洩漏會讓分類器
+    偷跑分數，時間反轉測試的訓練/測試折一樣會被污染。這裡構造一個
+    「戴法本身可以預測詞」的資料集（wear_id 決定一個額外的偏移量，
+    偏移量剛好也跟詞相關），確認分組後 reversed_accuracy 真的會變化，
+    不是傳了 groups 卻沒有任何效果的裝飾參數。記錄新舊對照，**不代表
+    分組後的數字比較「差」是壞事**——舊數字可能是洩漏灌出來的。
+    """
+    from analysis.experiments.d19_ablation_suite import time_reversal_ablation
+
+    rng = np.random.default_rng(7)
+    n_per_word, n_words = 20, 4
+    feats, labels, groups = [], [], []
+    for word in range(n_words):
+        for i in range(n_per_word):
+            # wear_id 跟 (word, i 的奇偶) 綁在一起，讓「認出戴哪一次」
+            # 變成能預測詞的捷徑——這正是 7c 在真實資料上找到的那種洩漏。
+            wear_id = word * 2 + (i % 2)
+            base = rng.normal(0, 1.0, size=(T_RAW, 104))
+            base[:, word * 5:word * 5 + 5] += 8.0  # 詞本身的真訊號（弱）
+            base[:, 96 + wear_id % 8] += 20.0       # 戴法特徵（強，且跟詞相關）
+            feats.append(base)
+            labels.append(word)
+            groups.append(wear_id)
+
+    ungrouped = time_reversal_ablation(feats, labels, cv=5, random_state=0)
+    grouped = time_reversal_ablation(feats, labels, cv=5, random_state=0, groups=groups)
+
+    assert ungrouped["grouping"] == "ungrouped_no_groups_given"
+    assert grouped["grouping"] == "grouped"
+    # 這裡不斷言哪邊一定比較高/低——只斷言分組真的讓 CV 折的組成不同，
+    # 兩個數字不會剛好一樣（傳了 groups 卻被靜默忽略的話兩者會相等）。
+    assert ungrouped["reversed_accuracy"] != pytest.approx(grouped["reversed_accuracy"])

@@ -646,6 +646,12 @@ def run_templates_build(session_paths, out_path, subject, wear_id):
 # the whole reason B04 exists.
 device_clock = {"last_t_us": None}
 
+# Which port the reader thread is currently bound to, and whether anything
+# has actually arrived on it. "The port opened" and "the board is talking"
+# are different facts -- measured on the real board, where the port opened
+# cleanly while neither ToF sensor produced a single line.
+serial_link = {"port": None, "opened_at": None, "first_line_at": None}
+
 # What the host last *told* the sensors to do. Not what they confirmed: a
 # $STATUS carries mel= and amb= but no sens_a=/sens_b=, so the device never
 # says whether a sensor is actually ranging. Everything downstream is handed
@@ -1307,6 +1313,88 @@ def verify_status():
 _LAST_GATE_NOTE = __doc__
 
 
+# --- device discovery ------------------------------------------------------
+#
+# USB-serial bridges found on ESP32 dev boards, plus Espressif's own native
+# USB. Used only to *hint*: an unrecognised VID/PID is reported as
+# likely_esp32=False and still listed, because guessing wrong in either
+# direction is worse than saying "I don't know, you pick".
+_ESP32_USB_VENDORS = {
+    0x10C4: "Silicon Labs CP210x",
+    0x1A86: "WCH CH340/CH9102",
+    0x0403: "FTDI",
+    0x303A: "Espressif (native USB)",
+}
+
+
+def list_serial_ports():
+    """Every serial port on the machine, with a hint about which is the board.
+
+    The hint is not a nicety. On this machine `list_ports.comports()` returns
+    32 motherboard `/dev/ttyS*` entries with no description, no VID and no
+    PID -- an unannotated list of those is unusable, and the one entry that
+    matters is not there at all until the board is plugged in.
+
+    Nothing is filtered out: a board behind an adapter this table does not
+    know would otherwise vanish from a list that claims to be complete.
+    Likely candidates simply sort first.
+    """
+    try:
+        from serial.tools import list_ports
+    except ImportError as exc:
+        return [], f"pyserial 沒有 list_ports: {exc}"
+
+    ports = []
+    for p in list_ports.comports():
+        vendor = _ESP32_USB_VENDORS.get(p.vid)
+        ports.append({
+            "device": p.device,
+            "description": p.description or "n/a",
+            "manufacturer": p.manufacturer,
+            "serial_number": p.serial_number,
+            "vid": p.vid,
+            "pid": p.pid,
+            "likely_esp32": vendor is not None,
+            "usb_vendor": vendor,
+        })
+    ports.sort(key=lambda d: (not d["likely_esp32"], d["device"]))
+    return ports, None
+
+
+def device_status():
+    """Where the link stands right now.
+
+    Reports "opened" and "receiving" separately on purpose. A port that
+    opens is not a board that works, and collapsing the two would let the
+    panel show "connected" over a completely silent link -- which is exactly
+    what the real board did the day one sensor failed to initialise.
+    """
+    port = serial_link["port"]
+    opened_at = serial_link["opened_at"]
+    first = serial_link["first_line_at"]
+    now = time.time()
+    if port is None:
+        state = "disconnected"
+    elif first is None:
+        state = "opened"        # port is open, nothing has arrived yet
+    else:
+        state = "receiving"
+    return {
+        "state": state,
+        "port": port,
+        "opened_at": opened_at,
+        "connected_for_s": round(now - opened_at, 1) if opened_at else None,
+        "data_seen": first is not None,
+        "seconds_to_first_line": (round(first - opened_at, 2)
+                                  if first and opened_at else None),
+        "sensors_seen": sensors_seen_string(),
+        # Whatever has gone quiet since, from the same detector the panel
+        # already shows -- "connected but one sensor died" is a state the
+        # user needs, and it is not the same as "disconnected".
+        "stale_streams": quality.stale_streams(),
+    }
+
+
 def summarize_verify_sessions(session_paths):
     """「這份報告是用什麼資料算的」——矩陣正上方那一行。
 
@@ -1366,6 +1454,12 @@ def summarize_verify_sessions(session_paths):
     # with something other than both sensors streaming.
     out["trials_missing_a_sensor"] = sum(
         n for value, n in trial_seen.items() if value != "AB")
+    # ⚠ Distinguish "checked, and every trial had both" from "these files
+    # predate the per-trial field, so nothing was checked". Both would
+    # otherwise show trials_missing_a_sensor == 0, and the second one is not
+    # reassurance -- it is an absence of evidence. Same trap as the `""` vs
+    # missing distinction on sensors_seen itself.
+    out["trial_sensors_seen_available"] = bool(trial_seen)
     return out
 
 
@@ -1643,8 +1737,13 @@ def serial_reader(port, baud, allow_v1=False):
             # A reconnect is a new link: what the previous one delivered says
             # nothing about this one.
             session_frame_baseline.update(snapshot_frame_counts())
+            serial_link.update(port=port, opened_at=time.time(), first_line_at=None)
             print(f"[bridge] serial open: {port} @ {baud}")
-            broadcaster.publish({"type": "link", "state": "up"})
+            # "opened", not "connected": the port opening tells us nothing
+            # about whether the board is talking. On the real board the port
+            # opened cleanly while neither ToF sensor produced a line.
+            broadcaster.publish({"type": "link", "state": "up",
+                                 "port": port, "data_seen": False})
             # Ask the device to identify itself right away. The board boots
             # long before the bridge starts, so its power-on $STATUS is
             # almost always already gone by the time we open the port --
@@ -1690,6 +1789,10 @@ def serial_reader(port, baud, allow_v1=False):
                     # bandwidth metric is about how full the link is, not
                     # how much of it turned out to be useful.
                     quality.note_bytes(len(raw))
+                    if serial_link["first_line_at"] is None and raw.strip():
+                        serial_link["first_line_at"] = time.time()
+                        broadcaster.publish({"type": "link", "state": "up",
+                                             "port": port, "data_seen": True})
                     try:
                         text = raw.decode("utf-8", errors="replace")
                     except Exception:
@@ -1741,6 +1844,7 @@ def serial_reader(port, baud, allow_v1=False):
             finally:
                 current_serial_holder["ser"] = None
                 ser.close()
+                serial_link.update(port=None, opened_at=None, first_line_at=None)
                 broadcaster.publish({"type": "link", "state": "down"})
         except Exception as exc:
             broadcaster.publish({"type": "link", "state": "down", "message": str(exc)})
@@ -2045,6 +2149,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_replay_sessions()
         elif self.path.startswith("/replay/state"):
             self._send_json(200, replay_status())
+        elif self.path.startswith("/device/ports"):
+            self._handle_device_ports()
+        elif self.path.startswith("/device/status"):
+            self._send_json(200, device_status())
         elif self.path.startswith("/verify/state"):
             self._send_json(200, verify_status())
         # ⚠️ 順序有意義：`/verify/reports/<id>/<path>` 必須比
@@ -2174,6 +2282,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "real": bool(body.get("real", False)),
             "ablation_permutations": permutations,
         })
+
+    def _handle_device_ports(self):
+        """`GET /device/ports` —— 掃描可用的序列埠。"""
+        ports, error = list_serial_ports()
+        payload = {
+            "ports": ports,
+            "connected_port": serial_link["port"],
+            "likely": [p["device"] for p in ports if p["likely_esp32"]],
+        }
+        if error:
+            payload["error"] = error
+        if not ports:
+            payload["hint"] = "找不到任何序列埠。確認板子已插上 USB。"
+        elif not payload["likely"]:
+            # Say so explicitly rather than leaving an all-false list to be
+            # read as "none of these work": the board may simply be behind
+            # an adapter this build does not recognise.
+            payload["hint"] = ("找不到明顯是 ESP32 的埠（可能是沒插上，"
+                               "或是用了不認得的 USB 轉接晶片）。"
+                               "下面列的是這台機器上全部的序列埠，可以手動選。")
+        self._send_json(200, payload)
 
     def _serve_verify_asset(self):
         """`GET /verify/reports/<run_id>/<path>` —— 唯讀靜態服務。"""

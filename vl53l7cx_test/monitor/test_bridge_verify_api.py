@@ -405,3 +405,108 @@ def test_serialize_tolerates_a_report_without_extras(tmp_path):
     }
     out = bs.serialize_verify_report(report, "r", tmp_path, 0.1)
     assert out["extras"] == {}
+
+
+# -- session summary: "what was this computed from?" ----------------------
+
+
+def _bs():
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "bs_summary", Path(__file__).resolve().parent / "bridge_server.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _session(tmp_path, name, per_trial_seen, meta_seen="AB"):
+    """Write a small session with an explicit per-trial sensors_seen pattern."""
+    import numpy as np
+    from host.storage.session_writer import SessionWriter, REQUIRED_META_KEYS
+    Z = 16
+    meta = {k: 0 for k in REQUIRED_META_KEYS}
+    meta.update(schema_version=1, subject="s01", session_date="2026-08-26",
+                wear_id=1, mode="quiz", distance_mm=30.0, angle_deg=0.0,
+                ambient="quiet", notes="", fw_sha="abc", proto_version=2,
+                tof_dim=Z, clock_slope=1.0, clock_offset=0.0,
+                clock_residual_p95=1.0, clock_drift_us=0.0, clock_drift_ppm=0.0,
+                clock_sync_span_us=1, clock_sync_confirmed=True,
+                session_start_device_us=0, session_start_host_us=0,
+                session_start_rtt_min_us=1.0)
+    for side in ("A", "B"):
+        meta[f"baseline_mu_{side}"] = np.full(2 * Z, 100.0, np.float32)
+        meta[f"baseline_sigma_{side}"] = np.full(2 * Z, 5.0, np.float32)
+    meta["noise_floor_mu"], meta["noise_floor_sigma"] = 100.0, 10.0
+    meta["sensors_seen"] = meta_seen
+
+    path = tmp_path / name
+    words = ["wu", "yi"]
+    with SessionWriter(path, meta) as w:
+        for idx, seen in enumerate(per_trial_seen):
+            T = 8
+            w.write_trial(
+                idx, label=words[idx % len(words)],
+                tof_A=np.full((T, 2 * Z), 100.0, np.float32),
+                tof_B=np.full((T, 2 * Z), 100.0, np.float32),
+                tof_t_us=(np.arange(T) * 33000).astype(np.int64),
+                tof_valid_A=np.ones((T, Z), bool), tof_valid_B=np.ones((T, Z), bool),
+                mic_rms=np.full(T, 300.0, np.float32),
+                mic_peak=np.full(T, 900, np.int16),
+                mic_t_us=(np.arange(T) * 32000).astype(np.int64),
+                wear_id=1, mode="quiz", valid_zone_ratio=1.0, drop_count=0,
+                vad_start_us=-1, vad_end_us=-1, lip_onset_us=-1,
+                voice_onset_us=-1, quality="ok",
+                **({"sensors_seen": seen} if seen else {}))
+    return str(path)
+
+
+def test_summary_counts_trials_labels_and_per_label(tmp_path):
+    bs = _bs()
+    p = _session(tmp_path, "s.h5", ["AB"] * 4)
+    out = bs.summarize_verify_sessions([p])
+    assert out["n_trials"] == 4
+    assert out["labels"] == ["wu", "yi"]
+    assert out["n_labels"] == 2
+    assert out["trials_per_label"] == {"wu": 2, "yi": 2}
+
+
+def test_summary_exposes_per_trial_sensors_not_just_the_session_value(tmp_path):
+    """A mid-session dropout reads "AB" at session level -- measured, not guessed.
+
+    reports/DEGRADED_SESSION.md round 2 established this: /meta's
+    sensors_seen is "AB" for every mid-session dropout case. Showing only
+    that value would tell the operator both sensors were fine while half the
+    trials were recorded with one.
+    """
+    bs = _bs()
+    p = _session(tmp_path, "s.h5", ["AB", "AB", "A", "A"], meta_seen="AB")
+    out = bs.summarize_verify_sessions([p])
+    assert out["sensors_seen"] == ["AB"]                # session level: reassuring
+    assert out["trial_sensors_seen"] == {"AB": 2, "A": 2}   # trial level: the truth
+    assert out["trials_missing_a_sensor"] == 2
+    assert out["trial_sensors_seen_available"] is True
+
+
+def test_no_per_trial_field_is_not_reported_as_all_clear(tmp_path):
+    """Absence of evidence must not render as evidence of absence.
+
+    An older file with no per-trial sensors_seen also yields
+    trials_missing_a_sensor == 0; the flag is what keeps the panel from
+    printing "all trials had both sensors" when nothing was checked.
+    """
+    bs = _bs()
+    p = _session(tmp_path, "s.h5", [None] * 3)
+    out = bs.summarize_verify_sessions([p])
+    assert out["trials_missing_a_sensor"] == 0
+    assert out["trial_sensors_seen_available"] is False
+
+
+def test_an_unreadable_session_does_not_sink_the_whole_summary(tmp_path):
+    """The verification run already finished; a broken summary must not eat it."""
+    bs = _bs()
+    good = _session(tmp_path, "s.h5", ["AB"] * 2)
+    out = bs.summarize_verify_sessions([good, str(tmp_path / "missing.h5")])
+    assert out["n_trials"] == 2
+    assert len(out["errors"]) == 1
+    assert "missing.h5" in out["errors"][0]

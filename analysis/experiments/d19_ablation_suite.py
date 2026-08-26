@@ -11,13 +11,14 @@
 一份分類器/CV 邏輯**——每個消融組態都有 p 值，這樣「掉了 3 個百分點」
 才不會只是雜訊（調度員的建議，合理，照做）。
 
-## 🔴 `groups`：六個檢定跟著 `D18` 一起分組，虛無假設也跟著變
+## 🔴 `groups`：五項消融全部分組，虛無假設也跟著變
 
 `run_ablation_suite()` 支援 `groups=`（每筆 trial 的 `wear_id`），原封不動
 轉傳給底層的六個 `run_permutation_test()` 呼叫（`all`／`mel`／
-`tof_combined`／`tof_l`／`tof_r`／雜訊化後的 `all`）——**同一次呼叫裡
-六個結果永遠拿到同一個分組狀態，不會出現同一份報告裡有些檢定分組了、
-有些沒有這種兩種嚴謹度混在一起的情況**。
+`tof_combined`／`tof_l`／`tof_r`／雜訊化後的 `all`），**以及**
+`time_reversal_ablation()` 自己的 CV 迴圈——**六項全部拿到同一個分組
+狀態，不會出現同一份報告裡有些檢定分組了、有些沒有這種兩種嚴謹度混在
+一起的情況**（`time_reversal` 原本是唯一的例外，補上分組之後不再是）。
 
 這不只是換一種 CV 切法：分組之後 CV 改用 `StratifiedGroupKFold`（同一次
 戴上的樣本不會同時落進訓練跟測試集，堵住 `7c` 實測證明過的洩漏——
@@ -26,11 +27,10 @@ ToF-only 準確率從隨機切的 0.917 掉到分組切的 0.625，那 0.29 就�
 改變**：標籤是在同一個 group 內部打亂，不是全體打亂，問的問題變成
 「在同一次戴上之內，這個模態還分得出詞嗎」——細節與理由見
 `d18_permutation_test.py` 的「🔴 分組驗證」章節，這裡不重複一份可能
-對不上的說明。
-
-**時間反轉測試（第 4 項）是唯一的例外**：它自己實作 CV，不經過
-`run_permutation_test()`，`groups` 對它沒有作用，`format_report()`
-會在有分組時明講這件事。
+對不上的說明。`time_reversal_ablation()` 不吃打亂（它比的是同一個訓練
+好的模型在正常/反轉測試資料上的分數，不是置換檢定），但一樣需要
+`StratifiedGroupKFold` 擋住訓練/測試折之間的同次戴上洩漏——分組驗證
+本身跟「這個檢定要不要打亂標籤」是兩件獨立的事，見該函式文件字串。
 
 只有一個 group（第一批資料很可能只戴一次）時分組驗證做不到，回傳的
 `grouping` 會是 `"ungrouped_single_group"`，**這個狀態在報告裡只出現
@@ -130,21 +130,36 @@ def substitute_modality_with_noise(feature_seqs, modality, random_state=DEFAULT_
 
 
 def time_reversal_ablation(feature_seqs, labels, cv=DEFAULT_CV_FOLDS,
-                            random_state=DEFAULT_RANDOM_STATE):
+                            random_state=DEFAULT_RANDOM_STATE, groups=None):
     """時間反轉測試（Sanity #3）：訓練用正常方向，測試用反轉方向。
 
-    自己做 CV（不是 `run_permutation_test()`）：每一折用正常方向的訓練
-    樣本 fit 模型，然後**分別**在同一折的正常方向測試樣本、反轉方向測試
-    樣本上評分——這樣「正常方向準確率」跟「反轉方向準確率」用的是同一個
-    fold 切法、同一個訓練好的模型，差異只來自測試資料方向，才是乾淨的
-    對照。見模組 docstring「這一項刻意不重用 run_permutation_test()」。
+    **為什麼自己做 CV，而不是重用 `run_permutation_test()`**（跟分組驗證
+    是兩件獨立的事，前者是這個檢定本身的性質，後者是加上去的保護）：
+    `sklearn.model_selection.permutation_test_score()` 在同一個 X 上訓練
+    也在同一個 X 上評分，沒有「訓練用資料集 A、測試用資料集 B」這個介面。
+    這裡的檢定恰好需要這個：每一折用正常方向的訓練樣本 fit 模型，然後
+    **分別**在同一折的正常方向測試樣本、反轉方向測試樣本上評分——這樣
+    「正常方向準確率」跟「反轉方向準確率」用的是同一個 fold 切法、同一個
+    訓練好的模型，差異只來自測試資料的方向，才是乾淨的對照。這個限制跟
+    `groups` 完全無關，即使不分組，`run_permutation_test()` 本來就做不了
+    這件事，所以**分組驗證接上之後這裡仍然自己做 CV**，只是 CV splitter
+    比照 `D18` 換成分組感知版本。
 
-    回傳 dict: {"forward_accuracy", "reversed_accuracy", "cv", "passed"}
-    `cv` 是實際用掉的折數（同樣被夾在最小類別樣本數，理由跟 D18 一致）。
+    **`groups`（同樣是每筆 trial 的 `wear_id`）**：同一次戴上的樣本如果
+    同時落進訓練與測試折，模型可能靠「認出這是哪一次戴的」在兩個方向的
+    測試上都拿到偏高的分數——這個洩漏風險跟另外五項消融完全一樣，時間
+    反轉本身不會讓它消失。分組狀態的判斷（`grouped`／
+    `ungrouped_no_groups_given`／`ungrouped_single_group`）直接重用 `D18`
+    的 `_resolve_grouping()`，這裡不另外寫一份可能對不上的邏輯。
+
+    回傳 dict: {"forward_accuracy", "reversed_accuracy", "cv", "passed",
+                "grouping", "n_groups", "grouping_note"}
+    `cv` 是實際用掉的折數（同樣被夾在最小類別樣本數，理由跟 D18 一致；
+    分組時另外被夾在 group 數，理由也跟 D18 一致）。
     """
-    from sklearn.model_selection import StratifiedKFold
+    from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 
-    from analysis.experiments.d18_permutation_test import make_estimator
+    from analysis.experiments.d18_permutation_test import _resolve_grouping, make_estimator
     from analysis.experiments.exp_c_silhouette import stack_modality
 
     y = np.asarray(labels)
@@ -159,11 +174,21 @@ def time_reversal_ablation(feature_seqs, labels, cv=DEFAULT_CV_FOLDS,
         raise ValueError(f"每個類別至少需要 2 筆樣本才能做 CV，最小類別只有 {min_class_count} 筆")
     n_splits = max(2, min(cv, min_class_count))
 
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    grouping, note, groups_array = _resolve_grouping(groups, y.shape[0])
+    if grouping == "grouped":
+        n_groups = int(np.unique(groups_array).size)
+        # 跟 D18 同一個理由：折數不能超過 group 數，每一折至少要拿到
+        # 一個完整的 group。
+        n_splits = max(2, min(n_splits, n_groups))
+        skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+        split_args = (X_forward, y, groups_array)
+    else:
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+        split_args = (X_forward, y)
 
     forward_scores = []
     reversed_scores = []
-    for train_idx, test_idx in skf.split(X_forward, y):
+    for train_idx, test_idx in skf.split(*split_args):
         estimator = make_estimator()
         estimator.fit(X_forward[train_idx], y[train_idx])
         forward_scores.append(estimator.score(X_forward[test_idx], y[test_idx]))
@@ -173,6 +198,9 @@ def time_reversal_ablation(feature_seqs, labels, cv=DEFAULT_CV_FOLDS,
     return {
         "forward_accuracy": float(np.mean(forward_scores)),
         "reversed_accuracy": reversed_accuracy,
+        "grouping": grouping,
+        "n_groups": (int(np.unique(groups_array).size) if groups_array is not None else None),
+        "grouping_note": note,
         "cv": n_splits,
         "passed": bool(reversed_accuracy < TIME_REVERSAL_MAX_ACCURACY),
     }
@@ -190,27 +218,24 @@ def run_ablation_suite(feature_seqs, labels, n_permutations=DEFAULT_N_PERMUTATIO
     `groups`（每筆 trial 的 `wear_id`，見 `d18_permutation_test.py` 的
     「🔴 分組驗證」說明）：這裡呼叫的六個 `run_permutation_test()`
     （`all`／`mel`／`tof_combined`／`tof_l`／`tof_r`／雜訊化後的 `all`）
-    全部原封不動轉傳，同一個 `run_ablation_suite()` 呼叫裡的六個結果
-    保證拿到同一個分組狀態——不會有的通過驗證、有的沒有，同一份報告
-    出現兩種嚴謹度。傳了 `groups` 之後**不只是換一種 CV 切法**：
-    每個檢定的準確率會變得比較誠實（同一次戴上的樣本不會又當訓練又當
-    測試），這裡各項消融比的「增益」（`gain`/`relative_drop`）也就跟著
-    變得可信；而每個檢定本身背後的虛無假設也跟著改變（組內打亂而非
-    全體打亂，細節見 `d18_permutation_test.py`），問的問題變成「在同一次
-    戴上之內，這個模態還分得出詞嗎」。
-
-    ⚠️ **`time_reversal`（第 4 項）是例外，不吃 `groups`**：它自己實作
-    CV（`time_reversal_ablation()`，見該函式文件字串），不經過
-    `run_permutation_test()`，這裡沒有跟著補上分組邏輯——傳了 `groups`
-    也不影響它。`format_report()` 在有分組時會明確提醒這件事，不讓它被
-    誤讀成「已經比照其他五項處理過」。
+    全部原封不動轉傳，**`time_reversal_ablation()` 自己的 CV 也一併轉傳**
+    ——五項消融保證拿到同一個分組狀態，不會有的通過驗證、有的沒有，
+    同一份報告出現兩種嚴謹度。傳了 `groups` 之後**不只是換一種 CV
+    切法**：每個檢定的準確率會變得比較誠實（同一次戴上的樣本不會又當
+    訓練又當測試），這裡各項消融比的「增益」（`gain`/`relative_drop`）
+    也就跟著變得可信；而 `run_permutation_test()` 那五個檢定背後的虛無
+    假設也跟著改變（組內打亂而非全體打亂，細節見 `d18_permutation_test.py`），
+    問的問題變成「在同一次戴上之內，這個模態還分得出詞嗎」——
+    `time_reversal_ablation()` 本身不是置換檢定，這句話對它不適用，但它
+    一樣需要分組後的 CV 折來擋住同次戴上的洩漏，見該函式文件字串。
 
     回傳 dict: {"is_synthetic", "dual_matrix_vs_single", "all_vs_mel_only",
                 "all_vs_tof_only", "time_reversal", "random_channel",
-                "grouping", "n_groups", "grouping_note"}——後三個是六個
-    分組結果共用的那個狀態（拿 `all` 那次的結果代表，六者必然相同）。
-    每個消融結果都有 "gain"/"relative_drop" 等數字與 "passed"（`None`
-    代表 story 沒有要求 PASS/FAIL，只要求記錄）。
+                "grouping", "n_groups", "grouping_note"}——後三個是全部
+    五項消融共用的那個狀態（拿 `all` 那次 `run_permutation_test()` 的結果
+    代表，因為全部傳同一個 `groups`/樣本數進 `_resolve_grouping()`，
+    結果必然相同）。每個消融結果都有 "gain"/"relative_drop" 等數字與
+    "passed"（`None` 代表 story 沒有要求 PASS/FAIL，只要求記錄）。
     """
     kwargs = dict(n_permutations=n_permutations, cv=cv, random_state=random_state,
                   n_jobs=n_jobs, groups=groups)
@@ -245,7 +270,8 @@ def run_ablation_suite(feature_seqs, labels, n_permutations=DEFAULT_N_PERMUTATIO
         "passed": None,  # story：只記錄，沒有通過/失敗門檻
     }
 
-    time_reversal = time_reversal_ablation(feature_seqs, labels, cv=cv, random_state=random_state)
+    time_reversal = time_reversal_ablation(feature_seqs, labels, cv=cv,
+                                           random_state=random_state, groups=groups)
     time_reversal["name"] = "time_reversal"
 
     noised_feats = substitute_modality_with_noise(feature_seqs, noise_modality, random_state)
@@ -279,9 +305,10 @@ def run_ablation_suite(feature_seqs, labels, n_permutations=DEFAULT_N_PERMUTATIO
 
 
 def _ablation_grouping_lines(suite):
-    """分組驗證狀態，**整份報告只講一次**——六個消融背後的六個
-    `run_permutation_test()` 呼叫共用同一個 `groups`，個別小節裡再各講
-    一次同樣的話只是六句一模一樣的警語洗版，讀報告的人反而更容易略過。
+    """分組驗證狀態，**整份報告只講一次**——五項消融共用同一個 `groups`
+    （`run_permutation_test()` 那五個檢定，加上 `time_reversal_ablation()`
+    自己的 CV），個別小節裡再各講一次同樣的話只是警語洗版，讀報告的人
+    反而更容易略過。
 
     重用 `d18_permutation_test._grouping_lines()` 的三態文字，不是另外
     寫一份可能對不上的版本。
@@ -291,15 +318,7 @@ def _ablation_grouping_lines(suite):
     fake_report = {"all": {"grouping": suite.get("grouping", "ungrouped_no_groups_given"),
                             "n_groups": suite.get("n_groups"),
                             "grouping_note": suite.get("grouping_note")}}
-    lines = _grouping_lines(fake_report)
-    if suite.get("grouping") == "grouped":
-        lines.append(
-            "> ⚠️ **例外：第 4 項「時間反轉測試」不吃 `groups`**——它自己"
-            "實作 CV，不經過 `run_permutation_test()`，這裡沒有分組保護，"
-            "讀它的數字時仍要記得同一次戴上的洩漏風險存在。"
-        )
-        lines.append("")
-    return lines
+    return _grouping_lines(fake_report)
 
 
 def format_report(suite):
