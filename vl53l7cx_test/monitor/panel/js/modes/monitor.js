@@ -390,6 +390,22 @@ registerMode("monitor", (() => {
   const rateCounters = { A: [], B: [] };
   let rafId = null;
   let qualityThresholdsTimerId = null;
+
+  // --- stale-data indicator ------------------------------------------
+  //
+  // Found live (ca's disconnect audit, 2026-08-26): unplugging the device
+  // left every number in this mode's content frozen at its last value --
+  // Hz labels, heatmap cells, all of it -- indistinguishable from a live
+  // feed at a glance. C04's sidebar status bar (shell.js) already detects
+  // this correctly (explicit {type:"link"} events, or -- if none arrive --
+  // no payload data for 3s) and reflects it via #linkDot's "up" class;
+  // this mode just wasn't looking at it. Deliberately reusing that
+  // existing, already-correct detection (reading the DOM state shell.js
+  // already maintains) rather than building a second one here.
+  let linkDotEl = null;
+  let staleBannerEl = null;
+  let staleShown = false; // avoids redundant DOM writes every paint() frame
+  let rootEl = null; // #mode-monitor itself, so paint() can dim the whole section
   let viewMode = "distance";
   let gridsContainer = null;
 
@@ -940,6 +956,19 @@ registerMode("monitor", (() => {
     // visible -- cheap (four small grids) and means switching views (or
     // side-by-side) never shows stale data, satisfying "四張圖同步更新"
     // trivially instead of tracking per-view dirty state.
+    // Reflect C04's link detection (see the module comment near
+    // linkDotEl's declaration) every frame -- cheap (one classList read),
+    // and paint() already runs every frame this mode is visible, so no
+    // extra timer is needed just for this. Guarded by staleShown so a
+    // steady disconnected/connected state doesn't touch the DOM every
+    // single frame, only on the actual transition.
+    const stale = !!linkDotEl && !linkDotEl.classList.contains("up");
+    if (stale !== staleShown) {
+      staleShown = stale;
+      if (staleBannerEl) staleBannerEl.style.display = stale ? "block" : "none";
+      if (rootEl) rootEl.classList.toggle("stale-data", stale);
+    }
+
     for (const sensor of SENSORS) {
       const frame = latestFrame[sensor];
       if (!frame) continue;
@@ -957,6 +986,7 @@ registerMode("monitor", (() => {
 
   return {
     init(root) {
+      rootEl = root;
       root.innerHTML = `
         <div class="stale-data-banner" data-stale-banner style="display:none">
           ⚠ 資料已停止 —— 畫面停在斷線前最後收到的值，不是即時資料
@@ -1102,6 +1132,8 @@ registerMode("monitor", (() => {
         qualityEls.sparkCtx[m.key] = sparkCanvas.getContext("2d");
         sparkResizeObserver.observe(sparkCanvas);
       }
+      staleBannerEl = root.querySelector("[data-stale-banner]");
+      linkDotEl = document.getElementById("linkDot"); // shell.js/C04's own element -- read-only, not ours to modify
       alarmBannerEl = root.querySelector("[data-alarm-banner]");
       reflashNoteEl = root.querySelector("[data-reflash-note]");
       recBtn = root.querySelector("[data-rec-btn]");

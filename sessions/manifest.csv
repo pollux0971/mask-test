@@ -1,4 +1,6 @@
 session_path,trial_idx,label,wear_id,mode,quality,n_frames,valid_zone_ratio,drop_count,session_date
+/home/pollux/Desktop/esp-mask-test/sessions/2026-08-26_S02.h5,0,_baseline,3,seated,ok,900,0.33611111111111114,0,2026-08-26
+/home/pollux/Desktop/esp-mask-test/sessions/2026-08-26_S02.h5,1,不要,3,seated,low,45,0.9333333333333333,3,2026-08-26
 /tmp/bridge-test-2gss7wss/sessions/2026-08-26_S01.h5,0,_baseline,1,quiz,ok,60,1.0,0,2026-08-26
 /tmp/bridge-test-2gss7wss/sessions/2026-08-26_S01.h5,1,一,1,quiz,low,46,0.9239130434782608,3,2026-08-26
 /tmp/bridge-test-5aouaxnn/sessions/2026-08-26_S01.h5,0,_baseline,1,quiz,ok,60,1.0,0,2026-08-26
@@ -30,7 +32,7 @@ session_path,trial_idx,label,wear_id,mode,quality,n_frames,valid_zone_ratio,drop
 /tmp/bridge-test-jadnmpl4/sessions/2026-08-26_S01.h5,0,_baseline,1,quiz,ok,60,1.0,0,2026-08-26
 /tmp/bridge-test-jadnmpl4/sessions/2026-08-26_S01.h5,1,啊,1,quiz,low,45,0.9333333333333332,3,2026-08-26
 /tmp/bridge-test-kfwm23n7/sessions/2026-08-26_S01.h5,0,_baseline,1,quiz,ok,60,1.0,0,2026-08-26
-/tmp/bridge-test-kfwm23n7/sessions/2026-08-26_S01.h5,1,四,1,quiz,low,51,0.9411764705882353,3,2026-08-26
+/tmp/bridge-test-kfwm23n7/sessions/2026-08-26_S01.h5,1,四,1,quiz,low,51,0.9411764705882352,3,2026-08-26
 /tmp/bridge-test-kgg1ez6e/sessions/2026-08-26_S01.h5,0,_baseline,1,quiz,ok,60,1.0,0,2026-08-26
 /tmp/bridge-test-kgg1ez6e/sessions/2026-08-26_S01.h5,1,不要,1,quiz,low,46,0.9239130434782608,3,2026-08-26
 /tmp/bridge-test-kxclk2l4/sessions/2026-08-26_S01.h5,0,_baseline,1,quiz,ok,60,1.0,0,2026-08-26

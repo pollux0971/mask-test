@@ -14,6 +14,29 @@
   gap: 10px;
 }
 
+/* Stale-data indicator (found via ca's disconnect audit, 2026-08-26):
+   without this, every number in this mode -- Hz labels, heatmap cells --
+   froze at its last value when the device disconnected, indistinguishable
+   from a live feed at a glance. Same red/pill language as
+   .quality-alarm-banner below (a stopped feed is a real problem, not an
+   "unverified assumption" caution -- unlike .assumed-badge's amber). */
+.stale-data-banner {
+  font-size: 0.8125rem;
+  font-weight: 700;
+  color: var(--status-bad);
+  background: var(--status-bad-soft);
+  padding: 6px 14px;
+  border-radius: 8px;
+  width: fit-content;
+}
+/* Dims the content, not just the banner -- a small banner alone is exactly
+   the "easy to miss on a projector" failure ca flagged. The frozen numbers
+   themselves stay legible (still useful as "last known value") but visibly
+   different from a live, full-opacity feed. */
+#mode-monitor.stale-data > *:not(.stale-data-banner) {
+  opacity: 0.35;
+}
+
 #mode-monitor .section-label {
   font-size: 0.75rem;
   letter-spacing: 0.08em;

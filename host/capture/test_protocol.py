@@ -904,3 +904,103 @@ def test_mel_full_scale_and_noise_floor_values():
     assert floor["log_mel"][0] == pytest.approx(-10.0)
     ceiling = parse_line("$F,2,1," + ",".join(["0"] * N_MELS))
     assert ceiling["log_mel"][0] == pytest.approx(0.0)
+
+
+# ------------------------- 8. 真板子開機/搶佔雜訊（見 reports/BOOT_OUTPUT.md）
+#
+# `uart_out_lock()`（韌體端）只保護我們自己寫的 `$` 行函式，`ESP_LOG*`
+# 完全不走那把鎖，而 mic_task/uart_cmd_task 是 priority 5、app_main（$T 的
+# 來源）預設 priority 1——高優先權隨時能在 `print_tof_line()` 的 130+ 次
+# printf() 之間插隊。這裡驗證的是「host 端真的擋得住嗎」，不是韌體行為
+# 本身（那邊沒有測試能改，這裡才是唯一能驗證的一端）。
+
+
+def test_esp_log_spliced_at_comma_boundary_mid_tof_is_rejected():
+    """模擬最常見的情形：`print_tof_line()` 印到一半（在兩個 `,%d` 之間）被
+    priority 5 的 task 搶走，插進一整行 `ESP_LOGI`。韌體端的 log 呼叫沒有
+    自己的前導換行，所以它會直接接在已印出的逗號後面，跟被打斷的 $T
+    黏成『一行』，殘餘的後半段 $T 資料則變成下一行（不是 `$` 開頭）。"""
+    values = TOF_A.split(",")
+    head = ",".join(values[:25])          # $T 前段：seq/t_us/dim + 20 個值
+    tail = ",".join(values[25:])          # 被截斷丟失的後段
+    log_text = "I (98765) bone_mic: a15_perf: mic_task stack headroom = 3200 bytes"
+    glued_line = head + "," + log_text    # 韌體端實際會送出的『一行』
+    orphan_line = tail                    # 殘餘尾段，下一次 readline() 收到它
+
+    assert parse_line(glued_line) is None          # 少了尾段的值，長度不足
+    assert parse_line(orphan_line) is None          # 不是 `$` 開頭，本來就不會被當資料
+
+    p = ProtocolParser()
+    p.feed(STATUS_V2)
+    e1 = p.feed(glued_line)
+    e2 = p.feed(orphan_line)
+    assert e1 is None and e2 is None
+    assert p.stats.malformed == 1           # glued_line：$ 開頭但解不出來
+    assert p.stats.ignored == 1             # orphan_line：不是 $ 開頭
+    assert p.stats.parsed == 1              # 只有 $STATUS
+
+
+def test_esp_log_spliced_mid_digit_mangles_one_value_and_is_rejected():
+    """更刁鑽的情形：搶佔剛好發生在單一 `printf(",%d")` 呼叫**之中**
+    （UART TX 緩衝滿、驅動要等待時），把一個數值本身從中間切開，
+    log 文字直接嵌進那個 token 裡（例如 `88` 被切成 `8` 和 `8...`）。"""
+    values = TOF_A.split(",")
+    mangled = values.copy()
+    mangled[20] = mangled[20][:1] + "I (98765) bone_mic: a15_perf: ...bytes" + mangled[20][1:]
+    line = ",".join(mangled)
+    assert parse_line(line) is None         # 該值不再是純數字，_i16 直接拒絕
+
+
+def test_one_zone_short_tof_is_the_dangerous_case_and_is_caught():
+    """peer 標為『最危險』的情形：不是明顯亂碼，只是**少一個 zone 的值**
+    ——欄位數比 `2*dim` 少 1，是最容易被『看起來像一個完整但比較短的 $T』
+    誤判成好資料的形態。`_parse_tof` 的 `len(values) < 2*dim` 檢查必須擋下它，
+    不能因為前向相容通則放寬成『至少 N 段』就連這個也放過。"""
+    values = TOF_A.split(",")
+    short = ",".join(values[:-1])           # 32 個值只剩 31 個
+    e = parse_line(short)
+    assert e is None, "少一個 zone 的 $T 被當成好資料解析出來了——這是資料完整性的破口"
+
+
+def test_consecutive_idf_boot_log_lines_never_become_events():
+    """開機時 app_main() 被呼叫之前，IDF 自己的元件初始化會印幾十行
+    `I (數字) tag: 文字`——這些必須全部算 ignored，一個都不能被誤判成
+    畸形 `$` 行（畸形行計數是用來衡量 UART 品質的，開機噪音混進去會
+    污染這個指標）。"""
+    boot_lines = [
+        "I (27) boot: ESP-IDF v6.0.2 2nd stage bootloader",
+        "I (30) boot: chip revision: v0.2",
+        "I (39) boot: Partition Table:",
+        "I (123) cpu_start: Pro cpu up.",
+        "I (456) cpu_start: Starting app cpu, entry point is 0x40376b0c",
+        "I (789) heap_init: Initializing. RAM available for dynamic allocation:",
+        "I (1011) spi_flash: detected chip: generic",
+        "I (1213) main_task: Started on CPU0",
+        "I (1415) main_task: Calling app_main()",
+    ]
+    p = ProtocolParser()
+    for line in boot_lines:
+        assert p.feed(line) is None
+    p.feed(STATUS_V2)
+    p.feed(TOF_A)
+    assert p.stats.ignored == len(boot_lines)
+    assert p.stats.malformed == 0
+    assert p.stats.parsed == 2
+
+
+def test_rom_boot_garbage_bytes_do_not_crash_or_become_events():
+    """開機最前面那幾行是 Mask ROM 印的，用固定的 ROM baud（不是我們設定的
+    460800），host 端用 460800 去讀會整段變成看不懂的位元組——可能根本不是
+    合法 UTF-8。`_decode()` 必須吃得下任何 bytes，不能拋例外，也不能剛好被
+    誤判成 `$` 開頭的資料行。"""
+    garbage_chunks = [
+        b"\xaa\x55\x1c\x00\xff\xfe\x00rst:0x1 (POWERON_RESET)\r\n",
+        b"\x00\x80\x81\xffSPIWP:0xee\r\n",
+        bytes(range(0, 32)),                 # 一整段隨機控制字元
+        b"\xff\xff\xff\xc0\xc1entry 0x403c8d20\r\n",   # 非法 UTF-8 續位元組
+    ]
+    p = ProtocolParser()
+    for chunk in garbage_chunks:
+        assert p.feed(chunk) is None          # 不拋例外就是及格
+    assert p.stats.malformed == 0             # 沒有一段剛好湊成 `$` 開頭還過欄位檢查
+    assert p.stats.parsed == 0
