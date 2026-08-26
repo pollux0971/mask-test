@@ -102,18 +102,59 @@ def parse_args(argv=None):
 # ------------------------------------------------------------------ 特徵組裝
 
 
+DEFAULT_TOF_RATE_HZ = 30.0
+
+
+def _tof_row_to_optional(values_row, valid_row):
+    """`Aligner`/`TofSample` 的慣例是無效 zone 填 `None`，不是 HDF5 裡的
+    `NaN`（`host/align/aligner.py` 模組文件）——這裡把 `§2` 的 NaN 表示法
+    轉成 `Aligner` 認得的表示法，authoritative 的是 `valid`，不是檢查
+    `NaN`（跟真機的 `protocol.py` 對無效欄位一律回 `None` 是同一個規矩）。
+    """
+    return [float(v) if ok else None for v, ok in zip(values_row, valid_row)]
+
+
+def _infer_tof_rate_hz(tof_t_us):
+    """`Aligner.frames()` 需要一個輸出頻率；用這筆 trial 自己實測的 ToF
+    幀間隔反推，而不是寫死 30——8×8 組態是 10 Hz（CONTRACTS.md §1.4），
+    寫死 30 會讓那個組態的輸出格點跟實際取樣完全對不上。"""
+    diffs = np.diff(np.asarray(tof_t_us, dtype=np.float64))
+    median_us = float(np.median(diffs))
+    if median_us <= 0:
+        return DEFAULT_TOF_RATE_HZ
+    return 1e6 / median_us
+
+
 def build_feature_seqs(trials, session_by_trial):
     """把 trial 走一遍 `D01` → `D02` → `D03`，回傳 `(feature_seqs, labels)`。
 
-    任何一筆組裝失敗（幀數對不上、缺 mel、baseline 缺漏）就**跳過那一筆並
-    記錄**，不是整批放棄——一次 session 幾十筆，為了一筆壞掉的丟掉全部太貴。
-    回傳 `(feature_seqs, labels, skipped, by_trial)`——`skipped` 是被跳過的
-    清單（會寫進報告），`by_trial` 是 `id(trial) -> 特徵`，給 `D12` 的距離比
-    用（它要知道哪一筆特徵屬於哪一次戴）。
+    **跨模態對齊走 `host/align/aligner.py` 的 `Aligner` +
+    `host/features/live_pipeline.py` 的 `assemble_query_from_aligned_frames()`
+    ——跟線上推論唯一可能的路徑用同一份程式碼**，不是離線自己重寫一套。
+
+    這裡原本是各模態各自算完 z-score/CMN 後用 `n = min(len(...))`
+    按索引截斷——ToF 30 Hz、Mel 62.5 Hz，取樣率不同，同一個索引對應到的
+    真實時間不一樣，而且落差隨索引線性增長。`feature_assembly
+    .assemble_feature_seq()` 自己的模組文件明講輸入「必須已經由 B06 對到
+    同一組共用幀」，舊寫法完全沒有做這件事，直接違反自己下游模組寫明的
+    前提。量測見 `reports/ALIGNMENT_MISMATCH.md`——只看合併後的 104 維
+    向量幾乎量不出差異（ToF 通道把 Mel 通道的落差稀釋掉了），拆開來看
+    Mel-only 的 cosine 距離達 0.86–1.46（值域 0–2），且會讓分類結果翻轉。
+
+    ⚠️ **改這裡會讓 `D06`/`D09`/`D22` 的數字跟著變，這是預期的**——
+    舊數字是拿一條違反自己前提的管線算出來的，不是「不小心變了」。
+
+    任何一筆組裝失敗（幀數不足、缺 mel/`mel_t_us`、baseline 缺漏）就
+    **跳過那一筆並記錄**，不是整批放棄——一次 session 幾十筆，為了一筆
+    壞掉的丟掉全部太貴。回傳 `(feature_seqs, labels, skipped, by_trial)`
+    ——`skipped` 是被跳過的清單（會寫進報告），`by_trial` 是
+    `id(trial) -> 特徵`，給 `D12` 的距離比用。
     """
-    from analysis.features.audio_features import mel_features
-    from analysis.features.feature_assembly import assemble_feature_seq
-    from analysis.features.tof_features import tof_features
+    from host.align.aligner import Aligner
+    from host.features.live_pipeline import (
+        InsufficientFramesError,
+        assemble_query_from_aligned_frames,
+    )
 
     feature_seqs, labels, skipped, by_trial = [], [], [], {}
     for trial in trials:
@@ -126,16 +167,42 @@ def build_feature_seqs(trials, session_by_trial):
         if trial.mel is None:
             skipped.append((trial.key, "沒有 mel dataset（§2 選填）"))
             continue
+        if trial.mel_t_us is None:
+            skipped.append((trial.key, "沒有 mel_t_us（§2 規定跟 mel 成對必寫，缺了就沒有真實時間可以對齊）"))
+            continue
+        n_tof = trial.tof_a.shape[0]
+        n_mel = trial.mel.shape[0]
+        if n_tof < 2 or n_mel < 2:
+            skipped.append((trial.key, f"ToF/Mel 原生幀數不足以對齊（ToF={n_tof}, Mel={n_mel}）"))
+            continue
         try:
-            tof_a_z = tof_features(trial.tof_a, trial.tof_valid_a, mu_a, sigma_a)
-            tof_b_z = tof_features(trial.tof_b, trial.tof_valid_b, mu_b, sigma_b)
-            mel_cmn = mel_features(trial.mel)
-            n = min(len(tof_a_z), len(tof_b_z), len(mel_cmn), len(trial.tof_t_us))
-            if n < 2:
-                skipped.append((trial.key, f"對齊後只剩 {n} 幀"))
-                continue
-            seq = assemble_feature_seq(tof_a_z[:n], tof_b_z[:n], mel_cmn[:n],
-                                       trial.tof_t_us[:n])
+            n_zones = trial.tof_valid_a.shape[1]
+            aligner = Aligner()
+            for i in range(n_tof):
+                t_us = int(trial.tof_t_us[i])
+                aligner.push_tof(
+                    "A", t_us,
+                    _tof_row_to_optional(trial.tof_a[i, :n_zones], trial.tof_valid_a[i]),
+                    _tof_row_to_optional(trial.tof_a[i, n_zones:], trial.tof_valid_a[i]),
+                    trial.tof_valid_a[i],
+                )
+                aligner.push_tof(
+                    "B", t_us,
+                    _tof_row_to_optional(trial.tof_b[i, :n_zones], trial.tof_valid_b[i]),
+                    _tof_row_to_optional(trial.tof_b[i, n_zones:], trial.tof_valid_b[i]),
+                    trial.tof_valid_b[i],
+                )
+            for i in range(n_mel):
+                aligner.push_mel(int(trial.mel_t_us[i]), trial.mel[i])
+
+            rate_hz = _infer_tof_rate_hz(trial.tof_t_us)
+            frames = list(aligner.frames(
+                int(trial.tof_t_us[0]), int(trial.tof_t_us[-1]), rate_hz=rate_hz,
+            ))
+            seq = assemble_query_from_aligned_frames(frames, mu_a, sigma_a, mu_b, sigma_b)
+        except InsufficientFramesError as exc:
+            skipped.append((trial.key, f"三個模態同時有資料的幀不足，無法對齊：{exc}"))
+            continue
         except Exception as exc:                     # noqa: BLE001 — 逐筆容錯
             skipped.append((trial.key, f"{type(exc).__name__}: {exc}"))
             continue
