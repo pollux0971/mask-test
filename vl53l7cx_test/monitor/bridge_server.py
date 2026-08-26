@@ -28,9 +28,11 @@ Usage:
 import argparse
 import base64
 import http.server
+import inspect
 import json
 import queue
 import re
+import signal
 import struct
 import subprocess
 import sys
@@ -179,10 +181,21 @@ protocol_state = {"parser": None}
 drop_tracker = DropTracker()
 quality_thresholds = ThresholdTable(THRESHOLDS_PATH)
 clock_aligner = ClockAligner()
+def current_parser_stats():
+    """ProtocolParser.stats for the live connection, or {} before one exists."""
+    parser = protocol_state.get("parser")
+    return parser.stats.as_dict() if parser is not None else {}
+
+
 quality = QualityAggregator(
     quality_thresholds,
     drop_tracker=drop_tracker,
     clock_aligner=clock_aligner,
+    # The malformed counter was already being computed and already reaching
+    # this process; it was simply never read here. A rejected line leaves the
+    # same seq gap as a frame that never arrived, so without it the transport
+    # alarm cannot tell the two apart.
+    parser_stats=current_parser_stats,
 )
 
 
@@ -212,6 +225,11 @@ def to_sse_event(event):
         out = {"type": "heartbeat", "drop_A": event["drop_A"],
                "drop_B": event["drop_B"], "drop_M": event["drop_M"],
                "heap": event["heap"], "temp_c": event["temp_c"]}
+        # protocol.py attaches the host-side parser counters to every $H.
+        # They used to be dropped right here by the whitelist -- computed,
+        # attached, then discarded at the last gate.
+        if event.get("host") is not None:
+            out["host"] = event["host"]
     elif kind == "status":
         # parser.state() is the seam B02 built for exactly this: it already
         # carries protocol_version / degraded / warning / recording_allowed,
@@ -485,49 +503,45 @@ def _frames_from_live_session(window_s):
 
 def _frames_from_stored_trial(h5_path, trial_group):
     """Read one already-recorded trial's tof_A/tof_B/mel back out of the
-    session HDF5 file and re-align them through a fresh Aligner. Read-only;
-    does not import or touch host/storage/session_writer.py or
-    session_loader.py. ToF (@30Hz) and Mel (@62.5Hz) are stored on their
+    session HDF5 file and re-align them through a fresh Aligner. Reads via
+    analysis/reporting/session_loader.py (not raw h5py directly -- that
+    would leave bool datasets as numpy.bool_ instead of Python bool;
+    session_loader already does that conversion, same convention
+    analysis/similarity/build_templates_from_session.py uses for the
+    training-side path). ToF (@30Hz) and Mel (@62.5Hz) are stored on their
     own separate time axes (CONTRACTS.md §2: "mel 的時間軸是 F 不是 M")
     and are not frame-aligned to each other on disk, so this cannot just
     concatenate the raw arrays -- it has to go back through Aligner exactly
     like the live-capture path does, via the same
     assemble_query_from_aligned_frames() downstream.
     """
-    import h5py
+    from analysis.reporting.session_loader import load_session
 
-    with h5py.File(h5_path, "r") as f:
-        if trial_group not in f:
-            raise KeyError(f"{trial_group} 不存在於 {h5_path}")
-        g = f[trial_group]
-        tof_A = np.asarray(g["tof_A"])
-        tof_B = np.asarray(g["tof_B"])
-        tof_valid_A = np.asarray(g["tof_valid_A"])
-        tof_valid_B = np.asarray(g["tof_valid_B"])
-        tof_t_us = np.asarray(g["tof_t_us"])
-        if "mel" not in g or "mel_t_us" not in g:
-            raise ValueError(f"{trial_group} 沒有 mel/mel_t_us（選填欄位，這筆錄音當下 Mel 未開啟）")
-        mel = np.asarray(g["mel"])
-        mel_t_us = np.asarray(g["mel_t_us"])
+    session = load_session(Path(h5_path))
+    trial = next((t for t in session.trials if t.key == trial_group), None)
+    if trial is None:
+        raise KeyError(f"{trial_group} 不存在於 {h5_path}")
+    if trial.mel is None or trial.mel_t_us is None:
+        raise ValueError(f"{trial_group} 沒有 mel/mel_t_us（選填欄位，這筆錄音當下 Mel 未開啟）")
 
-    n_zones = tof_valid_A.shape[1]
+    n_zones = trial.n_zones
     aligner = Aligner()
-    for i in range(len(tof_t_us)):
+    for i in range(len(trial.tof_t_us)):
         aligner.push_tof(
-            "A", int(tof_t_us[i]),
-            [None if np.isnan(v) else float(v) for v in tof_A[i, :n_zones]],
-            [None if np.isnan(v) else float(v) for v in tof_A[i, n_zones:]],
-            [bool(v) for v in tof_valid_A[i]])
+            "A", int(trial.tof_t_us[i]),
+            [None if np.isnan(v) else float(v) for v in trial.tof_a[i, :n_zones]],
+            [None if np.isnan(v) else float(v) for v in trial.tof_a[i, n_zones:]],
+            [bool(v) for v in trial.tof_valid_a[i]])
         aligner.push_tof(
-            "B", int(tof_t_us[i]),
-            [None if np.isnan(v) else float(v) for v in tof_B[i, :n_zones]],
-            [None if np.isnan(v) else float(v) for v in tof_B[i, n_zones:]],
-            [bool(v) for v in tof_valid_B[i]])
-    for i in range(len(mel_t_us)):
-        aligner.push_mel(int(mel_t_us[i]), [float(v) for v in mel[i]])
+            "B", int(trial.tof_t_us[i]),
+            [None if np.isnan(v) else float(v) for v in trial.tof_b[i, :n_zones]],
+            [None if np.isnan(v) else float(v) for v in trial.tof_b[i, n_zones:]],
+            [bool(v) for v in trial.tof_valid_b[i]])
+    for i in range(len(trial.mel_t_us)):
+        aligner.push_mel(int(trial.mel_t_us[i]), [float(v) for v in trial.mel[i]])
 
-    t_start = int(min(tof_t_us[0], mel_t_us[0]))
-    t_end = int(max(tof_t_us[-1], mel_t_us[-1]))
+    t_start = int(min(trial.tof_t_us[0], trial.mel_t_us[0]))
+    t_end = int(max(trial.tof_t_us[-1], trial.mel_t_us[-1]))
     return list(aligner.frames(t_start, t_end))
 
 # Newest device timestamp seen on any stream. The trial machine needs a
@@ -962,6 +976,43 @@ def open_trial_machine(info):
 # collide for real -- hold_stop() runs the HDF5 write inside the request, and
 # an unsynchronised tick() during it took the whole handler down.
 trial_lock = threading.Lock()
+
+
+#: Fields the panel may send that the state machine is still growing support
+#: for. Passed through when the method accepts them, and reported loudly when
+#: it does not -- silently dropping a field the client bothered to send is the
+#: failure mode this project keeps paying for (speaking_mode was dropped this
+#: way, and energy_mu before it).
+OPTIONAL_TRIAL_FIELDS = ("baseline_age_s",)
+_warned_unsupported_fields = set()
+
+
+def _optional_trial_kwargs(method, body):
+    """Forward the optional fields this method actually accepts.
+
+    baseline_age_s records how stale the baseline was when a trial was
+    recorded. It matters after the fact, not during: a four-hour session
+    will outlive its baseline, the panel warns the operator at the time, but
+    nothing in the HDF5 would say which trials were recorded after it went
+    stale -- and E05 is not going to be recorded twice.
+    """
+    try:
+        accepted = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return {}
+    out = {}
+    for field in OPTIONAL_TRIAL_FIELDS:
+        value = body.get(field)
+        if value is None:
+            continue
+        if field in accepted:
+            out[field] = value
+        elif field not in _warned_unsupported_fields:
+            _warned_unsupported_fields.add(field)
+            print(f"[bridge] ⚠ panel sent {field}={value!r} but "
+                  f"{method.__name__}() does not accept it yet — dropping it. "
+                  f"Recorded trials will not carry this field until it does.")
+    return out
 
 
 def as_trial_events(result):
@@ -1968,11 +2019,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # rather than taking down a trial that has already been recorded.
         if action == "start":
             return as_trial_events(machine.start_trial(
-                label=body.get("label"), speaking_mode=body.get("speaking_mode")))
+                label=body.get("label"), speaking_mode=body.get("speaking_mode"),
+                **_optional_trial_kwargs(machine.start_trial, body)))
         if action == "hold/start":
             return as_trial_events(machine.hold_start(
                 device_t_us=device_t_us, label=body.get("label"),
-                speaking_mode=body.get("speaking_mode")))
+                speaking_mode=body.get("speaking_mode"),
+                **_optional_trial_kwargs(machine.hold_start, body)))
         if action == "hold/stop":
             return as_trial_events(machine.hold_stop(device_t_us=device_t_us))
         if action == "confirm":
@@ -2330,6 +2383,48 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
+shutdown_event = threading.Event()
+
+
+def _on_sigint(signum, frame):
+    """Signal handler. Sets a flag and prints; touches nothing else.
+
+    Deliberately does NOT close the HDF5 file here, and installing it at all
+    is the point: with the default handler, Ctrl-C raises KeyboardInterrupt
+    at whatever bytecode boundary the interpreter happens to be at -- and
+    h5py's weakref cleanup callbacks are such a boundary. An exception raised
+    inside a weakref callback is *swallowed* by Python, which prints
+    "Exception ignored in:" and carries on. Measured at 5 times out of 6: the
+    operator presses Ctrl-C, sees one line of noise, and the bridge keeps
+    recording as if nothing happened. They then reach for something more
+    dangerous, like pulling the power.
+
+    Setting a flag moves "when do we shut down" from a random instant chosen
+    by the signal to a checkpoint we control.
+    """
+    if shutdown_event.is_set():
+        return  # a second Ctrl-C: let the default behaviour take over
+    print(f"\n[bridge] 收到中斷訊號 ({signal.Signals(signum).name})，正在收尾…",
+          flush=True)
+    shutdown_event.set()
+
+
+def close_session_writer():
+    """Close the session HDF5 cleanly, at a point of our choosing."""
+    with session_lock:
+        writer = session_runtime.get("writer")
+        session_runtime["writer"] = None
+        session_runtime["trial"] = None
+    if writer is None:
+        print("[bridge] 沒有開著的 session 檔案。", flush=True)
+        return
+    try:
+        writer.__exit__(None, None, None)
+        print("[bridge] session 檔案已關閉。", flush=True)
+    except Exception as exc:
+        print(f"[bridge] 關閉 session 檔案時出錯: {exc}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", default="/dev/ttyUSB0", help="ESP32 serial port")
@@ -2394,10 +2489,20 @@ def main():
     server.serial_port = args.port
     print(f"[bridge] panel: http://127.0.0.1:{args.http_port}/")
     print(f"[bridge] serial: {args.port} @ {args.baud}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+
+    # SIGINT only. SIGTERM and SIGKILL were measured as safe exactly as they
+    # are (the in-progress trial disappears whole, everything before it reads
+    # back), and they are safe *because* nothing Python-level runs -- adding a
+    # handler would replace proven behaviour with untested behaviour.
+    # SIGINT is the one that needs help: it is the only one that raises
+    # through Python, and therefore the only one that can be swallowed.
+    signal.signal(signal.SIGINT, _on_sigint)
+
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    shutdown_event.wait()
+    close_session_writer()
+    server.shutdown()
+    print("[bridge] 已停止。")
 
 
 if __name__ == "__main__":

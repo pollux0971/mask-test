@@ -1,0 +1,179 @@
+"""建樣板：把已經錄好的 session（一或多個 HDF5 檔）變成
+`RecognitionService`/`GET /templates`/`POST /recognize` 可以直接載入的
+`templates/<subject>_<wear_id>.npz`。
+
+`D08.md`（Enrollment 樣板管理）範圍裡「樣板存/載」的存檔機制
+（`analysis/similarity/enrollment.py` 的 `save_templates`/`load_templates`/
+`template_path`）已經存在且測試過，但「把真的錄音變成樣板」這個串接
+動作——不管是命令列還是面板——從沒有人寫過。`D08` 完整範圍還包含 LOOCV、
+逐樣板貢獻度分析、壞樣板標記與重錄介面（配合 `C14`），那些卡在
+`C20`/`D09`/`E06` 依賴鏈，**不在這支腳本範圍內**——這支腳本只做「錄音 →
+樣板」這一段，讓 `/recognize` 有東西可以吃。
+
+🔴 **每一筆樣板都用跟 `POST /recognize` 完全同一條路組出來**：
+`host/align/aligner.Aligner` + `host/features/live_pipeline.
+assemble_query_from_aligned_frames`——**不是** `analysis/run_all.py` 的
+`build_feature_seqs()`。兩者的對齊邏輯不一樣：`run_all.py` 直接把
+`tof_a`/`tof_b`/`mel` 截斷到最短長度（幀數對齊），`Aligner` 用 `t_us` 做
+真正的時間對齊（`bisect_left` + nearest/線性內插）。`$T` 跟 `$F` 幀率不同
+（`CONTRACTS.md` 早就警告過），如果建樣板跟線上推論用不同對齊邏輯，
+準確率會系統性偏差，而且不會有任何錯誤訊息——這正是
+`esp-mask-test-59` 讀程式碼比對兩條路徑後發現的，這支腳本刻意避開它。
+
+用 `analysis/reporting/session_loader.py` 讀 HDF5（不直接開 `h5py`——那樣
+布林值會變成 `numpy.bool_`，`session_loader` 已經處理過這個轉換）。
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+from analysis.reporting.session_loader import load_session, usable_trials
+from analysis.similarity.enrollment import save_templates
+from host.align.aligner import Aligner
+from host.features.live_pipeline import InsufficientFramesError, assemble_query_from_aligned_frames
+
+# 樣板數低於這個值時，LOOCV/準確率這類「留一筆出來測」的統計不可靠——
+# n=1 時分母是 0，算出來的數字是 nan，不是「還沒錄夠」的 0%，也不是「還
+# 不錯」；n=2 時只有兩種可能結果（0% 或 100%），噪聲極大。這裡不跑 LOOCV
+# （D08 的範圍，這支腳本不做），只在建完樣板時把這個限制講清楚。
+MIN_TEMPLATES_WARN = 3
+RECOMMENDED_TEMPLATES = 30  # reports/HANDOFF.md §3.1：D22 實測 n>=30 時誤拒率 <=1.1%
+
+
+def _tof_row_to_lists(tof, valid_row, n_zones):
+    """session_loader.Trial 的無效值是 NaN（跟 HDF5 schema 一致）；
+    Aligner/AlignedFrame 的慣例是 None -- 這裡做那個轉換，僅此而已。"""
+    distance = [None if np.isnan(v) else float(v) for v in tof[:n_zones]]
+    signal = [None if np.isnan(v) else float(v) for v in tof[n_zones:]]
+    return distance, signal
+
+
+def _aligner_for_trial(trial):
+    aligner = Aligner()
+    n_zones = trial.n_zones
+    for i in range(len(trial.tof_t_us)):
+        d_a, s_a = _tof_row_to_lists(trial.tof_a[i], trial.tof_valid_a[i], n_zones)
+        aligner.push_tof("A", int(trial.tof_t_us[i]), d_a, s_a, [bool(v) for v in trial.tof_valid_a[i]])
+        d_b, s_b = _tof_row_to_lists(trial.tof_b[i], trial.tof_valid_b[i], n_zones)
+        aligner.push_tof("B", int(trial.tof_t_us[i]), d_b, s_b, [bool(v) for v in trial.tof_valid_b[i]])
+    for i in range(len(trial.mel_t_us)):
+        aligner.push_mel(int(trial.mel_t_us[i]), [float(v) for v in trial.mel[i]])
+    return aligner
+
+
+def build_template_vector(session, trial):
+    """One trial -> one (T,104) template vector, via the exact same
+    Aligner + live_pipeline path POST /recognize uses (bridge_server.py's
+    _handle_recognize / _frames_from_live_session / _frames_from_stored_trial)."""
+    if trial.mel is None or trial.mel_t_us is None:
+        raise ValueError(f"{trial.key}: 沒有 mel/mel_t_us（選填欄位，這筆錄音當下 Mel 未開啟），無法組樣板")
+
+    mu_A, sigma_A = session.baseline("A")
+    mu_B, sigma_B = session.baseline("B")
+    if mu_A is None or mu_B is None:
+        raise ValueError(f"{trial.key}: session 缺 baseline mu/sigma，無法計算 ToF 特徵")
+
+    aligner = _aligner_for_trial(trial)
+    t_start = int(min(trial.tof_t_us[0], trial.mel_t_us[0]))
+    t_end = int(max(trial.tof_t_us[-1], trial.mel_t_us[-1]))
+    frames = list(aligner.frames(t_start, t_end))
+
+    query = assemble_query_from_aligned_frames(frames, mu_A, sigma_A, mu_B, sigma_B)
+    return query.data  # fixed T=24 -- matches RecognitionService's default dist_method="cosine"
+
+
+def build_templates(sessions, require_quality=("ok", "low")):
+    """回傳 (templates_by_class, provenance, skipped)。
+
+    provenance: {label: [{"session": path, "trial": trial_key}, ...]} ——
+    使用者會錄好幾次 session，這是唯一能回答「這批樣板哪些來自哪次錄製」
+    的地方，分不出來的話發現某次錄壞了也沒辦法只重錄那一批。
+
+    skipped: [(trial_key, reason), ...] —— 逐筆容錯（跟 run_all.py 的
+    build_feature_seqs() 同一種紀律：一筆組不出來就跳過並記錄原因，不是
+    整批放棄），但**不重用**那支函式本身，理由見模組 docstring。
+    """
+    templates_by_class = {}
+    provenance = {}
+    skipped = []
+    for session, trial in usable_trials(sessions, require_quality=require_quality):
+        try:
+            vec = build_template_vector(session, trial)
+        except (ValueError, InsufficientFramesError) as exc:
+            skipped.append((trial.key, str(exc)))
+            continue
+        templates_by_class.setdefault(trial.label, []).append(vec)
+        provenance.setdefault(trial.label, []).append({"session": str(session.path), "trial": trial.key})
+    return templates_by_class, provenance, skipped
+
+
+def _print_summary(templates_by_class, skipped):
+    if skipped:
+        print(f"[build_templates] 跳過 {len(skipped)} 筆（逐筆記錄原因，不是整批放棄）：")
+        for key, reason in skipped:
+            print(f"  - {key}: {reason}")
+
+    if "_reject" not in templates_by_class:
+        print("[build_templates] ⚠ 沒有任何 _reject（靜止／其他）樣板——"
+              "RecognitionService 需要它校準拒識門檻（D22 雙邊 ROC），"
+              "缺少的話這批樣板無法拿去建構 RecognitionService。", file=sys.stderr)
+
+    print("[build_templates] 各類別樣板數：")
+    for label, vecs in sorted(templates_by_class.items()):
+        n = len(vecs)
+        note = ""
+        if n < MIN_TEMPLATES_WARN:
+            note = (f"  ⚠ 只有 {n} 筆——這種「留一筆出來測」的統計在 n={n} 時不可靠："
+                    f"n=1 沒有東西可以留一筆出來測，算出來的準確率是 nan（不是 0%，"
+                    f"也不是「還不錯」）；n=2 只有兩種結果（0% 或 100%），噪聲極大。"
+                    f"至少 {MIN_TEMPLATES_WARN} 筆才有意義，正式 enrollment 建議每個詞"
+                    f"約 {RECOMMENDED_TEMPLATES} 筆（reports/HANDOFF.md §3.1）")
+        print(f"  {label}: {n}{note}")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--session", action="append", required=True, dest="sessions",
+                         help="要用的 session HDF5 檔路徑，可重複給多個（同一次戴上分好幾次錄）")
+    parser.add_argument("--out", required=True, help="輸出的 .npz 路徑（例如 templates/alice_1.npz）")
+    parser.add_argument("--subject", required=True)
+    parser.add_argument("--wear-id", type=int, required=True)
+    parser.add_argument("--require-quality", default="ok,low",
+                         help="逗號分隔，預設 ok,low（排除 rejected，跟 enrollment.py 的 "
+                              "EXCLUDED_QUALITY / session_loader.usable_trials 預設一致）")
+    args = parser.parse_args(argv)
+
+    require_quality = tuple(q.strip() for q in args.require_quality.split(","))
+
+    sessions = [load_session(Path(p)) for p in args.sessions]
+    templates_by_class, provenance, skipped = build_templates(sessions, require_quality)
+
+    if not templates_by_class:
+        print(f"[build_templates] 0 筆可用 trial（quality 篩選：{require_quality}）"
+              "——沒有東西可以建樣板", file=sys.stderr)
+        _print_summary(templates_by_class, skipped)
+        return 1
+
+    _print_summary(templates_by_class, skipped)
+
+    out_path = Path(args.out)
+    save_templates(templates_by_class, out_path, subject=args.subject, wear_id=args.wear_id)
+
+    provenance_path = out_path.with_suffix(".provenance.json")
+    provenance_path.write_text(json.dumps({
+        "subject": args.subject, "wear_id": args.wear_id,
+        "source_sessions": [str(s.path) for s in sessions],
+        "require_quality": list(require_quality),
+        "trials_by_class": provenance,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"[build_templates] 存好：{out_path}")
+    print(f"[build_templates] 樣板來源記錄：{provenance_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

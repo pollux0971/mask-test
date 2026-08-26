@@ -712,6 +712,44 @@ def test_speaking_mode_written_to_hdf5(tmp_path):
         assert f["trial_000"].attrs["speaking_mode"] == "whisper"
 
 
+def test_baseline_age_s_written_to_hdf5(tmp_path):
+    """ca's audit: a stale baseline produces trials that look fine (no
+    crash, no error) but have a wrong z-score reference the whole way
+    down -- a screen warning only protects whoever's watching it live,
+    this is what lets D14 flag/exclude trials after the fact. Only the
+    age gets stored, not a "was it stale" verdict -- the threshold can
+    change later, a stored age never goes stale itself."""
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
+    _feed_tof(aligner, "A", 900_000, 1_300_000)
+    _feed_tof(aligner, "B", 900_000, 1_300_000)
+    _feed_mic(sm, 900_000, 1_300_000)
+
+    sm.hold_start(device_t_us=1_000_000, baseline_age_s=42.5)
+    sm.hold_stop(device_t_us=2_000_000)
+    writer.__exit__(None, None, None)
+
+    with h5py.File(h5_path, "r") as f:
+        assert f["trial_000"].attrs["baseline_age_s"] == pytest.approx(42.5)
+
+
+def test_baseline_age_s_omitted_when_not_provided(tmp_path):
+    """沒給就整個 attr 不寫入（跟 vad_start_us 等同一個原則），不是 0——
+    0 秒是一個合法的年齡（剛擷取完立刻錄），會被誤讀成「baseline 很新鮮」。"""
+    clock = FakeClock()
+    sm, writer, aligner, h5_path, manifest_path = _make_sm(tmp_path, clock=clock)
+    _feed_tof(aligner, "A", 900_000, 1_300_000)
+    _feed_tof(aligner, "B", 900_000, 1_300_000)
+    _feed_mic(sm, 900_000, 1_300_000)
+
+    sm.hold_start(device_t_us=1_000_000)  # baseline_age_s 沒給
+    sm.hold_stop(device_t_us=2_000_000)
+    writer.__exit__(None, None, None)
+
+    with h5py.File(h5_path, "r") as f:
+        assert "baseline_age_s" not in f["trial_000"].attrs
+
+
 # ---------------------------------------------------------------------------
 # B21 階段 3：真的呼叫 B15/B16，四個 VAD 欄位是真值
 

@@ -272,6 +272,7 @@ class SessionWriter:
         lip_onset_us_A: Optional[int] = None, lip_onset_us_B: Optional[int] = None,
         speaking_mode: Optional[str] = None, vad_confidence: Optional[float] = None,
         comparable: Optional[bool] = None,
+        baseline_age_s: Optional[float] = None,
         quality: str,
     ) -> None:
         """寫一個完整的 trial，寫完立刻 flush。`idx` 重複寫會覆蓋掉舊的
@@ -301,6 +302,13 @@ class SessionWriter:
         四個時間戳同一個原則：`None` 就整個 attr 不寫入，**不是寫
         `False`**——「沒算過」跟「算過了、結論是不可比」是兩件事，含混
         起來會讓 D14 把「沒有意見」誤讀成「這筆不可比」的實際判斷。
+
+        `baseline_age_s`：這筆 trial 錄的當下，baseline 已經是幾秒前錄的
+        （`ca` 發現 `record.js` 沒有過期偵測，`E05` 要錄 4 小時，baseline
+        一定會過期）。**只存年齡本身，不存「算不算過期」的判斷**——
+        `monitor.js` 現有的 10 分鐘門檻以後可能會調，門檻變了不該讓已經
+        錄好的資料跟著變義；下游要判斷過不過期，自己拿這個數字跟當下的
+        門檻比較。跟其他選填欄位同一個原則：`None` 就整個 attr 不寫入。
         """
         if quality not in VALID_QUALITY_VALUES:
             raise ValueError(f"quality 必須是 {VALID_QUALITY_VALUES} 之一，收到 {quality!r}")
@@ -378,6 +386,8 @@ class SessionWriter:
             grp.attrs["vad_confidence"] = np.float32(vad_confidence)
         if comparable is not None:
             grp.attrs["comparable"] = bool(comparable)
+        if baseline_age_s is not None:
+            grp.attrs["baseline_age_s"] = np.float32(baseline_age_s)
 
         self._trial_indices_written.add(idx)
         self._file.flush()

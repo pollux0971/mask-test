@@ -21,3 +21,7 @@ venv/
 
 # Claude Code session lock (machine-local)
 .claude/scheduled_tasks.lock
+
+# 錄音資料是資料不是程式碼（E05 會產生數小時的檔案）
+sessions/*.h5
+sessions/manifest.csv

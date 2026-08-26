@@ -140,6 +140,30 @@ class ThresholdTable:
         return level, hint
 
 
+def _transport_alarm_message(stream, host, device, malformed):
+    """Explain a positive delta without over-claiming its cause.
+
+    The original wording said "UART overrun or the bridge falling behind",
+    which sounds authoritative and is often wrong. A line the parser rejected
+    as malformed leaves exactly the same seq gap as a frame that never
+    arrived -- and the firmware, whose $T line was merely spliced by an
+    unlocked ESP_LOG write, has no idea its output was interrupted, so its
+    own counter does not move either. Same symptom, different fault, and the
+    old message would send someone to check the cabling.
+    """
+    base = (f"{stream}：主機算出 {host} 次掉幀，裝置只認 {device} 次。"
+            f"差額為正代表這些幀沒有完整送達主機。")
+    if malformed:
+        return base + (
+            f" ⚠ 但本連線已有 {malformed} 行被判定為畸形（解析失敗）——"
+            f"被拒絕的行在 seq 缺口上跟「裝置沒送」完全一樣，"
+            f"所以這個差額**不一定是傳輸損失**，也可能是韌體的 log "
+            f"把 $T 行切開（ESP_LOG 不走 uart_out_lock）。"
+            f"先看 malformed 是否同步上升，再去查線材。"
+        )
+    return base + " 沒有畸形行，所以比較可能是真的傳輸損失（UART overrun 或 bridge 跟不上）。"
+
+
 class QualityAggregator:
     """Accumulates observations and renders the 1 Hz ``quality`` event.
 
@@ -160,6 +184,7 @@ class QualityAggregator:
         window_s: float = DEFAULT_WINDOW_S,
         clock=time.monotonic,
         host_clock=time.time,
+        parser_stats=None,
     ):
         self.thresholds = thresholds
         self.drop_tracker = drop_tracker
@@ -175,6 +200,10 @@ class QualityAggregator:
         # produced clock_slope = 5.9e7 the first time these two were wired
         # together (B04 alone had been self-consistent, so nothing showed).
         self._host_clock = host_clock
+        #: Callable returning ProtocolParser.stats.as_dict(), or None. The
+        #: parser already counts malformed lines and the count already
+        #: reaches this process -- it was simply never read here.
+        self._parser_stats = parser_stats
         self._lock = threading.Lock()
 
         self._zones = deque()        # (t, n_valid, dim)
@@ -329,6 +358,14 @@ class QualityAggregator:
         """
         if self.drop_tracker is None or self._device_drops is None:
             return []
+        stats = {}
+        if self._parser_stats is not None:
+            try:
+                stats = self._parser_stats() or {}
+            except Exception:
+                stats = {}
+        malformed = stats.get("malformed") or 0
+
         alarms = []
         for stream, device in self._device_drops.items():
             host = self._host_drops_at_heartbeat.get(stream)
@@ -342,13 +379,18 @@ class QualityAggregator:
                     "host": host,
                     "device": device,
                     "delta": delta,
-                    "message": (
-                        f"{stream}：主機算出 {host} 次掉幀，裝置只認 "
-                        f"{device} 次。差額為正代表幀在傳輸途中遺失"
-                        f"（UART overrun 或 bridge 跟不上），不是計數誤差。"
-                    ),
+                    "malformed": malformed,
+                    "message": _transport_alarm_message(stream, host, device, malformed),
                 })
         return alarms
+
+    def parser_stats(self):
+        if self._parser_stats is None:
+            return {}
+        try:
+            return self._parser_stats() or {}
+        except Exception:
+            return {}
 
     # -- rendering ------------------------------------------------------
 
@@ -390,6 +432,13 @@ class QualityAggregator:
                 entry["hint"] = alarm["message"]
 
         event = {"type": "quality", "t": time.time(), "metrics": metrics}
+        stats = self.parser_stats()
+        if stats:
+            # Surfaced because a rejected line is indistinguishable from a
+            # frame the device never sent, as far as the seq gap is
+            # concerned -- so drop_rate silently absorbs both.
+            event["malformed"] = stats.get("malformed", 0)
+            event["malformed_rate"] = stats.get("malformed_rate", 0.0)
         if alarms:
             event["alarms"] = alarms
         if self.thresholds.load_error:

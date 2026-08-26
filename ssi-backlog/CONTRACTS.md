@@ -13,6 +13,8 @@
 | 3. 特徵向量規格 | `T03` | ✅ 已凍結 |
 | 4. HTTP / SSE 介面 | `B09`, `B18`, `B19`, `D09` | ⬜ 待凍結 |
 | 5. 檔案所有權 | `T06` | ✅ 已凍結 |
+| 6. 詞彙集 | `T06` | ✅ 已凍結 |
+| 7. Enrollment 樣板檔格式 | `D08` | ✅ 已凍結（補記既有行為） |
 
 ## 變更紀錄
 
@@ -65,6 +67,8 @@
 | 2026-08-26 | 4. HTTP / SSE 介面 | D09：§4.3 的 JSON 範例補上前一輪（D07）已在文字說明但沒改到範例本身的 `theta_reject_tof`/`theta_reject_mel`（範例仍寫舊的單一 `theta_reject`，跟上面的文字說明不一致）；新增 `dist_method` 欄位（記錄該次辨識實際用的距離函式，`D09` 預設 `"cosine"`——批次餘弦 0.147ms vs DTW 8-12ms，且 `D05` 合成資料 LOOCV 顯示 DTW 較差，`E05` 後應複驗）；`latency_ms` 的鍵從寫死的 `"dtw"` 改成 `"dist"`（距離函式可換，鍵名不該綁死一種） | D07, D09, C16, C17, C18 | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | `/meta` 新增選填、成對的 `energy_mu`/`energy_sigma`：唇動偵測的能量門檻若用估的，`B16` 量到偏嚴約 23%，會讓 `lip_onset_us` 系統性偏晚，進而讓 `D14` 唯一要量的 `measure_lip_lead()` 唇動領先量被低估——修法是在 baseline 當下用真實幀算好，算好的東西不落盤重跑分析就拿不到，所以要跟 `baseline_mu_*`/`noise_floor_*` 一樣進 `/meta`。`/trial_NNN` 新增選填的 `comparable`（bool）：`measure_lip_lead()` 算出來的 `lip_lead_us` 能不能拿去平均——沒算過就整個 attr 省略，不是填 `False`（那是「算過了、結論是不可比」，跟「沒有意見」是兩件事）。這是這個 schema 第一個 bool 型選填 attr，順帶驗過型別接縫：h5py 直接讀是 `numpy.bool_`（`numpy.bool_(True) is True` 為 `False`，`is True`/`is False` 這種寫法在那一層會靜默失效），但 `analysis/reporting/session_loader.py` 的 `_as_scalar()` 已經把它正規化成 Python `bool`，讀取端走 `load_session()` 是安全的 | B16, B21, D14, T02 | 是 |
 | 2026-08-26 | 2. HDF5 Session Schema | `/trial_NNN` 新增選填、各自獨立的 `lip_onset_us_A`/`lip_onset_us_B`：雙感測器 VAD 融合策略裁定採 `union_min`（兩顆都測到取較早的），但這個策略是拿合成資料選出來的，`E05` 的主資料集是唯一一次真實資料且不會重錄——只存融合後的 `lip_onset_us` 會讓「當初選 union_min 對不對」這個問題錄完就永遠回答不了。跟既有的 VAD 時間戳同一個原則：沒偵測到就整個 attr 省略；`lip_onset_us_B` 缺席是 `union_min` 設計本身假設的正常狀況（B 感測器可能整段偵測不到），不代表資料損毀，兩個欄位不綁在一起檢查 | B15, B16, B21, D14, T02 | 是 |
+| 2026-08-26 | 7. Enrollment 樣板檔格式（新增章節） | 補記 `templates/*.npz` 的內部格式——`D08.md` 只寫了檔名慣例，`.npz` 內部的鍵、形狀、dtype、`_reject` 怎麼存全部只活在 `enrollment.py` 的 docstring 裡。原因：這個持久化格式已有三個生產/消費者（`D08` 自己、`bridge_server.py` 的 `recognition_service.py`、即將加入的「trial 轉樣板」端點），跟 §2 的 HDF5 schema 補記前的處境一樣。以程式碼實際行為為準，沒有發現跟 `D08.md` 衝突之處 | D08, D22, T06 | 是 |
+| 2026-08-26 | 2. HDF5 Session Schema | `/trial_NNN` 新增選填的 `baseline_age_s`（f32）：這筆 trial 錄的當下 baseline 已經是幾秒前錄的。原因：`ca` 發現 `record.js` 完全沒有 baseline 過期偵測（`monitor.js` 有 10 分鐘 `stale` 判定，`record.js` 沒有），`E05` 要連續錄 4 小時，baseline 中途過期幾乎必然發生，畫面警告只保護當下操作者，事後從 HDF5 看不出哪幾筆是過期後錄的。只存年齡本身，不存「算不算過期」的判斷——過期門檻是 `monitor.js` 的產品決策，將來可能調整，門檻變了不該讓已經錄好的資料跟著變義 | B21, D14, D15, T02 | 是 |
 
 ---
 
@@ -404,6 +408,9 @@ D 軌可直接對著它開發讀取程式，不需要等真實資料。
     comparable,             # bool，選填；lip_lead_us 能不能拿去平均——
                             # 沒算過就整個省略，不是填 False（那是「算過了，
                             # 結論是不可比」，兩者意思不同）
+    baseline_age_s,         # f32，選填；這筆錄的當下 baseline 是幾秒前錄的
+                            # ——只存年齡，不存「算不算過期」的判斷（門檻
+                            # 由 monitor.js 決定，將來可能改）
     quality ∈ {ok, low, rejected}
 ```
 
@@ -1201,3 +1208,62 @@ bridge 每秒比一次 mtime，**改完存檔即時生效，不需重啟**。
 多模態論證。
 
 詞彙集由設定檔驅動，所以 `E08` 的「降到 4 選項」備援只需要改這一個 JSON。
+
+---
+
+## 7. Enrollment 樣板檔格式（`templates/*.npz`）
+
+**負責：`D08`**（`analysis/similarity/enrollment.py`）｜補記日期：`2026-08-26`
+
+> 🔴 **這份格式在此之前只寫在 `enrollment.py` 自己的 docstring 裡，
+> `D08.md` 只提過檔名慣例（`templates/<subject>_<wear_id>.npz`），
+> 沒有規定 `.npz` 內部的鍵、形狀、`_reject` 怎麼存。** 這是一個持久化
+> 格式，目前已有三個生產/消費者：`D08` 自己（存/載/LOOCV）、
+> `recognition_service.py`（`bridge_server.py` 載入後供即時辨識用）、
+> 即將加入的「錄好的 trial 轉樣板」端點（`7c`）——跟 §2 的 HDF5 schema
+> 在補記前的處境完全一樣，補在這裡避免重蹈覆轍。**以下以
+> `enrollment.py` 目前的實際行為為準，沒有發現跟 `D08.md` 衝突之處**
+> （`D08.md` 只講了檔名，沒講到會衝突的細節）。
+
+```
+templates/<subject>_<wear_id>.npz          （template_path()）
+
+.npz 內容（save_templates()/load_templates()）：
+  class__<label>       (n_templates, T, D) float64
+                        每個類別各自一個鍵，key 是 "class__" 前綴加標籤
+                        本身（例如 "class__wu"、"class___reject" ——
+                        _reject 是普通標籤之一，不是另一種資料結構）
+                        T = 24（D03 DEFAULT_T_FIXED，FeatureSeq.data 的
+                        固定重採樣長度）
+                        D = 104（§3：64 維 ToF + 40 維 Mel，
+                        FeatureSeq.slices = {"tof": slice(0,64),
+                        "mel": slice(64,104)}）
+  _meta_subject         0-d array，np.array(str(subject))
+  _meta_wear_id         0-d array，np.array(int(wear_id))
+```
+
+**`_reject` 類別的表示方式**：跟其他詞類別完全一樣，就是
+`templates_by_class["_reject"]` 底下的一組樣板，存的時候一樣疊成
+`class___reject`（`"class__"` + `"_reject"`，沒有特殊處理）。**消費端
+要自己決定要不要把它跟詞類別分開**——`bridge_server.py` 目前的作法是
+`load_templates()` 讀出來之後，用 `templates_by_class.pop("_reject", [])`
+把它從詞分類的字典裡拿掉，單獨傳給 `calibrate_tri_reject_thresholds()`
+（`_reject` 樣板是拿來校準拒識門檻，不是拿來當作可以被辨識成功的一類
+「詞」）。`D22` 的雙邊 ROC 校準也是吃這個被 pop 出來的獨立列表，不是
+`templates_by_class` 整個字典。
+
+> ⚠️ **同一類別的樣板假設同形狀，是真的限制，不是文件寫寫而已。**
+> `save_templates()` 用 `np.stack(templates)` 疊陣列——`np.stack()`
+> 本身要求所有輸入形狀相同，不同形狀會直接拋 `ValueError`，這裡沒有
+> 額外的形狀檢查或善意的錯誤訊息。因為所有樣板理論上都是同一套 D03
+> `FeatureSeq.data` 流程（含固定重採樣到 T=24）產出的，正常情況下不會
+> 遇到，但**任何繞過標準 D03 流程直接組樣板的呼叫端**（例如即將加入的
+> 「錄好的 trial 轉樣板」端點，如果自己組陣列而不是呼叫
+> `assemble_feature_seq()`）都要遵守這個前提，否則 `save_templates()`
+> 會在存檔那一刻就報錯，不是悄悄存進一個形狀不一致的檔案。
+
+**跨 wear_id 載入不會被擋下，只會警告**：`load_templates()` 給
+`expected_wear_id` 且跟檔案內存的不一致時，回傳非 `None` 的 warning
+字串，但**仍然把樣板正常回傳**——呼叫端要自己決定看到警告後要不要繼續
+用（`bridge_server.py`／`recognition_service.py` 目前的作法是把警告一併
+往上傳給呼叫者顯示，不是自己擋下請求）。

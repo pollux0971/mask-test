@@ -222,6 +222,16 @@ class TrialStateMachine:
         self._noise_floor_sigma = noise_floor_sigma
         self._energy_mu = energy_mu
         self._energy_sigma = energy_sigma
+        # ca's audit: a 4-hour E05 session can run past baseline going
+        # stale (see record.js's BASELINE_STALE_MS) with no crash and no
+        # visible sign in the HDF5 afterward -- a screen warning only
+        # protects whoever's watching it live. This is a fresh per-trial
+        # measurement (the frontend computes it at hold_start()/start_trial()
+        # time, not a session-wide setting), so it does NOT carry over
+        # between trials the way _speaking_mode does -- a caller that omits
+        # it means "unknown for this trial", not "reuse the last one"
+        # (reusing would be actively wrong, since age keeps increasing).
+        self._baseline_age_s: Optional[float] = None
 
         self._seed = seed if seed is not None else random.SystemRandom().randrange(2**31 - 1)
         self._order = list(self._words)
@@ -355,10 +365,11 @@ class TrialStateMachine:
         self._speaking_mode = speaking_mode
 
     def start_trial(self, now: Optional[float] = None, label: Optional[str] = None,
-                     speaking_mode: Optional[str] = None) -> dict:
+                     speaking_mode: Optional[str] = None, baseline_age_s: Optional[float] = None) -> dict:
         if self.state != TrialState.IDLE:
             raise RuntimeError(f"不能在狀態 {self.state.value} 開始新 trial，必須先回到 IDLE")
         self._apply_speaking_mode(speaking_mode)
+        self._baseline_age_s = baseline_age_s
         now = self._clock() if now is None else now
         self._current_label = label if label is not None else self._order[self._order_pos % len(self._order)]
         return self._enter(TrialState.PROMPT, now)
@@ -423,7 +434,8 @@ class TrialStateMachine:
     # -- B12: hold-to-record -----------------------------------------
 
     def hold_start(self, now: Optional[float] = None, device_t_us: Optional[int] = None,
-                    label: Optional[str] = None, speaking_mode: Optional[str] = None) -> dict:
+                    label: Optional[str] = None, speaking_mode: Optional[str] = None,
+                    baseline_age_s: Optional[float] = None) -> dict:
         """`POST /trial/hold/start`。按下就是開始，**沒有 COUNTDOWN**——固定
         時長模式的倒數是給「使用者要等外部節奏」的情境用的，hold-to-record
         本來就是使用者自己決定何時開口，倒數只會讓體感變慢。跳過 PROMPT
@@ -439,6 +451,7 @@ class TrialStateMachine:
         if device_t_us is None:
             raise ValueError("hold_start 需要 device_t_us（按下當下最新收到的裝置 t_us）")
         self._apply_speaking_mode(speaking_mode)
+        self._baseline_age_s = baseline_age_s
         now = self._clock() if now is None else now
         self._current_label = label if label is not None else self._order[self._order_pos % len(self._order)]
         self._hold_start_device_t_us = int(device_t_us)
@@ -674,6 +687,10 @@ class TrialStateMachine:
             # 結論就是不可比）——原樣傳過去，不在這裡多做判斷。
             comparable=lead.comparable,
             lip_onset_us_A=lip_onset_us_A, lip_onset_us_B=lip_onset_us_B,
+            # baseline_age_s：只存年齡（frontend 在按下當下量的，不是存檔
+            # 當下），不在這裡判斷「多舊算過期」——門檻以後可能改，存下來的
+            # 年齡不會過期，讓 D14 事後自己決定怎麼篩。
+            baseline_age_s=self._baseline_age_s,
             quality=quality, **vad_attrs,
         )
         add_session(self._session_h5_path, self._manifest_path, root=self._manifest_root)

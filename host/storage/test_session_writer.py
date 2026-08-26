@@ -916,3 +916,26 @@ def test_invalid_source_rejected(tmp_path):
     with pytest.raises(ValueError, match="source"):
         with SessionWriter(tmp_path / "session.h5", _sample_meta(source="usb")):
             pass
+
+
+# -- baseline_age_s (E05 過期偵測需要事後可查的年齡，不是判定結果) --------
+
+
+def test_baseline_age_s_omitted_when_none(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        w.write_trial(0, **_sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False))
+
+    with h5py.File(path, "r") as f:
+        assert "baseline_age_s" not in f["trial_000"].attrs
+
+
+def test_baseline_age_s_written_when_given(tmp_path):
+    path = tmp_path / "session.h5"
+    with SessionWriter(path, _sample_meta()) as w:
+        kwargs = _sample_trial_kwargs(T=5, M=6, include_mel=False, include_audio=False)
+        kwargs["baseline_age_s"] = 1834.5
+        w.write_trial(0, **kwargs)
+
+    with h5py.File(path, "r") as f:
+        assert f["trial_000"].attrs["baseline_age_s"] == pytest.approx(1834.5, abs=1e-2)
