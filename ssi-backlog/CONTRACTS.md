@@ -711,6 +711,27 @@ snr_zone = |Δ_round - Δ_spread| / sigma_baseline
 
 🔴 **`file=` 參數做 resolve-then-contain 限制在 sessions 目錄內**，
 且「目錄外」與「不存在」**回同一個 404**——分開回會讓呼叫端可以探測檔案系統。
+
+**`GET /replay/sessions` 的回應是一個「陣列」，不是物件：**
+
+```json
+[{"file": "2026-08-26_S01.h5",
+  "path": "/abs/path/to/sessions/2026-08-26_S01.h5",
+  "bytes": 123456,
+  "modified_at": "2026-08-26T13:02:11"}]
+```
+
+沒有 session 時回 `[]`（**不是 204**）。`path` 是要回傳給
+`POST /replay/start?file=` 的值。
+
+> **為什麼要寫下來**：`replay.js` 原本自己註解成 `{"files": ["<name>", ...]}`，
+> 於是 `data.files` 是 `undefined`、`Array.isArray()` 檢查讓它**靜靜變成空陣列**，
+> **下拉選單永遠只有預設項且完全不報錯**。契約沒寫，前端就只能猜。
+
+**`POST /replay/stop`**：前端**必須**在離開回放模式時呼叫它。
+沒有呼叫的話，後端會**持續處於回放狀態並繼續擋掉真實資料**——
+畫面上的回放浮水印逾時消失，但送過來的仍然是舊錄音。
+**使用者會以為自己在看即時資料。**
 | POST | `/trial/hold/start` \| `/stop` | `B12` | Hold-to-Record |
 | POST | `/trial/abort` \| `/redo` | `B11` | 放棄 / 重錄 |
 | POST | `/recognize` | `D09` | 辨識，回 TriResult |
