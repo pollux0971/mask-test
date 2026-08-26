@@ -1287,6 +1287,88 @@ def verify_status():
         }
 
 
+#: 🔴 值得在動這個檔案之前讀一次。
+#:
+#: 這個專案到目前為止，**同一個形狀的 bug 出現了五次**，而且全部落在
+#: 「資料已經算好、正確、就在手上」之後的**最後一關**：
+#:
+#:   * `$H` 的 `host` 解析統計 —— 被 `to_sse_event()` 的白名單濾掉
+#:   * `sensors_seen`          —— 寫進 `/meta` 了，驗證層沒有人讀
+#:   * `coverage`              —— `live_pipeline` 算好了，沒離開那一層
+#:   * `figures`               —— 檔案在，`iterdir()` 只掃一層所以列不到
+#:   * `extras`（D19 的 p 值） —— `build_report()` 有算，序列化沒帶出去
+#:
+#: **共通點**：白名單、只掃一層、忘了 passthrough——**這些構造的預設行為
+#: 都是「丟掉」，而丟掉不會報錯、不會變紅、不會有任何人發現。**
+#: 上游算得再對也沒用。
+#:
+#: 所以：**在這個檔案裡加一個「只挑幾個欄位」的地方時，先問一句
+#: 「沒被挑到的那些，有沒有人需要？」** 預設應該是帶出去，不是丟掉。
+_LAST_GATE_NOTE = __doc__
+
+
+def summarize_verify_sessions(session_paths):
+    """「這份報告是用什麼資料算的」——矩陣正上方那一行。
+
+    委員問的第二個問題，而畫面上目前完全看不出來。
+
+    ⚠️ **`sensors_seen` 同時給 session 層與 trial 層，這是刻意的。**
+    `/meta` 的值是整個 session 一個字串，而實測證明**中途掉線時它是
+    `"AB"`**（見 `reports/DEGRADED_SESSION.md` 第二輪）——
+    只顯示那個值，反而會讓人看到「兩顆都在」而放心。
+    per-trial 的統計才看得出「6 筆裡有 3 筆只有 A」。
+
+    讀不出來的 session 不會讓整個回應失敗：驗證報告本身已經跑完了，
+    摘要壞掉不該把結果一起帶走。
+    """
+    from analysis.reporting import session_loader
+
+    out = {"sessions": [], "n_trials": 0, "labels": [],
+           "trials_per_label": {}, "sensors_seen": [],
+           "trial_sensors_seen": {}, "errors": []}
+    labels, per_label, trial_seen = [], {}, {}
+
+    for path in session_paths:
+        try:
+            session = session_loader.load_session(path)
+        except Exception as exc:
+            out["errors"].append(f"{path}: {exc}")
+            continue
+        trials = list(session.trials)
+        out["sessions"].append({
+            "path": str(path),
+            "subject": session.meta.get("subject"),
+            "wear_id": session.meta.get("wear_id"),
+            "mode": session.meta.get("mode"),
+            "sensors_seen": session.meta.get("sensors_seen"),
+            "sensors_enabled": session.meta.get("sensors_enabled"),
+            "n_trials": len(trials),
+        })
+        out["n_trials"] += len(trials)
+        seen = session.meta.get("sensors_seen")
+        if seen is not None and seen not in out["sensors_seen"]:
+            out["sensors_seen"].append(seen)
+        for trial in trials:
+            if trial.label:
+                labels.append(trial.label)
+                per_label[trial.label] = per_label.get(trial.label, 0) + 1
+            value = (trial.attrs or {}).get("sensors_seen")
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", "replace")
+            if value is not None:
+                trial_seen[value] = trial_seen.get(value, 0) + 1
+
+    out["labels"] = sorted(set(labels))
+    out["n_labels"] = len(out["labels"])
+    out["trials_per_label"] = per_label
+    out["trial_sensors_seen"] = trial_seen
+    # The one line worth putting on screen: how many trials were recorded
+    # with something other than both sensors streaming.
+    out["trials_missing_a_sensor"] = sum(
+        n for value, n in trial_seen.items() if value != "AB")
+    return out
+
+
 def serialize_verify_report(report, run_id, out_dir, elapsed_s):
     """把 `D15` 的報告轉成前端吃得下的 JSON。
 
@@ -1294,6 +1376,9 @@ def serialize_verify_report(report, run_id, out_dir, elapsed_s):
     它們的意思完全不同——`fail` 是「跑了沒達標」（一個結果）、`skipped` 是
     「資料不足」（一個缺口）、`error` 是「程式炸了」（一個 bug）。序列化層
     把它們併成「不 OK」，前端就再也分不出來，而使用者會把缺口讀成失敗。
+
+    ⚠️ **改這個函式之前先讀一次「最後一關」那段註解**（見 `_LAST_GATE_NOTE`）：
+    這裡是一個白名單，而白名單的預設行為是**丟掉**。
     """
     return {
         "run_id": run_id,
@@ -1302,7 +1387,11 @@ def serialize_verify_report(report, run_id, out_dir, elapsed_s):
         "elapsed_s": round(elapsed_s, 1),
         "is_synthetic": report["is_synthetic"],
         "session_paths": report["session_paths"],
+        "session_summary": summarize_verify_sessions(report["session_paths"]),
         "matrix": report["matrix"],
+        # D19 的置換檢定 p 值就在這裡面——「這不是運氣」的證據。
+        # build_report() 一直有算，只是從來沒有被序列化出去。
+        "extras": report.get("extras", {}),
         "outcomes": [o.to_dict() for o in report["outcomes"]],
         "inconsistencies": report["inconsistencies"],
         "limitations": report["limitations"],
@@ -1377,8 +1466,34 @@ def list_verify_runs():
             "modified_at": datetime.fromtimestamp(entry.stat().st_mtime).isoformat(),
             "has_summary": summary.is_file(),
             "files": sorted(f.name for f in entry.iterdir() if f.is_file()),
+            "figures": list_run_figures(entry),
         })
     return sorted(runs, key=lambda r: r["run_id"], reverse=True)
+
+
+def list_run_figures(run_dir):
+    """Relative paths of every figure in one run, e.g. "figures/c_silhouette.png".
+
+    `files` above only ever listed the run directory's own entries, and
+    `write_outputs()` puts every plot in a `figures/` subdirectory -- so the
+    figures existed, were already served correctly by
+    `GET /verify/reports/<id>/<path>`, and yet no caller could learn their
+    names. The panel had no way to render a single plot, which is the part
+    of the verification page people actually look at.
+
+    Returned relative to the run directory (not just the basename) so the
+    value can be appended to the run's URL as-is; the static route resolves
+    subdirectories, so no reassembly is needed on the other side.
+    """
+    figures = []
+    for sub in ("figures",):
+        directory = run_dir / sub
+        if not directory.is_dir():
+            continue
+        for f in sorted(directory.iterdir()):
+            if f.is_file():
+                figures.append(f"{sub}/{f.name}")
+    return figures
 
 
 def replay_poller(interval=0.02):

@@ -13,21 +13,208 @@
    不代表其他實驗真的通過）。 */
 .validate-blocking {
   flex-shrink: 0;
-  font-size: 0.8125rem;
+  /* esp-mask-test-ad: blocking 跟 inconsistencies 在投影模式下要最醒目
+     ——這是委員會盯著看的東西。比其餘內文（0.75rem）明顯大一號，
+     配上粗左邊框，讓它在遠處掃過去也認得出「這是最重要的那一塊」。 */
+  font-size: 0.9375rem;
   line-height: 1.5;
-  padding: 10px 14px;
+  padding: 10px 16px;
   border-radius: 10px;
+  border-left: 5px solid transparent;
 }
 .validate-blocking-blocked {
   color: var(--status-bad);
   background: var(--status-bad-soft);
   border: 1px solid var(--status-bad);
+  border-left: 5px solid var(--status-bad);
   font-weight: 600;
 }
 .validate-blocking-clear {
   color: var(--status-good);
   background: var(--status-good-soft);
   border: 1px solid transparent;
+  border-left: 5px solid var(--status-good);
+}
+
+.validate-datasource {
+  flex-shrink: 0;
+  font-size: 0.75rem;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+.validate-datasource-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.validate-datasource-sessions {
+  color: var(--text-dim);
+}
+
+/* 「一眼看懂」矩陣摘要：五個小格子，只給狀態色跟 must-pass 鎖頭，細節
+   留給下面的卡片。刻意比卡片小、比 blocking 素，避免搶走 blocking
+   的視覺優先權（那才是「這份報告能不能信」的開關）。 */
+.validate-matrix-summary {
+  flex-shrink: 0;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.validate-matrix-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 0.8125rem;
+  font-weight: 700;
+}
+.validate-matrix-key {
+  opacity: 0.8;
+}
+.validate-matrix-mark {
+  font-size: 0.9375rem;
+}
+
+.validate-extras-block {
+  font-size: 0.75rem;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.validate-extras-title {
+  font-weight: 700;
+  color: var(--text);
+}
+.validate-pvalue-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border);
+}
+.validate-pvalue-label {
+  color: var(--text-dim);
+  min-width: 5em;
+}
+.validate-pvalue-detail {
+  color: var(--text-dim);
+  font-size: 0.6875rem;
+}
+.validate-pvalue-floor-warn {
+  flex-basis: 100%;
+  color: var(--status-warn);
+  font-size: 0.6875rem;
+  line-height: 1.4;
+}
+/* 🔴 esp-mask-test-ad 明確要求：這句話不能被摺起來或縮小 -- 沒分組驗證
+   卻看起來像做過，是「宣稱了一個沒做的方法學保證」，用跟 blocking
+   banner 同等級的視覺份量（純紅底、粗體），不是可以略過的小提醒。 */
+.validate-grouping-blocked {
+  flex-basis: 100%;
+  color: var(--status-bad);
+  background: var(--status-bad-soft);
+  border: 1px solid var(--status-bad);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-weight: 600;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  margin-top: 4px;
+}
+.validate-grouping-ok {
+  flex-basis: 100%;
+  color: var(--status-good);
+  font-size: 0.6875rem;
+}
+
+.validate-crosschecks-area,
+.validate-extras-area {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.validate-crosschecks {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.validate-crosscheck-item {
+  /* 跟 .validate-blocking 同一個理由：投影模式下要在遠處看得清楚。 */
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 4px solid transparent;
+}
+/* conflict = 真的矛盾（兩個結論打架），note = 值得注意但不矛盾（例如
+   來源不足） -- 兩者顏色要分清楚，不能都用紅色，否則「資料不足」看起來
+   像「有問題」，違反 C25 的「low/pending 不可以長得像失敗」規矩。
+   conflict 額外給淺紅底色（不只是邊框），因為它是真的矛盾，份量要跟
+   blocking banner 同一等級的「這裡有問題」信號；note 維持素色背景。 */
+.validate-crosscheck-conflict {
+  background: var(--status-bad-soft);
+  border-color: var(--status-bad);
+  border-left-color: var(--status-bad);
+}
+.validate-crosscheck-conflict .validate-crosscheck-topic {
+  color: var(--status-bad);
+}
+.validate-crosscheck-note .validate-crosscheck-topic {
+  color: var(--status-unknown);
+}
+.validate-crosscheck-topic {
+  font-weight: 700;
+  margin-bottom: 2px;
+}
+.validate-crosscheck-message {
+  color: var(--text);
+}
+.validate-crosscheck-sources {
+  color: var(--text-dim);
+  margin-top: 4px;
+  font-size: 0.6875rem;
+}
+.validate-limitations-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.validate-detail {
+  font-size: 0.6875rem;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+.validate-detail summary {
+  cursor: pointer;
+}
+.validate-detail-table {
+  margin-top: 4px;
+  border-collapse: collapse;
+  width: 100%;
+}
+.validate-detail-table td {
+  padding: 2px 8px 2px 0;
+  vertical-align: top;
+  word-break: break-word;
+}
+.validate-detail-table td:first-child {
+  color: var(--text-dim);
+  white-space: nowrap;
 }
 
 .validate-run-controls {

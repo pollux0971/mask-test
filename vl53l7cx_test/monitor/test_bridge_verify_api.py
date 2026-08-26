@@ -266,3 +266,142 @@ def test_report_subdirectories_are_reachable(rig):
 def test_report_route_blocks_directory_traversal(rig, attack):
     status, _, _ = _raw_get(rig, f"/verify/reports/{attack}")
     assert status in (403, 404), f"穿越沒有被擋: {attack}"
+
+
+# -- figures: listed as well as served ------------------------------------
+
+
+def _seed_run(tmp_path, run_id="20260826_120000"):
+    """Write a run directory by hand, shaped like write_outputs() leaves it."""
+    run = tmp_path / "verification" / run_id
+    (run / "figures").mkdir(parents=True, exist_ok=True)
+    (run / "summary.md").write_text("# summary\n", encoding="utf-8")
+    (run / "summary.html").write_text("<h1>summary</h1>", encoding="utf-8")
+    # A one-pixel PNG, so the served bytes are a real image not a text file.
+    (run / "figures" / "c_silhouette.png").write_bytes(
+        bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108060000"
+                      "001f15c4890000000a49444154789c6300010000050001"
+                      "0d0a2db40000000049454e44ae426082"))
+    (run / "figures" / "c_silhouette.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+    return run
+
+
+def test_reports_listing_includes_figures(tmp_path):
+    """The figures existed and were servable; nothing could learn their names.
+
+    `files` only ever listed the run directory's own entries, and every plot
+    goes into a `figures/` subdirectory -- so the panel had no way to render
+    a single figure, which is the part of the verification page people
+    actually look at.
+    """
+    _seed_run(tmp_path)
+    r = Rig("--proto", "v2",
+            bridge_args=("--verification-dir", str(tmp_path / "verification")))
+    try:
+        status, body = _request(r, "GET", "/verify/reports")
+        assert status == 200, body
+        assert body, "the seeded run was not listed"
+        run = body[0]
+        assert run["run_id"] == "20260826_120000"
+        assert set(run["figures"]) == {"figures/c_silhouette.png",
+                                       "figures/c_silhouette.pdf"}, run["figures"]
+        # Relative to the run, so it can be appended to the run URL as-is.
+        for fig in run["figures"]:
+            assert fig.startswith("figures/")
+    finally:
+        r.close()
+
+
+def test_a_listed_figure_is_actually_fetchable(tmp_path):
+    """The listing is only useful if the path it hands back resolves.
+
+    Subdirectories are the thing to check: a basename-only guard (the one
+    /voice/ uses) would flatten `figures/` and 404 every plot.
+    """
+    _seed_run(tmp_path)
+    r = Rig("--proto", "v2",
+            bridge_args=("--verification-dir", str(tmp_path / "verification")))
+    try:
+        run = _request(r, "GET", "/verify/reports")[1][0]
+        for fig in run["figures"]:
+            status, ctype, body = _raw_get(
+                r, f"/verify/reports/{run['run_id']}/{fig}")
+            assert status == 200, (fig, status)
+            assert body, f"{fig} served empty"
+            if fig.endswith(".png"):
+                assert ctype.startswith("image/png"), ctype
+                assert body.startswith(b"\x89PNG"), "not actually a PNG"
+            elif fig.endswith(".pdf"):
+                # C23 hands the PDF to the user for the write-up, so the
+                # browser must be told it is one rather than downloading it
+                # as an opaque blob.
+                assert ctype.startswith("application/pdf"), ctype
+                assert body.startswith(b"%PDF"), "not actually a PDF"
+    finally:
+        r.close()
+
+
+def test_a_run_with_no_figures_lists_an_empty_array(tmp_path):
+    """Absent, not missing: the panel should not have to guard for undefined."""
+    run = tmp_path / "verification" / "20260826_090000"
+    run.mkdir(parents=True)
+    (run / "summary.md").write_text("# summary\n", encoding="utf-8")
+    r = Rig("--proto", "v2",
+            bridge_args=("--verification-dir", str(tmp_path / "verification")))
+    try:
+        body = _request(r, "GET", "/verify/reports")[1]
+        assert body[0]["figures"] == []
+    finally:
+        r.close()
+
+
+# -- extras: the "this is not luck" evidence ------------------------------
+
+
+def test_serialize_carries_extras_through(tmp_path):
+    """D19's permutation p-value lives in extras and never left the backend.
+
+    build_report() has always computed it; the serializer simply did not
+    list the key, and a whitelist that does not list a key drops it silently.
+    That is the same shape as four other bugs in this file's history -- see
+    the _LAST_GATE_NOTE comment.
+    """
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "bs_extras", Path(__file__).resolve().parent / "bridge_server.py")
+    bs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bs)
+
+    report = {
+        "is_synthetic": True,
+        "session_paths": ["x.h5"],
+        "matrix": [],
+        "outcomes": [],
+        "inconsistencies": [],
+        "limitations": [],
+        "blocking": [],
+        "failed": [], "skipped": [], "errored": [],
+        "extras": {"D19 消融": {"p_value": 0.004, "n_permutations": 200}},
+    }
+    out = bs.serialize_verify_report(report, "20260826_120000", tmp_path, 1.5)
+    assert "extras" in out, "extras was dropped by the serializer"
+    assert out["extras"]["D19 消融"]["p_value"] == 0.004
+
+
+def test_serialize_tolerates_a_report_without_extras(tmp_path):
+    """Older/partial reports must not blow up the response."""
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "bs_extras2", Path(__file__).resolve().parent / "bridge_server.py")
+    bs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bs)
+
+    report = {
+        "is_synthetic": True, "session_paths": [], "matrix": [], "outcomes": [],
+        "inconsistencies": [], "limitations": [], "blocking": [],
+        "failed": [], "skipped": [], "errored": [],
+    }
+    out = bs.serialize_verify_report(report, "r", tmp_path, 0.1)
+    assert out["extras"] == {}

@@ -41,6 +41,8 @@ const EXPERIMENTS = [
     purpose: "擦音（如「四」）是否確實在 Mel 特徵上比 ToF 更明顯，驗證雙模態互補的假設。" },
 ];
 
+const STATUS_MARK = { pass: "✓", fail: "✗", skipped: "—", error: "⚠" };
+
 const STATUS_LABEL = {
   pass: "✓ PASS", fail: "✗ FAIL", skipped: "— SKIPPED", error: "⚠ ERROR",
 };
@@ -57,12 +59,26 @@ const C0_STEPS = [
 ];
 const C0_STEP_SECONDS = 30;
 
+// 後端的 reason/diagnosis/inconsistency/limitation 文字習慣用 **粗體**
+// 標重點（Python 端的 markdown 慣例），但這個檔案從來沒有把它轉成 <strong>
+// -- 單行的 reason 還好，這輪新增的跨實驗一致性/已知限制是整段文字，
+// 滿版星號很顯眼、口試現場會分散注意力。只處理 **bold**，不是完整
+// markdown 解析器，避免處理到不該處理的內容。
+function mdBold(text) {
+  if (typeof text !== "string") return text;
+  return text.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+}
+
 function parseSessionPaths(raw) {
   return raw.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
 }
 
 registerMode("validate", (() => {
   let blockingEl = null;
+  let dataSourceEl = null;
+  let matrixSummaryEl = null;
+  let crossChecksEl = null;
+  let extrasEl = null;
   let cardsEl = null;
   let sessionsInputEl = null, fastCheckboxEl = null, realCheckboxEl = null;
   let runBtn = null, runStatusEl = null, runErrorEl = null;
@@ -99,8 +115,24 @@ registerMode("validate", (() => {
     return `<span class="validate-status ${cls}">${label}${measured}</span>` +
       // skipped/error 一定要有說明，不能是沒有解釋的灰格子 (esp-mask-test-ad
       // 的明確要求，見完成回報)
-      (outcome.reason ? `<div class="validate-reason">${outcome.reason}</div>` : "") +
-      diagnosisHtml(outcome);
+      (outcome.reason ? `<div class="validate-reason">${mdBold(outcome.reason)}</div>` : "") +
+      diagnosisHtml(outcome) +
+      detailHtml(outcome);
+  }
+
+  // `outcome.detail` 存在於後端回應裡（每個實驗塞的數字不一樣，例如 C 有
+  // score/tof_score/complementary，E 有 fricative_pass/uniform_weak_tof），
+  // 先前完全沒有被顯示過。通用地列成 key/value，不用假裝知道每個實驗的
+  // 專屬欄位該怎麼排版 -- 想深入看的人才會展開。
+  function detailHtml(outcome) {
+    const detail = outcome.detail;
+    if (!detail || typeof detail !== "object" || !Object.keys(detail).length) return "";
+    const rows = Object.entries(detail).map(([k, v]) => {
+      const val = typeof v === "object" && v !== null ? JSON.stringify(v) : String(v);
+      return `<tr><td class="mono">${k}</td><td class="mono">${val}</td></tr>`;
+    }).join("");
+    return `<details class="validate-detail"><summary>詳細數據</summary>` +
+      `<table class="validate-detail-table"><tbody>${rows}</tbody></table></details>`;
   }
 
   // `diagnosis` 一直存在於後端回應裡，但先前完全沒有被顯示過。內容依
@@ -116,7 +148,7 @@ registerMode("validate", (() => {
       return `<details class="validate-diagnosis validate-diagnosis-error">` +
         `<summary>⚠ 詳細錯誤（工程除錯用）</summary>${outcome.diagnosis}</details>`;
     }
-    return `<div class="validate-diagnosis">💡 ${outcome.diagnosis}</div>`;
+    return `<div class="validate-diagnosis">💡 ${mdBold(outcome.diagnosis)}</div>`;
   }
 
   function renderCards() {
@@ -216,6 +248,189 @@ registerMode("validate", (() => {
     }
   }
 
+  // 「這份報告是用什麼資料算的」-- 委員的第二個問題（esp-mask-test-ad
+  // 明確要求）。is_synthetic／session_paths 這輪的 /verify/run 回應本來就
+  // 有；sensors_seen／trial 數／詞彙數這幾個後端還沒有序列化出來
+  // （reports/DEGRADED_SESSION.md 的發現：sensors_seen 在 session /meta
+  // 裡，但 serialize_verify_report() 沒有讀它），誠實顯示還缺什麼，
+  // 不要假裝資料齊全。
+  function renderDataSource() {
+    if (!dataSourceEl) return;
+    if (!lastRun) {
+      dataSourceEl.style.display = "none";
+      return;
+    }
+    dataSourceEl.style.display = "block";
+    const synthBadge = lastRun.is_synthetic
+      ? `<span class="caveat-badge">⚠ 合成資料</span>`
+      : `<span class="validate-status validate-status-pass">真實資料</span>`;
+    const sessionNames = (lastRun.session_paths || [])
+      .map((p) => p.split("/").pop()).join("、") || "（無）";
+    dataSourceEl.innerHTML = `
+      <div class="validate-datasource-row">${synthBadge}
+        <span class="validate-datasource-sessions mono">${sessionNames}</span>
+      </div>
+      <div class="pending-note">sensors_seen（實際有資料流過來的感測器）／trial 數／詞彙數目前
+        /verify/run 的回應沒有這幾個欄位，已回報調度員追加。</div>
+    `;
+  }
+
+  // 「一眼看懂」矩陣摘要：五個小格，只給狀態色 + must-pass 鎖頭，細節
+  // 留給下面的卡片 -- esp-mask-test-ad 認可的分層（摘要給第一眼，卡片給
+  // 想深入看的人）。
+  function renderMatrixSummary() {
+    if (!matrixSummaryEl) return;
+    if (!lastRun || !Array.isArray(lastRun.outcomes)) {
+      matrixSummaryEl.style.display = "none";
+      return;
+    }
+    matrixSummaryEl.style.display = "flex";
+    matrixSummaryEl.innerHTML = EXPERIMENTS.map((exp) => {
+      const outcome = lastRun.outcomes.find((o) => o.key === exp.key);
+      const status = outcome ? outcome.status : "none";
+      const cls = STATUS_CLASS[status] || "validate-status-none";
+      const mark = STATUS_MARK[status] || "?";
+      const lock = outcome && outcome.is_must_pass ? "🔒" : "";
+      return `
+        <div class="validate-matrix-cell ${cls}" title="${blockingKeyLabel(exp.key)}">
+          <span class="validate-matrix-key mono">${exp.key}</span>
+          <span class="validate-matrix-mark">${mark}</span>
+          <span class="validate-matrix-lock">${lock}</span>
+        </div>
+      `;
+    }).join("");
+  }
+
+  // inconsistencies／limitations：後端這輪的 /verify/run 回應本來就有，
+  // 先前完全沒被渲染過 -- 委員追問時最需要的誠實揭露內容。
+  function renderCrossChecks() {
+    if (!crossChecksEl) return;
+    if (!lastRun) {
+      crossChecksEl.innerHTML = "";
+      return;
+    }
+    const inconsistencies = lastRun.inconsistencies || [];
+    const limitations = lastRun.limitations || [];
+    if (!inconsistencies.length && !limitations.length) {
+      crossChecksEl.innerHTML = "";
+      return;
+    }
+    const incHtml = inconsistencies.map((item) => `
+      <div class="validate-crosscheck-item validate-crosscheck-${item.severity}">
+        <div class="validate-crosscheck-topic">
+          ${item.severity === "conflict" ? "🔴" : "⚠"} ${item.topic}
+        </div>
+        <div class="validate-crosscheck-message">${mdBold(item.message)}</div>
+        ${item.sources && item.sources.length
+          ? `<div class="validate-crosscheck-sources">來源：${item.sources.join("、")}</div>` : ""}
+      </div>
+    `).join("");
+    const limHtml = limitations.length
+      ? `<ul class="validate-limitations-list">${limitations.map((l) => `<li>${mdBold(l)}</li>`).join("")}</ul>`
+      : "";
+    crossChecksEl.innerHTML =
+      (inconsistencies.length
+        ? `<div class="section-label">跨實驗一致性</div><div class="validate-crosschecks">${incHtml}</div>`
+        : "") +
+      (limitations.length
+        ? `<div class="section-label">已知限制</div>${limHtml}` : "");
+  }
+
+  // D16/D19 的 extras（含 D19 消融的置換檢定 p 值）-- 使用者要的
+  // 「這不是運氣」證據就在這裡，但目前 serialize_verify_report() 根本
+  // 沒有把 report["extras"] 序列化出來（讀 verification_report.py 的
+  // build_report() 確認 extras 確實存在於 Python 端，只是沒被送到前端）。
+  // 這是一行程式的小修，已回報調度員；這裡誠實顯示還沒好，不假裝有數字。
+  // D18 的 P_VALUE_THRESHOLD（analysis/experiments/d18_permutation_test.py
+  // line 57）。只用來決定「下限太接近門檻」的警語要不要出現，純顯示判斷，
+  // 不是重算 p 值本身 -- 跟這個檔案已經在做的事（EXPERIMENTS 陣列裡的
+  // criterion 字串同樣是照抄後端常數來顯示）是同一種程度的重複，不是
+  // C22.md 禁止的「重寫分析演算法」。
+  const P_VALUE_THRESHOLD = 0.01;
+
+  function pValueRowHtml(label, result) {
+    if (!result || result.pvalue == null) return "";
+    const floor = result.p_floor;
+    const passedMark = result.passed ? "✓ p < " + P_VALUE_THRESHOLD : "— 未達顯著";
+    // esp-mask-test-ad 明確要求：p 值旁邊一定要帶置換次數與解析度下限，
+    // 否則「p < 0.01」看起來會比它實際的解析度更精確。警語只在下限跟
+    // 門檻太接近時出現（7c [c32fd9] 的判斷：floor >= 門檻/2），避免無關
+    // 的警語讓人略過所有警語。
+    const floorTooClose = floor != null && floor >= P_VALUE_THRESHOLD / 2;
+    return `
+      <div class="validate-pvalue-row">
+        <span class="validate-pvalue-label">${label}</span>
+        <span class="mono">p = ${result.pvalue.toFixed(4)}（${passedMark}）</span>
+        <span class="validate-pvalue-detail mono">${result.n_permutations} 次置換，
+          解析度下限 ${floor != null ? floor.toFixed(4) : "?"}</span>
+        ${floorTooClose ? `<div class="validate-pvalue-floor-warn">⚠ 這個下限跟通過門檻（${P_VALUE_THRESHOLD}）太接近，
+          這個 p 值不夠精確去分辨「真的顯著」跟「置換次數不夠」——建議提高
+          <span class="mono">--ablation-permutations</span>。</div>` : ""}
+        ${groupingHtml(result)}
+      </div>
+    `;
+  }
+
+  // 🔴 esp-mask-test-ad 明確要求：`ungrouped_single_group`（要求了分組驗證
+  // 但只戴一次做不到）**這句話不能被摺起來或縮小**——沒看到這句話，
+  // 委員會以為分組驗證真的做了，而 7c [c32fd9] 實測證明沒分組會讓準確率
+  // 灌水 29 個百分點。所以這裡直接輸出、跟 blocking banner 同等視覺份量，
+  // 不用 <details>。
+  function groupingHtml(result) {
+    if (result.grouping === "ungrouped_single_group") {
+      return `<div class="validate-grouping-blocked">🔴 分組驗證無法進行：${mdBold(result.grouping_note || "")}</div>`;
+    }
+    if (result.grouping === "grouped") {
+      return `<div class="validate-grouping-ok">✅ 已依 wear_id 分組驗證（${result.n_groups} 組），避免組內洩漏灌水。</div>`;
+    }
+    // "ungrouped_no_groups_given" -- 沒人要求過分組，不是缺口，不用講。
+    return "";
+  }
+
+  function renderExtras() {
+    if (!extrasEl) return;
+    if (!lastRun) {
+      extrasEl.innerHTML = "";
+      return;
+    }
+    const extras = lastRun.extras;
+    if (!extras) {
+      // 後端還沒把 report["extras"] 序列化進 /verify/run 的回應
+      // （已回報調度員，是一行程式的小修）。誠實顯示還缺什麼，不假裝
+      // 有數字 -- 這行文字等後端補上後要記得整段換掉，不要變成永久的
+      // 「等後端」。
+      extrasEl.innerHTML = `
+        <div class="section-label">補充分析（D16 互資訊 / D19 消融，側邊實驗，非五張主卡的結論）</div>
+        <div class="pending-note">後端目前沒有把 extras（含 D19 消融的置換檢定 p 值）序列化進
+          /verify/run 的回應，已回報調度員——這裡之後會顯示 p 值、置換次數、
+          解析度下限，以及分組驗證是否真的做了。</div>
+      `;
+      return;
+    }
+    const d19 = extras.d19_dual_matrix;
+    const d16 = extras.d16_gain;
+    extrasEl.innerHTML = `
+      <div class="section-label">補充分析（D16 互資訊 / D19 消融，側邊實驗，非五張主卡的結論）</div>
+      ${d19 ? `
+        <div class="validate-extras-block">
+          <div class="validate-extras-title">D19 消融：雙 ToF 合併是否比單顆更好
+            （gain=${typeof d19.gain === "number" ? d19.gain.toFixed(4) : d19.gain}，
+            ${d19.passed ? "✓ 有差異" : "— 未達門檻"}）</div>
+          ${pValueRowHtml("雙 ToF 合併", d19.tof_combined)}
+          ${pValueRowHtml("僅左 ToF", d19.tof_l)}
+          ${pValueRowHtml("僅右 ToF", d19.tof_r)}
+        </div>
+      ` : ""}
+      ${d16 != null ? `
+        <div class="validate-extras-block">
+          D16 互資訊增益（雙矩陣 vs 單矩陣）：
+          <span class="mono">${typeof d16 === "number" ? d16.toFixed(4) : d16}</span>
+        </div>
+      ` : ""}
+      ${!d19 && d16 == null ? `<div class="pending-note">這輪沒有足夠特徵跑 D16/D19（需要至少 2 個類別的資料）。</div>` : ""}
+    `;
+  }
+
   async function refreshState() {
     try {
       const res = await fetch("/verify/state");
@@ -227,6 +442,10 @@ registerMode("validate", (() => {
       runErrorEl.style.display = "none";
       renderCards();
       renderBlocking();
+      renderDataSource();
+      renderMatrixSummary();
+      renderCrossChecks();
+      renderExtras();
       renderRunStatus();
       if (!running && pollTimer) {
         clearInterval(pollTimer);
@@ -507,6 +726,8 @@ registerMode("validate", (() => {
         <div class="section-label">驗證模式 · 五項物理驗證實驗</div>
 
         <div class="validate-blocking" data-blocking style="display:none"></div>
+        <div class="validate-datasource" data-datasource style="display:none"></div>
+        <div class="validate-matrix-summary" data-matrix-summary style="display:none"></div>
 
         <div class="validate-run-controls">
           <label class="validate-control-label">Session 檔案（一行一個，或逗號分隔）
@@ -524,6 +745,9 @@ registerMode("validate", (() => {
 
         <div class="validate-cards" data-cards></div>
 
+        <div class="validate-crosschecks-area" data-crosschecks></div>
+        <div class="validate-extras-area" data-extras></div>
+
         <div class="section-label">報告檢視器</div>
         <div class="validate-reports-error" data-reports-error style="display:none"></div>
         <div class="validate-reports-list" data-reports-list></div>
@@ -531,6 +755,10 @@ registerMode("validate", (() => {
       `;
 
       blockingEl = root.querySelector("[data-blocking]");
+      dataSourceEl = root.querySelector("[data-datasource]");
+      matrixSummaryEl = root.querySelector("[data-matrix-summary]");
+      crossChecksEl = root.querySelector("[data-crosschecks]");
+      extrasEl = root.querySelector("[data-extras]");
       cardsEl = root.querySelector("[data-cards]");
       sessionsInputEl = root.querySelector("[data-sessions-input]");
       fastCheckboxEl = root.querySelector("[data-fast-checkbox]");
@@ -547,6 +775,10 @@ registerMode("validate", (() => {
 
       renderCards();
       renderBlocking();
+      renderDataSource();
+      renderMatrixSummary();
+      renderCrossChecks();
+      renderExtras();
       refreshState();
       renderReportsList();
       renderCompare();
